@@ -8,7 +8,7 @@ from mimetypes import guess_type
 import numpy as np
 from Bio import SeqIO
 from BCBio import GFF
-from wol_parse import SeqContext
+from modules.parse import SeqContext
 
 def table_lookup(codon):
     '''

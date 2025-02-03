@@ -1,5 +1,8 @@
 import os 
 import json
+from typing import Dict, List, Any, Tuple, Optional
+from Bio.Seq import Seq
+from Bio.SeqFeature import FeatureLocation
 from tqdm import tqdm 
 import gzip
 from Bio import SeqIO
@@ -8,22 +11,44 @@ from BCBio import GFF
 from mimetypes import guess_type 
 from selectors import EpollSelector
 from functools import partial
+from itertools import islice
 
 class SeqContext:
-    def __init__(self, fna, annot):
-
+    '''A class to handle genomic sequence context and annotations.
+    
+    This class loads and provides access to genome sequence data and its annotations.
+    
+    Attributes:
+        genome (Seq): The complete genome sequence
+        annot (str): Path to the genome annotation file
+    '''
+    
+    def __init__(self, fna: str, annot: str) -> None:
+        '''Initialize SeqContext with genome and annotation files.
+        
+        Args:
+            fna (str): Path to the genome FASTA file
+            annot (str): Path to the genome annotation file (GFF format)
+        '''
         #load genome fasta
         fna_encoding = guess_type(fna)[1]
         _open = partial(gzip.open, mode='rt') if fna_encoding == 'gzip' else open
-        genome_fasta = SeqIO.parse(_open(fna),'fasta')
+        genome_fasta = SeqIO.parse(_open(fna), 'fasta')
         for record in genome_fasta:
             self.genome = record.seq
     
         #load annotation
         self.annot = annot
 
-    def gene_seqs(self):
-        seqs = {}
+    def gene_seqs(self) -> Dict[str, Seq]:
+        '''Extract sequences for all genes in the genome.
+        
+        Returns:
+            Dict[str, Seq]: Dictionary mapping gene IDs to their sequences.
+                Keys are gene reference IDs (from Dbxref)
+                Values are gene sequences (including reverse complement for - strand)
+        '''
+        seqs: Dict[str, Seq] = {}
         annot_encoding = guess_type(self.annot)[1]
         _open = partial(gzip.open, mode='rt') if annot_encoding == 'gzip' else open
         for rec in GFF.parse(_open(self.annot)):
@@ -37,20 +62,45 @@ class SeqContext:
                     seqs[refid] = seq
         return seqs
     
-    def genome_features(self):
-        features = {}
+    def genome_features(self) -> Dict[str, FeatureLocation]:
+        '''Get locations for all features in the genome.
+        
+        Returns:
+            Dict[str, FeatureLocation]: Dictionary mapping feature IDs to their locations.
+                Keys are feature reference IDs (from Dbxref)
+                Values are BioPython FeatureLocation objects
+        '''
+        features: Dict[str, FeatureLocation] = {}
         for rec in GFF.parse(self.annot):
             for feat in rec.features:
                 features[feat.qualifiers['Dbxref'][0].split(':')[-1]] = feat.location
         return features 
                     
-def check_mutations(entry, genestart, sample, ems_only, c_filter=0):
-    '''
+def check_mutations(
+    entry: List[str], 
+    genestart: int, 
+    sample: str, 
+    ems_only: bool, 
+    c_filter: int = 0
+) -> Tuple[Dict[str, int], int]:
+    '''Analyze a mpileup entry to identify mutations.
+    
     Given a position in a mpileup file (entry), position in genome (genestart),
     and sample name determines nucleotide mutation and count.
-    Stores mutation information in dictionary
+    
+    Args:
+        entry (List[str]): A line from mpileup file split into fields
+        genestart (int): Start position of the gene in the genome
+        sample (str): Sample identifier
+        ems_only (bool): If True, only return EMS canonical mutations (C>T or G>A)
+        c_filter (int, optional): Minimum count filter for mutations. Defaults to 0
+        
+    Returns:
+        Tuple containing:
+            - Dict[str, int]: Dictionary of mutations and their counts
+            - int: Read depth at this position
     '''
-    muts = {}    
+    muts: Dict[str, int] = {}    
     bp = (int(entry[1]) - int(genestart))
     bp = str(bp) + '_'
     ref = entry[2]
@@ -107,16 +157,33 @@ def check_mutations(entry, genestart, sample, ems_only, c_filter=0):
 
     return muts, depth
 
-def parse_mpile(mpile, seqobject, ems_only):
-    '''
+def parse_mpile(
+    mpile: str, 
+    seqobject: SeqContext, 
+    ems_only: bool
+) -> Dict[str, Dict[str, Any]]:
+    '''Parse an mpileup file to identify mutations in genes.
+    
     Iterates over an mpileup file calling check_mutations() for each position.
     Collects mutations into a dictionary object to be returned.
-    Requires genomic context in the form of a SeqContext object
+    
+    Args:
+        mpile (str): Path to mpileup file
+        seqobject (SeqContext): Genomic context object containing sequence and annotations
+        ems_only (bool): If True, only process EMS canonical mutations
+        
+    Returns:
+        Dict[str, Dict[str, Any]]: Nested dictionary containing:
+            - First level keys are gene IDs
+            - Second level contains:
+                - 'mutations': Dictionary of mutations and their counts
+                - 'avg_cov': Average coverage for the gene
+                - 'gene_len': Length of the gene
     '''
     annot_encoding = guess_type(seqobject.annot)[1]
     _open = partial(gzip.open, mode='rt') if annot_encoding == 'gzip' else open 
     for rec in GFF.parse(_open(seqobject.annot)):
-        mutations = {}
+        mutations: Dict[str, Dict[str, Any]] = {}
         encoding = guess_type(mpile)[1] 
         _open = partial(gzip.open, mode='rt') if encoding == 'gzip' else open
 
@@ -130,11 +197,13 @@ def parse_mpile(mpile, seqobject, ems_only):
             for feat in tqdm(rec.features):
                 if feat.type == 'gene':
                     refid = feat.qualifiers['Dbxref'][0].split(':')[-1]
-                    mutations[refid]={'mutations':{},
-                                        'avg_cov':0,  #avg and len are used for normalizing effect score
-                                        'gene_len':0}
+                    mutations[refid] = {
+                        'mutations': {},
+                        'avg_cov': 0,  #avg and len are used for normalizing effect score
+                        'gene_len': 0
+                    }
                     loc = feat.location
-                    depths = []
+                    depths: List[int] = []
                     #iterate over lines in mpileup 
                     for l in mf:
                         entry = l.split()
