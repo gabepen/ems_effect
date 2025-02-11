@@ -83,14 +83,22 @@ def process_mpileups(pile: str, mutpath: str, wolgenome: Any, ems_only: bool) ->
     '''
     piles = glob(pile + '/*_variants.txt')
     base_counts: Dict[str, Dict[str, int]] = {}
+    context_counts: Dict[str, Dict[str, int]] = {}  # Store contexts per sample
     
     for mpileup in piles: 
         samp = mpileup.split('/')[-1]
         sample = samp.split('.')[0]
         base_counts[sample] = {'A':0, 'T':0, 'G':0, 'C':0}
+        context_counts[sample] = {}
         
-        # Process mutations and count bases
-        nuc_muts = parse.parse_mpile(mpileup, wolgenome, ems_only, base_counts[sample])
+        # Process mutations and count bases/contexts
+        nuc_muts, contexts = parse.parse_mpile(
+            mpileup, 
+            wolgenome, 
+            ems_only, 
+            base_counts[sample],
+            context_counts[sample]
+        )
         
         # Save mutation data
         with open(f"{mutpath}/{sample}.json", 'w') as of:
@@ -99,6 +107,10 @@ def process_mpileups(pile: str, mutpath: str, wolgenome: Any, ems_only: bool) ->
     # Save base counts
     with open(f"{mutpath}/basecounts.json", 'w') as of:
         json.dump(base_counts, of)
+        
+    # Save context counts
+    with open(f"{mutpath}/contextcounts.json", 'w') as of:
+        json.dump(context_counts, of)
 
 def process_mutations(
     nuc_mut_files: List[str],

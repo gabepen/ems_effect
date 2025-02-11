@@ -76,17 +76,44 @@ class SeqContext:
                 features[feat.qualifiers['Dbxref'][0].split(':')[-1]] = feat.location
         return features 
                     
+def get_sequence_context(
+    position: int, 
+    ref_base: str,
+    genome_seq: str,
+    context_size: int = 3
+) -> str:
+    '''Get sequence context around a mutation site.
+    
+    Args:
+        position (int): Position of mutation in genome (1-based)
+        ref_base (str): Reference base at mutation site
+        genome_seq (str): Full genome sequence
+        context_size (int): Size of context window (3 or 5, default=3)
+        
+    Returns:
+        str: Sequence context with mutation site in center (e.g., 'ATC' for 3mer)
+    '''
+    if context_size not in [3, 5]:
+        raise ValueError("Context size must be 3 or 5")
+        
+    pos_0based = position - 1
+    flank = context_size // 2
+    start = max(0, pos_0based - flank)
+    end = min(len(genome_seq), pos_0based + flank + 1)
+    
+    return str(genome_seq[start:end])
+
 def check_mutations(
     entry: List[str], 
     genestart: int, 
     sample: str, 
     ems_only: bool, 
-    base_counts: Dict[str, int]
+    base_counts: Dict[str, int],
+    genome_seq: str,
+    context_counts: Dict[str, int],
+    context_size: int = 3
 ) -> Tuple[Dict[str, int], int]:
-    '''Analyze a mpileup entry to identify mutations.
-    
-    Given a position in a mpileup file (entry), position in genome (genestart),
-    and sample name determines nucleotide mutation and count.
+    '''Analyze a mpileup entry to identify mutations and count contexts.
     
     Args:
         entry (List[str]): A line from mpileup file split into fields
@@ -94,6 +121,9 @@ def check_mutations(
         sample (str): Sample identifier
         ems_only (bool): If True, only return EMS canonical mutations (C>T or G>A)
         base_counts (Dict[str, int]): Dictionary to track base counts
+        genome_seq (str): Full genome sequence for context
+        context_counts (Dict[str, int]): Dictionary to track context counts
+        context_size (int): Size of sequence context window (3 or 5)
         
     Returns:
         Tuple containing:
@@ -105,6 +135,10 @@ def check_mutations(
     bp = str(bp) + '_'
     ref = entry[2]
     depth = int(entry[3])
+    position = int(entry[1])
+
+    # Get sequence context
+    context = get_sequence_context(position, ref, genome_seq, context_size)
 
     # Count reference base occurrences
     base_counts[ref] += depth
@@ -114,46 +148,31 @@ def check_mutations(
     r_iter = iter(reads)
     for i, r in reads:
         if r != '.' and r != 'N' and r != '$' and r != '*':
-            #catch insertions 
+            # Handle insertions
             if r == '+':
                 insert = next(r_iter)[1]
                 mut = bp+ref+'>'
                 for c in islice(r_iter,int(insert)):
                     mut+=c[1]
-            #catch deletions
+            # Handle deletions
             elif r == '-':
                 delete = next(r_iter)[1]
                 mut = bp+'del'
                 for c in islice(r_iter,int(delete)):
                     mut+=c[1]
-            #normal point muts
+            # Handle point mutations
             else:
-                change = ref+'>'+r    
-                mut = bp+change
-
-            #filter out non ems canon mutations    
-            if ems_only:
-                if mut.split('_')[1] == 'C>T' or mut.split('_')[1] == 'G>A':
-                    if mut not in muts:
-                        muts[mut] = 1
-                    else:
-                        muts[mut] += 1
-                else:
+                mut = f"{ref}>{r}"
+                if ems_only and mut not in ['C>T', 'G>A']:
                     continue
-            else:
-                if mut not in muts:
-                    muts[mut] = 1
-                else:
-                    muts[mut] += 1
-    #filter low count mutations
-    
-    rmkeys = []
-    for key in muts:
-        if muts[key] < 0:
-            rmkeys.append(key)
-    for key in rmkeys:
-        del muts[key]
-    
+                    
+                # Only count contexts for point mutations
+                context_counts[context] = context_counts.get(context, 0) + 1
+                
+                mut = bp + mut
+
+            # Record all mutations (including indels)
+            muts[mut] = muts.get(mut, 0) + 1
 
     return muts, depth
 
@@ -161,8 +180,10 @@ def parse_mpile(
     mpile: str, 
     seqobject: SeqContext, 
     ems_only: bool, 
-    base_counts: Dict[str, int]
-) -> Dict[str, Dict[str, Any]]:
+    base_counts: Dict[str, int],
+    context_counts: Dict[str, int],
+    context_size: int = 3
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
     '''Parse an mpileup file to identify mutations in genes.
     
     Iterates over an mpileup file calling check_mutations() for each position.
@@ -173,14 +194,13 @@ def parse_mpile(
         seqobject (SeqContext): Genomic context object containing sequence and annotations
         ems_only (bool): If True, only process EMS canonical mutations
         base_counts (Dict[str, int]): Dictionary to track base counts
+        context_counts (Dict[str, int]): Dictionary to track context counts
+        context_size (int): Size of context window (3 or 5)
         
     Returns:
-        Dict[str, Dict[str, Any]]: Nested dictionary containing:
-            - First level keys are gene IDs
-            - Second level contains:
-                - 'mutations': Dictionary of mutations and their counts
-                - 'avg_cov': Average coverage for the gene
-                - 'gene_len': Length of the gene
+        Tuple containing:
+            - Dict[str, Dict[str, Any]]: Mutation data per gene
+            - Dict[str, int]: Counts of mutation contexts
     '''
     annot_encoding = guess_type(seqobject.annot)[1]
     _open = partial(gzip.open, mode='rt') if annot_encoding == 'gzip' else open 
@@ -211,7 +231,16 @@ def parse_mpile(
                         entry = l.split()
                         #check if mpileup entry is in the gene 
                         if int(entry[1])-1 in loc: 
-                            muts, depth = check_mutations(entry, loc.start, samp, ems_only, base_counts)
+                            muts, depth = check_mutations(
+                                entry, 
+                                loc.start, 
+                                samp, 
+                                ems_only, 
+                                base_counts,
+                                str(seqobject.genome),
+                                context_counts,
+                                context_size
+                            )
                             depths.append(depth)
                             mutations[refid]['mutations'].update(muts)
                         elif int(entry[1]) > loc.end:
@@ -222,5 +251,5 @@ def parse_mpile(
                         mutations[refid]['avg_cov'] = 0
                     
                     mutations[refid]['gene_len'] = loc.end - loc.start
-        return mutations
+        return mutations, context_counts
                             
