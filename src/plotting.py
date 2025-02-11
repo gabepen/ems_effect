@@ -13,35 +13,34 @@ def load_json(file_path):
         data = json.load(file)
     return data
 
-def count_mutations(json_files: list) -> (dict, dict):
+def count_mutations(json_files: list) -> dict:
+    '''Count mutation frequencies across all samples.
     
-    
+    Args:
+        json_files (list): List of paths to mutation JSON files
+        
+    Returns:
+        dict: Dictionary of mutation frequencies per sample
+    '''
     total_freqs = {}
-    total_counts = {}
     
     # iterate over each sample json file in the directory
     for mutation_json in json_files:
-        
         # get sample name from the file path
         sample = mutation_json.split('/')[-1].split('.')[0]
         
-        # initialize the total frequencies and counts for the sample
+        # initialize the total frequencies for the sample
         total_freqs[sample] = {}
-        if sample not in total_counts:
-            total_counts[sample] = {'A':0,'C':0,'G':0,'T':0}
         
         # load the mutation json file
         mutation_counts = load_json(mutation_json)
         
         # iterate over each gene in the mutation json file
         for gene in mutation_counts:
-            
             # for each site along the gene that has a mutation count
             for site in mutation_counts[gene]['mutations']:
-                
                 # get the mutation type ('C>T', 'A>G', etc.)
                 mutation_type = site[-3:]
-                ref = mutation_type[0]
                 new = mutation_type[-1]
                 
                 # skip if the new base is not a valid nucleotide
@@ -53,10 +52,8 @@ def count_mutations(json_files: list) -> (dict, dict):
                     total_freqs[sample][mutation_type] = mutation_counts[gene]['mutations'][site]
                 else:
                     total_freqs[sample][mutation_type] += mutation_counts[gene]['mutations'][site] 
-               
-                total_counts[sample][ref] += mutation_counts[gene]['mutations'][site]
                 
-    return total_freqs, total_counts
+    return total_freqs
 
 def plot_ems_mutation_frequencies(data_path: str, output_dir: str) -> None:
     
@@ -71,7 +68,7 @@ def plot_ems_mutation_frequencies(data_path: str, output_dir: str) -> None:
 
     # Create a bar plot for the mutation frequencies
     g = sns.catplot(kind="bar", x="mutation", y="norm_count",
-                    hue='ems', data=mutation_frequencies, legend=False,
+                    hue='ems', data=mutation_frequencies,
                     height=6, aspect=1.5)
                 
     # Remove the top and right spines from the plot
@@ -88,27 +85,22 @@ def plot_ems_mutation_frequencies(data_path: str, output_dir: str) -> None:
     # Save the plot to a file
     plt.savefig(output_path, dpi=300, pad_inches=0.1)
 
-def normalize_mutation_counts(total_freqs: dict, counts: dict, output_file_dir: str) -> str:
+def normalize_mutation_counts(total_freqs: dict, base_counts: dict, output_file_dir: str) -> str:
+    '''Normalize mutation counts by total reference base counts and write to CSV.
     
-    """
-    Normalize mutation counts and write the results to a CSV file.
-    This function takes in two dictionaries: `total_freqs` and `counts`. It normalizes the mutation
-    frequencies in `total_freqs` by dividing each frequency by the corresponding count in `counts`.
-    The results are then written to a CSV file named 'normAll_frequencies.csv'. Additionally, a bar plot
-    is generated from the CSV file and saved as 'normAll_freqs.png'.
     Args:
-        total_freqs (dict): A dictionary where keys are sample names and values are dictionaries of mutation
-                            types and their frequencies.
-        counts (dict): A dictionary where keys are sample names and values are dictionaries of reference
-                       bases and their counts.
+        total_freqs (dict): Dictionary of mutation frequencies per sample
+        base_counts (dict): Dictionary of total base counts per sample from basecounts.json
+        output_file_dir (str): Directory to write output CSV
+        
     Returns:
-        str: The path to the CSV file where the normalized mutation frequencies are written.
-    """
-    
+        str: Path to output CSV file
+    '''
     output_file = os.path.join(output_file_dir, 'normalized_ems_mutations_freqs.csv')
     header = ['sample','ems','norm_count','mutation']
-    with open(output_file, '+w' ) as csvf:
-        writer = csv.writer(csvf, delimiter=',')
+    
+    with open(output_file, 'w') as csvf:
+        writer = csv.writer(csvf)
         writer.writerow(header)
         for sample in total_freqs:
             if 'NT' in sample or 'Minus' in sample or 'Pre' in sample:
@@ -116,22 +108,29 @@ def normalize_mutation_counts(total_freqs: dict, counts: dict, output_file_dir: 
             else:
                 ems = '+'
             for mut_type in total_freqs[sample]:
-                ref = mut_type[0]
-                total_freqs[sample][mut_type] = total_freqs[sample][mut_type] / counts[sample][ref] 
-                writer.writerow([sample,ems,total_freqs[sample][mut_type],mut_type])
+                ref = mut_type[0]  # Get reference base from mutation type
+                # Normalize by total count of reference base from basecounts
+                norm_freq = total_freqs[sample][mut_type] / base_counts[sample][ref]
+                writer.writerow([sample, ems, norm_freq, mut_type])
     
     return output_file
 
-def mutation_type_barplot(json_file_dir: list, output_file_dir: str):
+def mutation_type_barplot(json_file_dir: list, base_counts: dict, output_file_dir: str):
+    '''Generate mutation type frequency barplot using basecounts for normalization.
     
-    ''' Takes a direcotry of mutation json files for each sample and plots the frequency of each mutation type
+    Args:
+        json_file_dir (list): List of paths to mutation JSON files
+        base_counts (dict): Dictionary of total base counts per sample
+        output_file_dir (str): Directory to write output files
     '''
-    # first count the mutations and frequencies for each sample
-    total_frequencies, total_counts = count_mutations(json_file_dir)
-    mutation_frequence_csv = normalize_mutation_counts(total_frequencies, total_counts, output_file_dir)
+    # Count mutation frequencies
+    total_frequencies = count_mutations(json_file_dir)
+    
+    # Normalize using provided base counts
+    mutation_frequence_csv = normalize_mutation_counts(total_frequencies, base_counts, output_file_dir)
+    
+    # Generate plot
     plot_ems_mutation_frequencies(mutation_frequence_csv, output_file_dir)
-    
-    
 
 def main():
     parser = argparse.ArgumentParser(description='Plot data from a JSON file.')
@@ -146,8 +145,16 @@ def main():
     
     if args.mutation_jsons:
         mutation_json_file_dir = args.mutation_jsons
+        
+        # collect all the mutation json files
         jsons = glob(mutation_json_file_dir + '/*.json')
-        mutation_type_barplot(jsons, args.output_dir)
+        
+        # load the base counts json file into a dictionary  
+        with open(mutation_json_file_dir + '/../basecounts.json') as f:
+            base_counts = json.load(f)
+        
+        # plot the mutation type barplot
+        mutation_type_barplot(jsons, base_counts, args.output_dir)
         
 if __name__ == "__main__":
     main()

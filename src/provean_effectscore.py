@@ -82,12 +82,23 @@ def process_mpileups(pile: str, mutpath: str, wolgenome: Any, ems_only: bool) ->
         None: Results are written to JSON files in mutpath directory
     '''
     piles = glob(pile + '/*_variants.txt')
+    base_counts: Dict[str, Dict[str, int]] = {}
+    
     for mpileup in piles: 
         samp = mpileup.split('/')[-1]
         sample = samp.split('.')[0]
-        nuc_muts = parse.parse_mpile(mpileup, wolgenome, ems_only)
+        base_counts[sample] = {'A':0, 'T':0, 'G':0, 'C':0}
+        
+        # Process mutations and count bases
+        nuc_muts = parse.parse_mpile(mpileup, wolgenome, ems_only, base_counts[sample])
+        
+        # Save mutation data
         with open(f"{mutpath}/{sample}.json", 'w') as of:
             json.dump(nuc_muts, of)
+    
+    # Save base counts
+    with open(f"{mutpath}/basecounts.json", 'w') as of:
+        json.dump(base_counts, of)
 
 def process_mutations(
     nuc_mut_files: List[str],
@@ -330,8 +341,8 @@ def main() -> None:
     paths = setup_directories(args.output.rstrip('/'))
     
     # Define reference paths
-    genomic_fna = '/storage1/gabe/ems_effect_code/data/references/GCF_016584425.1_ASM1658442v1_genomic.fna.gz'
-    annotation = '/storage1/gabe/ems_effect_code/data/references/GCF_016584425.1_ASM1658442v1_genomic.gff'
+    genomic_fna = '/storage1/gabe/ems_effect_code/data/references/GCF_000008025.1_ASM802v1_genomic.fna.gz'
+    annotation = '/storage1/gabe/ems_effect_code/data/references/GCF_000008025.1_ASM802v1_genomic.gff'
     codon_table = '/storage1/gabe/ems_effect_code/data/references/11.json'
     prov_score_table_path = '/storage1/gabe/ems_effect_code/data/provean_tables/score_table_2.json'
     

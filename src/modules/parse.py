@@ -81,7 +81,7 @@ def check_mutations(
     genestart: int, 
     sample: str, 
     ems_only: bool, 
-    c_filter: int = 0
+    base_counts: Dict[str, int]
 ) -> Tuple[Dict[str, int], int]:
     '''Analyze a mpileup entry to identify mutations.
     
@@ -93,7 +93,7 @@ def check_mutations(
         genestart (int): Start position of the gene in the genome
         sample (str): Sample identifier
         ems_only (bool): If True, only return EMS canonical mutations (C>T or G>A)
-        c_filter (int, optional): Minimum count filter for mutations. Defaults to 0
+        base_counts (Dict[str, int]): Dictionary to track base counts
         
     Returns:
         Tuple containing:
@@ -106,8 +106,8 @@ def check_mutations(
     ref = entry[2]
     depth = int(entry[3])
 
-    #running total bp count
-    #counts[sample][ref] += depth
+    # Count reference base occurrences
+    base_counts[ref] += depth
 
     reads = entry[4]
     reads = enumerate(reads)
@@ -149,7 +149,7 @@ def check_mutations(
     
     rmkeys = []
     for key in muts:
-        if muts[key] < c_filter:
+        if muts[key] < 0:
             rmkeys.append(key)
     for key in rmkeys:
         del muts[key]
@@ -160,7 +160,8 @@ def check_mutations(
 def parse_mpile(
     mpile: str, 
     seqobject: SeqContext, 
-    ems_only: bool
+    ems_only: bool, 
+    base_counts: Dict[str, int]
 ) -> Dict[str, Dict[str, Any]]:
     '''Parse an mpileup file to identify mutations in genes.
     
@@ -171,6 +172,7 @@ def parse_mpile(
         mpile (str): Path to mpileup file
         seqobject (SeqContext): Genomic context object containing sequence and annotations
         ems_only (bool): If True, only process EMS canonical mutations
+        base_counts (Dict[str, int]): Dictionary to track base counts
         
     Returns:
         Dict[str, Dict[str, Any]]: Nested dictionary containing:
@@ -209,7 +211,7 @@ def parse_mpile(
                         entry = l.split()
                         #check if mpileup entry is in the gene 
                         if int(entry[1])-1 in loc: 
-                            muts, depth = check_mutations(entry, loc.start, samp, ems_only)
+                            muts, depth = check_mutations(entry, loc.start, samp, ems_only, base_counts)
                             depths.append(depth)
                             mutations[refid]['mutations'].update(muts)
                         elif int(entry[1]) > loc.end:
