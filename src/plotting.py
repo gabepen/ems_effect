@@ -7,6 +7,7 @@ import csv
 import seaborn as sns
 import pandas as pd
 import numpy as np
+import re
 
 def load_json(file_path):
     with open(file_path, 'r') as file:
@@ -55,7 +56,7 @@ def count_mutations(json_files: list) -> dict:
                 
     return total_freqs
 
-def plot_kmer_context(data_dict: dict, output_dir: str) -> None:
+def plot_kmer_context(data_dict: dict, genome_kmer_counts: dict, output_dir: str) -> None:
     '''Plot the kmer context barplot.
     
     Args:
@@ -68,16 +69,21 @@ def plot_kmer_context(data_dict: dict, output_dir: str) -> None:
 
     # initialize a dictionary to store the observed kmers
     observed_kmers = {}
+    ems_samples = []
     
-    # sum observed kmers across all treated samples
+    # normalize and average the observed kmer rate across all treated samples
     for sample in data_dict:
         if 'EMS' in sample:
+            ems_samples.append(sample)
             for kmer in data_dict[sample]:
                 if kmer not in observed_kmers:
-                    observed_kmers[kmer] = data_dict[sample][kmer]
+                    observed_kmers[kmer] = data_dict[sample][kmer] / genome_kmer_counts[kmer]
                 else:
-                    observed_kmers[kmer] += data_dict[sample][kmer]
-    
+                    observed_kmers[kmer] += data_dict[sample][kmer] / genome_kmer_counts[kmer] 
+                     
+    for kmer in observed_kmers:
+        observed_kmers[kmer] = observed_kmers[kmer] / len(ems_samples)
+            
     # plot the kmer context barplot 
     # Sort kmers by count and get top 10
     top_kmers = dict(sorted(observed_kmers.items(), key=lambda x: x[1], reverse=True)[:30])
@@ -90,37 +96,146 @@ def plot_kmer_context(data_dict: dict, output_dir: str) -> None:
     
     # Customize plot
     plt.xlabel('Kmer Context')
-    plt.ylabel('Count')
-    plt.title('Top 10 Most Frequent Kmer Contexts')
+    plt.ylabel('Frequency')
+    plt.title('Top 30 Most Frequent Kmer Contexts')
     plt.xticks(rotation=45, ha='right')
     
     # Adjust layout and save
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
-          
-def plot_ems_mutation_frequencies(data_path: str, output_dir: str) -> None:
-    '''Create bar plot of mutation frequencies using matplotlib.
     
-    Args:
-        data_path (str): Path to CSV file containing mutation frequencies
-        output_dir (str): Directory to save output plot
-    '''
-    # Set output path for the plot
+def plot_ems_mutation_frequencies_per_sample(data_path: str, output_dir: str) -> None:
+    '''Create bar plot of mutation frequencies per sample using matplotlib.'''
+    output_path = os.path.join(output_dir, 'ems_mutation_frequencies_per_sample.png')
+    
+    df = pd.read_csv(data_path)
+    # Sort mutations alphabetically
+    mutations = sorted(df['mutation'].unique())
+    control_samples = df[df['ems'] == '-']['sample'].unique()
+    
+    # Sort treated samples by total mutation frequency
+    treated_totals = df[df['ems'] == '+'].groupby('sample')['norm_count'].sum()
+    treated_samples = treated_totals.sort_values(ascending=True).index
+    
+    # Group treated samples into three bins by mutation rate
+    n_samples = len(treated_samples)
+    samples_per_group = n_samples // 3
+    remainder = n_samples % 3
+    
+    # Create groups with even distribution of remainder
+    group_sizes = [samples_per_group + (1 if i < remainder else 0) for i in range(3)]
+    sample_groups = []
+    start_idx = 0
+    for size in group_sizes:
+        sample_groups.append(treated_samples[start_idx:start_idx + size])
+        start_idx += size
+    
+    # Extract sample numbers/identifiers for legend
+    def extract_sample_id(sample):
+        # First get the basic ID
+        if 'EMS-' in sample:
+            sample_id = sample.split('EMS-')[1]
+        elif 'EMS' in sample:
+            sample_id = sample.split('EMS')[1]
+        else:
+            return sample
+            
+        # Clean up the ID to just keep number and treatment time if present
+        if '_' in sample_id:
+            # Handle cases like "1_3d" or "6_7d"
+            parts = sample_id.split('_')
+            if len(parts) >= 2 and 'd' in parts[1]:
+                return f"{parts[0]}_{parts[1].split('_')[0]}"  # Keep just the number and days
+            return parts[0]  # Just keep the number if no valid treatment time
+        
+        # Remove any trailing text after numbers
+        number = re.match(r'\d+', sample_id)
+        return number.group() if number else sample_id
+    
+    group_labels = []
+    for i, group in enumerate(['Low', 'Medium', 'High']):
+        sample_ids = [extract_sample_id(s) for s in sample_groups[i]]
+        # Split sample IDs into roughly equal groups
+        n = len(sample_ids)
+        split_point = (n + 1) // 2
+        if n > 4:  # Only split if more than 4 samples
+            group_labels.append(f"EMS {', '.join(sample_ids[:split_point])}")
+            group_labels.append(f"EMS {', '.join(sample_ids[split_point:])}")
+        else:
+            group_labels.append(f"EMS {', '.join(sample_ids)}")
+    
+    # Plot setup and control samples (unchanged)
+    plt.figure(figsize=(12, 6))
+    bar_width = 0.8 / (len(control_samples) + len(treated_samples))
+    group_spacing = 0.5
+    x = np.arange(len(mutations)) * (1 + group_spacing)
+    
+    # Plot control samples
+    for i, sample in enumerate(control_samples):
+        sample_data = df[df['sample'] == sample].set_index('mutation')['norm_count']
+        sample_values = [sample_data.get(mut, 0) for mut in mutations]
+        pos = x - (0.4) + (i * bar_width)
+        plt.bar(pos, sample_values, bar_width, color='lightgrey')
+    
+    # Plot treated samples with grouped colors
+    colors = [plt.cm.Oranges(0.3), plt.cm.Oranges(0.6), plt.cm.Oranges(0.9)]
+    current_idx = 0  # Keep track of overall position
+    for group_idx, group_samples in enumerate(sample_groups):
+        for i, sample in enumerate(group_samples):
+            sample_data = df[df['sample'] == sample].set_index('mutation')['norm_count']
+            sample_values = [sample_data.get(mut, 0) for mut in mutations]
+            pos = x + (current_idx * bar_width)  # Use running index instead of group calculation
+            plt.bar(pos, sample_values, bar_width, color=colors[group_idx])
+            current_idx += 1  # Increment position counter
+    
+    # Create legend with split groups
+    legend_elements = [
+        plt.Rectangle((0,0), 1, 1, color='lightgrey', label='Controls')
+    ]
+    
+    # Add legend entries for each subgroup
+    current_color_idx = 0
+    for i in range(len(group_labels)):
+        legend_elements.append(
+            plt.Rectangle((0,0), 1, 1, 
+                         color=colors[current_color_idx], 
+                         label=group_labels[i])
+        )
+        if i % 2 == 1:  # Increment color index after each pair
+            current_color_idx += 1
+    
+    plt.xlabel('Mutation Type')
+    plt.ylabel('Normalized Mutation Rate')
+    plt.title('EMS Mutation Type Frequencies by Sample')
+    plt.xticks(x, mutations, rotation=45)
+    # Change legend position
+    plt.legend(
+        handles=legend_elements, 
+        loc='upper right',  # Position in top right
+        bbox_to_anchor=(0.98, 0.98),  # Fine-tune position
+        framealpha=0.9  # Make legend background slightly transparent
+    )
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+def plot_ems_mutation_frequencies(data_path: str, output_dir: str) -> None:
+    '''Create bar plot of mutation frequencies using matplotlib.'''
     output_path = os.path.join(output_dir, 'ems_mutation_frequencies.png')
     
-    # Read the mutation frequencies from the CSV file
     df = pd.read_csv(data_path)
     
-    # Split data into control and treated groups
-    control = df[df['ems'] == '-'].groupby('mutation')['norm_count'].mean()
-    treated = df[df['ems'] == '+'].groupby('mutation')['norm_count'].mean()
+    # Split data into control and treated groups and sort mutations
+    mutations = sorted(df['mutation'].unique())
+    control = df[df['ems'] == '-'].groupby('mutation')['norm_count'].mean().reindex(mutations)
+    treated = df[df['ems'] == '+'].groupby('mutation')['norm_count'].mean().reindex(mutations)
     
     # Set up the plot
     plt.figure(figsize=(10, 6))
     
     # Create x-axis positions
-    mutations = control.index
     x = np.arange(len(mutations))
     
     # Create bars
@@ -215,6 +330,7 @@ def mutation_type_barplot(json_file_dir: list, base_counts: dict, output_file_di
     
     # Generate plot
     plot_ems_mutation_frequencies(mutation_frequence_csv, output_file_dir)
+    plot_ems_mutation_frequencies_per_sample(mutation_frequence_csv, output_file_dir)   
 
 def main():
     parser = argparse.ArgumentParser(description='Plot data from a JSON file.')
@@ -244,9 +360,10 @@ def main():
     if args.kmer_context:
         kmer_context_file_path = args.kmer_context
         kmer_context_data = load_json(kmer_context_file_path)
-        
+        genome_kmer_counts_file_path = mutation_json_file_dir + '/../kmer_counts.json'
+        genome_kmer_counts = load_json(genome_kmer_counts_file_path)
         # plot the kmer context barplot
-        plot_kmer_context(kmer_context_data, args.output_dir)
+        plot_kmer_context(kmer_context_data, genome_kmer_counts, args.output_dir)
         
         
 if __name__ == "__main__":
