@@ -176,18 +176,9 @@ def check_mutations(
 
     return muts, depth
 
-def parse_mpile(
-    mpile: str, 
-    seqobject: SeqContext, 
-    ems_only: bool, 
-    base_counts: Dict[str, int],
-    context_counts: Dict[str, int],
-    context_size: int = 3
-) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int]]:
-    '''Parse an mpileup file to identify mutations in genes.
-    
-    Iterates over an mpileup file calling check_mutations() for each position.
-    Collects mutations into a dictionary object to be returned.
+def parse_mpile(mpile: str, seqobject: SeqContext, ems_only: bool, base_counts: Dict[str, int],
+                context_counts: Dict[str, int], context_size: int = 3) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, int]]]:
+    '''Parse mpileup file to identify mutations in genes and intergenic regions.
     
     Args:
         mpile (str): Path to mpileup file
@@ -201,36 +192,62 @@ def parse_mpile(
         Tuple containing:
             - Dict[str, Dict[str, Any]]: Mutation data per gene
             - Dict[str, int]: Counts of mutation contexts
+            - Dict[str, Dict[str, int]]: Counts of intergenic mutations per sample
     '''
     annot_encoding = guess_type(seqobject.annot)[1]
     _open = partial(gzip.open, mode='rt') if annot_encoding == 'gzip' else open 
+    
     for rec in GFF.parse(_open(seqobject.annot)):
         mutations: Dict[str, Dict[str, Any]] = {}
+        intergenic_counts: Dict[str, Dict[str, int]] = {}  # Changed to dict of dicts
         encoding = guess_type(mpile)[1] 
         _open = partial(gzip.open, mode='rt') if encoding == 'gzip' else open
 
         samp = mpile.split('/')[-1]
         samp = samp.split('.')[0]
-        #counts[samp] = {'A':0,'T':0,'G':0,'C':0}
+        intergenic_counts[samp] = {}  # Initialize counts for this sample
 
         with _open(mpile) as mf:
-            #iterate over genes in gtf
             print('wol_parse | parsing mpileup: ' + mpile)
+            mpileup_iter = iter(mf)  # Create iterator for mpileup file
+            current_line = next(mpileup_iter, None)
+            
             for feat in tqdm(rec.features):
                 if feat.type == 'gene':
                     refid = feat.qualifiers['Dbxref'][0].split(':')[-1]
                     mutations[refid] = {
                         'mutations': {},
-                        'avg_cov': 0,  #avg and len are used for normalizing effect score
+                        'avg_cov': 0,
                         'gene_len': 0
                     }
                     loc = feat.location
-                    depths: List[int] = []
-                    #iterate over lines in mpileup 
-                    for l in mf:
-                        entry = l.split()
-                        #check if mpileup entry is in the gene 
-                        if int(entry[1])-1 in loc: 
+                    depths = []
+                    
+                    # Process lines until we reach or pass this gene
+                    while current_line:
+                        entry = current_line.split()
+                        pos = int(entry[1]) - 1
+                        
+                        # Process intergenic mutations before gene
+                        if pos < loc.start:
+                            muts, _ = check_mutations(
+                                entry,
+                                0,  # No gene start offset for intergenic
+                                samp, 
+                                ems_only, 
+                                base_counts,
+                                str(seqobject.genome),
+                                context_counts,
+                                context_size
+                            )
+                            # Count mutation types in intergenic region for this sample
+                            for mut in muts:
+                                mut_type = mut.split('_')[1]  # Get mutation type after position
+                                intergenic_counts[samp][mut_type] = intergenic_counts[samp].get(mut_type, 0) + muts[mut]
+                            current_line = next(mpileup_iter, None)
+                            
+                        # If position is in gene, process normally
+                        elif pos in loc:
                             muts, depth = check_mutations(
                                 entry, 
                                 loc.start, 
@@ -243,13 +260,35 @@ def parse_mpile(
                             )
                             depths.append(depth)
                             mutations[refid]['mutations'].update(muts)
-                        elif int(entry[1]) > loc.end:
+                            current_line = next(mpileup_iter, None)
+                            
+                        else:  # Position is past gene
                             break
+                            
                     try:
                         mutations[refid]['avg_cov'] = sum(depths) / len(depths)
                     except ZeroDivisionError:
                         mutations[refid]['avg_cov'] = 0
                     
                     mutations[refid]['gene_len'] = loc.end - loc.start
-        return mutations, context_counts
+                    
+            # Process any remaining lines as intergenic
+            while current_line:
+                entry = current_line.split()
+                muts, _ = check_mutations(
+                    entry,
+                    0,
+                    samp,
+                    ems_only,
+                    base_counts,
+                    str(seqobject.genome),
+                    context_counts,
+                    context_size
+                )
+                for mut in muts:
+                    mut_type = mut.split('_')[1]
+                    intergenic_counts[samp][mut_type] = intergenic_counts[samp].get(mut_type, 0) + muts[mut]
+                current_line = next(mpileup_iter, None)
+                
+        return mutations, context_counts, intergenic_counts
                             

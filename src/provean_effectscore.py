@@ -92,7 +92,7 @@ def process_mpileups(pile: str, mutpath: str, wolgenome: Any, ems_only: bool) ->
         context_counts[sample] = {}
         
         # Process mutations and count bases/contexts
-        nuc_muts, contexts = parse.parse_mpile(
+        nuc_muts, contexts, intergenic_counts = parse.parse_mpile(
             mpileup, 
             wolgenome, 
             ems_only, 
@@ -111,6 +111,10 @@ def process_mpileups(pile: str, mutpath: str, wolgenome: Any, ems_only: bool) ->
     # Save context counts
     with open(f"{mutpath}/contextcounts.json", 'w') as of:
         json.dump(context_counts, of)
+        
+    # Save intergenic counts
+    with open(f"{mutpath}/intergeniccounts.json", 'w') as of:
+        json.dump(intergenic_counts, of)
 
 def process_mutations(
     nuc_mut_files: List[str],
