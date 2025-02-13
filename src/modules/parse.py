@@ -12,6 +12,9 @@ from mimetypes import guess_type
 from selectors import EpollSelector
 from functools import partial
 from itertools import islice
+import multiprocessing as mp
+from glob import glob
+from pathlib import Path
 
 class SeqContext:
     '''A class to handle genomic sequence context and annotations.
@@ -176,119 +179,264 @@ def check_mutations(
 
     return muts, depth
 
-def parse_mpile(mpile: str, seqobject: SeqContext, ems_only: bool, base_counts: Dict[str, int],
-                context_counts: Dict[str, int], context_size: int = 3) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, int]]]:
-    '''Parse mpileup file to identify mutations in genes and intergenic regions.
+def process_mpileup_chunk(args: Tuple[str, List[str], SeqContext, bool, List[Tuple], int, int, int]) -> Tuple[str, Dict, Dict, Dict]:
+    '''Process a chunk of mpileup lines.
     
     Args:
-        mpile (str): Path to mpileup file
-        seqobject (SeqContext): Genomic context object containing sequence and annotations
-        ems_only (bool): If True, only process EMS canonical mutations
-        base_counts (Dict[str, int]): Dictionary to track base counts
-        context_counts (Dict[str, int]): Dictionary to track context counts
-        context_size (int): Size of context window (3 or 5)
-        
+        args (Tuple): Contains:
+            - sample (str): Sample name
+            - lines (List[str]): Chunk of mpileup lines
+            - seqobject (SeqContext): Genome context object
+            - ems_only (bool): Whether to only process EMS mutations
+            - gff_features (List[Tuple]): Sorted list of gene features
+            - context_size (int): Size of context window
+            - start_idx (int): Starting line index
+            - chunk_size (int): Size of chunk
+            
     Returns:
         Tuple containing:
-            - Dict[str, Dict[str, Any]]: Mutation data per gene
-            - Dict[str, int]: Counts of mutation contexts
-            - Dict[str, Dict[str, int]]: Counts of intergenic mutations per sample
+            - str: Sample name
+            - Dict: Mutations per gene
+            - Dict: Base counts
+            - Dict: Intergenic counts with:
+                - mutations: Dict of mutation types and counts
+                - gc_sites: Count of G/C bases in intergenic regions
+                - total_sites: Total bases in intergenic regions
+                - coverage: List of coverage values for averaging
     '''
-    annot_encoding = guess_type(seqobject.annot)[1]
-    _open = partial(gzip.open, mode='rt') if annot_encoding == 'gzip' else open 
+    sample, lines, seqobject, ems_only, gff_features, context_size, start_idx, chunk_size = args
     
-    for rec in GFF.parse(_open(seqobject.annot)):
-        mutations: Dict[str, Dict[str, Any]] = {}
-        intergenic_counts: Dict[str, Dict[str, int]] = {}  # Changed to dict of dicts
-        encoding = guess_type(mpile)[1] 
-        _open = partial(gzip.open, mode='rt') if encoding == 'gzip' else open
-
-        samp = mpile.split('/')[-1]
-        samp = samp.split('.')[0]
-        intergenic_counts[samp] = {}  # Initialize counts for this sample
-
-        with _open(mpile) as mf:
-            print('wol_parse | parsing mpileup: ' + mpile)
-            mpileup_iter = iter(mf)  # Create iterator for mpileup file
-            current_line = next(mpileup_iter, None)
+    mutations = {}
+    base_counts = {'A': 0, 'T': 0, 'G': 0, 'C': 0}
+    context_counts = {}
+    intergenic_counts = {
+        sample: {
+            'mutations': {},  # Store mutation types and counts
+            'gc_sites': 0,    # Count of G and C bases in intergenic regions
+            'total_sites': 0, # Total bases in intergenic regions
+            'coverage': [],   # List to track coverage for averaging
+        }
+    }
+    
+    current_gene_idx = 0
+    current_gene = None if not gff_features else gff_features[0]
+    
+    for line in lines:
+        entry = line.split()
+        pos = int(entry[1]) - 1
+        ref = entry[2]
+        depth = int(entry[3])
+        
+        # Move to next gene if we're past the current one
+        while current_gene and pos > current_gene[1]:
+            current_gene_idx += 1
+            if current_gene_idx < len(gff_features):
+                current_gene = gff_features[current_gene_idx]
+            else:
+                current_gene = None
+                break
+        
+        # Process mutations based on position
+        muts, depth = check_mutations(
+            entry,
+            current_gene[0] if current_gene and pos >= current_gene[0] else 0,
+            sample,
+            ems_only,
+            base_counts,
+            str(seqobject.genome),
+            context_counts,
+            context_size
+        )
+        
+        # Add mutations to appropriate collection
+        if current_gene and current_gene[0] <= pos <= current_gene[1]:
+            # Gene mutation handling remains the same
+            gene_id = current_gene[2]
+            if gene_id not in mutations:
+                mutations[gene_id] = {
+                    'mutations': {},
+                    'avg_cov': 0,
+                    'gene_len': current_gene[1] - current_gene[0],
+                    'depths': []
+                }
+            mutations[gene_id]['mutations'].update(muts)
+            mutations[gene_id]['depths'].append(depth)
+        else:
+            # Intergenic region - track mutations, GC content, and coverage
+            intergenic_counts[sample]['total_sites'] += 1
+            intergenic_counts[sample]['coverage'].append(depth)
+            if ref in ['G', 'C']:
+                intergenic_counts[sample]['gc_sites'] += 1
             
-            for feat in tqdm(rec.features):
+            for mut in muts:
+                mut_type = mut.split('_')[1]
+                if 'mutations' not in intergenic_counts[sample]:
+                    intergenic_counts[sample]['mutations'] = {}
+                intergenic_counts[sample]['mutations'][mut_type] = \
+                    intergenic_counts[sample]['mutations'].get(mut_type, 0) + muts[mut]
+    
+    return sample, mutations, base_counts, intergenic_counts
+
+def get_chunk_boundaries(mpileup_file, chunk_size: int, gff_features: List[Tuple]) -> List[Tuple[int, int]]:
+    '''Determine chunk boundaries that don't split genes.
+    
+    Args:
+        mpileup_file: Open file handle to mpileup
+        chunk_size: Target size for chunks
+        gff_features: Sorted list of gene features
+        
+    Returns:
+        List[Tuple[int, int]]: List of (start_line, end_line) for each chunk
+    '''
+    boundaries = []
+    current_start = 0
+    current_lines = []
+    current_pos = 0
+    
+    for i, line in enumerate(mpileup_file):
+        current_lines.append(line)
+        pos = int(line.split()[1])
+        
+        # Check if we've hit our target chunk size
+        if len(current_lines) >= chunk_size:
+            # Find the next gene boundary
+            for gene_start, gene_end, _, _ in gff_features:
+                if gene_start > pos:
+                    # Found next gene - use this as boundary
+                    while current_lines and int(current_lines[-1].split()[1]) >= gene_start:
+                        current_lines.pop()
+                    boundaries.append((current_start, current_start + len(current_lines)))
+                    current_start += len(current_lines)
+                    current_lines = []
+                    break
+            
+            # If we didn't find a gene boundary, use chunk size
+            if current_lines:
+                boundaries.append((current_start, current_start + len(current_lines)))
+                current_start += len(current_lines)
+                current_lines = []
+                
+    # Handle remaining lines
+    if current_lines:
+        boundaries.append((current_start, current_start + len(current_lines)))
+    
+    return boundaries
+
+def parse_mpile(mpile: str, 
+                seqobject: SeqContext, 
+                ems_only: bool, 
+                base_counts: Dict[str, int],
+                context_counts: Dict[str, int], 
+                context_size: int = 3,
+                chunk_size: int = 100000
+                ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, int]]]:
+    '''Parse mpileup files in parallel to identify mutations.'''
+    # Load and sort GFF features once
+    gff_features = []
+    with open(seqobject.annot) as gff_file:
+        for rec in GFF.parse(gff_file):
+            for feat in rec.features:
                 if feat.type == 'gene':
-                    refid = feat.qualifiers['Dbxref'][0].split(':')[-1]
-                    mutations[refid] = {
+                    gff_features.append((
+                        feat.location.start,
+                        feat.location.end,
+                        feat.qualifiers['Dbxref'][0].split(':')[-1],
+                        feat.location
+                    ))
+    gff_features.sort(key=lambda x: x[0])
+    
+    # Get list of mpileup files
+    if os.path.isdir(mpile):
+        mpileup_files = glob(os.path.join(mpile, "*.mpileup*"))
+    else:
+        mpileup_files = [mpile]
+    
+    # Process each mpileup file in chunks
+    all_mutations = {}
+    all_intergenic = {}
+    
+    for mpileup in mpileup_files:
+        sample = Path(mpileup).stem
+        print(f"Processing {sample}...")
+        
+        encoding = guess_type(mpileup)[1]
+        _open = partial(gzip.open, mode='rt') if encoding == 'gzip' else open
+        
+        with _open(mpileup) as f:
+            # First pass to get chunk boundaries
+            chunk_boundaries = get_chunk_boundaries(f, chunk_size, gff_features)
+            f.seek(0)  # Reset file pointer
+            
+            # Read file in chunks based on boundaries
+            chunk_args = []
+            for start_idx, end_idx in chunk_boundaries:
+                current_chunk = list(islice(f, end_idx - start_idx))
+                if current_chunk:
+                    chunk_args.append((
+                        sample, current_chunk, seqobject, ems_only, 
+                        gff_features, context_size, start_idx, len(current_chunk)
+                    ))
+        
+        # Process chunks in parallel
+        with mp.Pool() as pool:
+            chunk_results = list(pool.imap(process_mpileup_chunk, chunk_args))
+        
+        # Combine chunk results
+        sample_mutations = {}
+        sample_intergenic = {
+            'mutations': {},
+            'gc_sites': 0,
+            'total_sites': 0,
+            'avg_coverage': 0,
+            'coverage_depths': []
+        }
+        sample_base_counts = {'A': 0, 'T': 0, 'G': 0, 'C': 0}
+        
+        for _, mutations, counts, intergenic in chunk_results:
+            # Combine mutations
+            for gene_id, gene_data in mutations.items():
+                if gene_id not in sample_mutations:
+                    sample_mutations[gene_id] = {
                         'mutations': {},
                         'avg_cov': 0,
-                        'gene_len': 0
+                        'gene_len': gene_data['gene_len'],
+                        'depths': []
                     }
-                    loc = feat.location
-                    depths = []
-                    
-                    # Process lines until we reach or pass this gene
-                    while current_line:
-                        entry = current_line.split()
-                        pos = int(entry[1]) - 1
-                        
-                        # Process intergenic mutations before gene
-                        if pos < loc.start:
-                            muts, _ = check_mutations(
-                                entry,
-                                0,  # No gene start offset for intergenic
-                                samp, 
-                                ems_only, 
-                                base_counts,
-                                str(seqobject.genome),
-                                context_counts,
-                                context_size
-                            )
-                            # Count mutation types in intergenic region for this sample
-                            for mut in muts:
-                                mut_type = mut.split('_')[1]  # Get mutation type after position
-                                intergenic_counts[samp][mut_type] = intergenic_counts[samp].get(mut_type, 0) + muts[mut]
-                            current_line = next(mpileup_iter, None)
-                            
-                        # If position is in gene, process normally
-                        elif pos in loc:
-                            muts, depth = check_mutations(
-                                entry, 
-                                loc.start, 
-                                samp, 
-                                ems_only, 
-                                base_counts,
-                                str(seqobject.genome),
-                                context_counts,
-                                context_size
-                            )
-                            depths.append(depth)
-                            mutations[refid]['mutations'].update(muts)
-                            current_line = next(mpileup_iter, None)
-                            
-                        else:  # Position is past gene
-                            break
-                            
-                    try:
-                        mutations[refid]['avg_cov'] = sum(depths) / len(depths)
-                    except ZeroDivisionError:
-                        mutations[refid]['avg_cov'] = 0
-                    
-                    mutations[refid]['gene_len'] = loc.end - loc.start
-                    
-            # Process any remaining lines as intergenic
-            while current_line:
-                entry = current_line.split()
-                muts, _ = check_mutations(
-                    entry,
-                    0,
-                    samp,
-                    ems_only,
-                    base_counts,
-                    str(seqobject.genome),
-                    context_counts,
-                    context_size
-                )
-                for mut in muts:
-                    mut_type = mut.split('_')[1]
-                    intergenic_counts[samp][mut_type] = intergenic_counts[samp].get(mut_type, 0) + muts[mut]
-                current_line = next(mpileup_iter, None)
-                
-        return mutations, context_counts, intergenic_counts
+                sample_mutations[gene_id]['mutations'].update(gene_data['mutations'])
+                sample_mutations[gene_id]['depths'].extend(gene_data['depths'])
+            
+            # Combine intergenic data
+            chunk_intergenic = intergenic[sample]
+            if 'mutations' in chunk_intergenic:
+                for mut_type, count in chunk_intergenic['mutations'].items():
+                    sample_intergenic['mutations'][mut_type] = \
+                        sample_intergenic['mutations'].get(mut_type, 0) + count
+            
+            sample_intergenic['gc_sites'] += chunk_intergenic['gc_sites']
+            sample_intergenic['total_sites'] += chunk_intergenic['total_sites']
+            sample_intergenic['coverage_depths'].extend(chunk_intergenic['coverage'])
+            
+            # Combine base counts
+            for base, count in counts.items():
+                sample_base_counts[base] += count
+        
+        # Calculate final averages
+        for gene_id in sample_mutations:
+            depths = sample_mutations[gene_id]['depths']
+            sample_mutations[gene_id]['avg_cov'] = sum(depths) / len(depths) if depths else 0
+            del sample_mutations[gene_id]['depths']
+        
+        # For intergenic regions
+        if sample_intergenic['coverage_depths']:
+            sample_intergenic['avg_coverage'] = \
+                sum(sample_intergenic['coverage_depths']) / len(sample_intergenic['coverage_depths'])
+        del sample_intergenic['coverage_depths']  # Clean up temporary list
+        
+        # Update global results
+        all_mutations.update(sample_mutations)
+        all_intergenic[sample] = sample_intergenic
+        for base, count in sample_base_counts.items():
+            base_counts[base] = base_counts.get(base, 0) + count
+    
+    return all_mutations, context_counts, all_intergenic
                             
