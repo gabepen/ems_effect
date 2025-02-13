@@ -8,6 +8,7 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 import re
+from pathlib import Path
 
 def load_json(file_path):
     with open(file_path, 'r') as file:
@@ -19,7 +20,7 @@ def count_mutations(json_files: list) -> dict:
     
     Args:
         json_files (list): List of paths to mutation JSON files
-        
+    
     Returns:
         dict: Dictionary of mutation frequencies per sample
     '''
@@ -28,7 +29,8 @@ def count_mutations(json_files: list) -> dict:
     # iterate over each sample json file in the directory
     for mutation_json in json_files:
         # get sample name from the file path
-        sample = mutation_json.split('/')[-1].split('.')[0]
+        mutation_json = Path(mutation_json)  # Convert to Path if not already
+        sample = mutation_json.stem  # Use Path.stem instead of split
         
         # initialize the total frequencies for the sample
         total_freqs[sample] = {}
@@ -53,7 +55,7 @@ def count_mutations(json_files: list) -> dict:
                     total_freqs[sample][mutation_type] = mutation_counts[gene]['mutations'][site]
                 else:
                     total_freqs[sample][mutation_type] += mutation_counts[gene]['mutations'][site] 
-                
+               
     return total_freqs
 
 def plot_kmer_context(data_dict: dict, genome_kmer_counts: dict, output_dir: str) -> None:
@@ -105,12 +107,48 @@ def plot_kmer_context(data_dict: dict, genome_kmer_counts: dict, output_dir: str
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     
+def extract_sample_id(sample):
+    '''Extract abbreviated sample ID from full sample name.
+    
+    Args:
+        sample (str): Full sample name
+        
+    Returns:
+        str: Abbreviated sample identifier
+    '''
+    # First get the basic ID
+    if 'EMS-' in sample:
+        sample_id = sample.split('EMS-')[1]
+        prefix = 'EMS'
+    elif 'EMS' in sample:
+        sample_id = sample.split('EMS')[1]
+        prefix = 'EMS'
+    elif 'NT-' in sample:
+        sample_id = sample.split('NT-')[1]
+        prefix = 'NT'
+    elif 'NT' in sample:
+        sample_id = sample.split('NT')[1]
+        prefix = 'NT'
+    else:
+        return sample
+        
+    # Clean up the ID to just keep number and treatment time if present
+    if '_' in sample_id:
+        # Handle cases like "1_3d" or "6_7d"
+        parts = sample_id.split('_')
+        if len(parts) >= 2 and 'd' in parts[1]:
+            return f"{parts[0]}_{parts[1].split('_')[0]}"  # Keep just the number and days
+        return f"{parts[0]}"  # Just keep the number if no valid treatment time
+    
+    # Remove any trailing text after numbers
+    number = re.match(r'\d+', sample_id)
+    return f"{number.group()}" if number else sample_id
+
 def plot_ems_mutation_frequencies_per_sample(data_path: str, output_dir: str) -> None:
     '''Create bar plot of mutation frequencies per sample using matplotlib.'''
     output_path = os.path.join(output_dir, 'ems_mutation_frequencies_per_sample.png')
     
     df = pd.read_csv(data_path)
-    # Sort mutations alphabetically
     mutations = sorted(df['mutation'].unique())
     control_samples = df[df['ems'] == '-']['sample'].unique()
     
@@ -130,28 +168,6 @@ def plot_ems_mutation_frequencies_per_sample(data_path: str, output_dir: str) ->
     for size in group_sizes:
         sample_groups.append(treated_samples[start_idx:start_idx + size])
         start_idx += size
-    
-    # Extract sample numbers/identifiers for legend
-    def extract_sample_id(sample):
-        # First get the basic ID
-        if 'EMS-' in sample:
-            sample_id = sample.split('EMS-')[1]
-        elif 'EMS' in sample:
-            sample_id = sample.split('EMS')[1]
-        else:
-            return sample
-            
-        # Clean up the ID to just keep number and treatment time if present
-        if '_' in sample_id:
-            # Handle cases like "1_3d" or "6_7d"
-            parts = sample_id.split('_')
-            if len(parts) >= 2 and 'd' in parts[1]:
-                return f"{parts[0]}_{parts[1].split('_')[0]}"  # Keep just the number and days
-            return parts[0]  # Just keep the number if no valid treatment time
-        
-        # Remove any trailing text after numbers
-        number = re.match(r'\d+', sample_id)
-        return number.group() if number else sample_id
     
     group_labels = []
     for i, group in enumerate(['Low', 'Medium', 'High']):
@@ -220,7 +236,7 @@ def plot_ems_mutation_frequencies_per_sample(data_path: str, output_dir: str) ->
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
 def plot_ems_mutation_frequencies(data_path: str, output_dir: str) -> None:
     '''Create bar plot of mutation frequencies using matplotlib.'''
     output_path = os.path.join(output_dir, 'ems_mutation_frequencies.png')
@@ -314,6 +330,57 @@ def normalize_mutation_counts(total_freqs: dict, base_counts: dict, output_file_
     
     return output_file
 
+def plot_dnds_ratio(amino_acid_mutations: dict, output_dir: str, sample_name: str) -> None:
+    '''Plot dN/dS ratio vs gene length and coverage.
+    
+    Args:
+        amino_acid_mutations (dict): Dictionary containing amino acid mutation data per gene
+        output_dir (str): Directory to save output plots
+        sample_name (str): Name of the sample for plot labeling
+    '''
+    # Extract data from amino_acid_mutations
+    genes = []
+    syn_ratios = []
+    gene_lengths = []
+    coverages = []
+    
+    for gene in amino_acid_mutations:
+        if 'syn_ratio' in amino_acid_mutations[gene] and 'gene_len' in amino_acid_mutations[gene]:
+            genes.append(gene)
+            syn_ratios.append(amino_acid_mutations[gene]['syn_ratio'])
+            gene_lengths.append(amino_acid_mutations[gene]['gene_len'])
+            coverages.append(amino_acid_mutations[gene].get('avg_cov', 0))
+    
+    # Calculate average dN/dS
+    avg_dnds = sum(syn_ratios) / len(syn_ratios) if syn_ratios else 0
+    print(f"Average dN/dS ratio for {sample_name}: {avg_dnds:.3f}")
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Plot dN/dS vs gene length
+    ax1.scatter(gene_lengths, syn_ratios, alpha=0.5, color='darkorange')
+    ax1.set_xlabel('Gene Length (bp)')
+    ax1.set_ylabel('dN/dS Ratio')
+    ax1.set_title(f'dN/dS Ratio vs Gene Length - {sample_name}')
+    ax1.set_xscale('log')
+    ax1.set_yscale('log')
+    ax1.yaxis.set_major_formatter(plt.ScalarFormatter())
+    
+    # Plot dN/dS vs coverage
+    ax2.scatter(coverages, syn_ratios, alpha=0.5, color='darkorange') 
+    ax2.set_xlabel('Average Coverage')
+    ax2.set_ylabel('dN/dS Ratio')
+    ax2.set_title(f'dN/dS Ratio vs Coverage - {sample_name}')
+    ax2.set_xscale('log')
+    ax2.set_yscale('log')
+    ax2.yaxis.set_major_formatter(plt.ScalarFormatter())
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'dnds_relationships_{sample_name}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
 def mutation_type_barplot(json_file_dir: list, base_counts: dict, output_file_dir: str):
     '''Generate mutation type frequency barplot using basecounts for normalization.
     
@@ -332,39 +399,232 @@ def mutation_type_barplot(json_file_dir: list, base_counts: dict, output_file_di
     plot_ems_mutation_frequencies(mutation_frequence_csv, output_file_dir)
     plot_ems_mutation_frequencies_per_sample(mutation_frequence_csv, output_file_dir)   
 
+def plot_combined_dnds_ratios(aa_mutations_files: list, output_dir: str) -> None:
+    '''Create combined dN/dS ratio plot for all samples.
+    
+    Args:
+        aa_mutations_files (list): List of paths to amino acid mutation JSON files
+        output_dir (str): Directory to save output plots
+    '''
+    # Data structures to hold all samples
+    all_data = {
+        'gene_lengths': [],
+        'coverages': [],
+        'syn_ratios': [],
+        'is_control': []  # True for control samples, False for treated
+    }
+    
+    # Process each sample
+    for aa_file in aa_mutations_files:
+        with open(aa_file) as f:
+            aa_mutations = json.load(f)
+            
+        # Determine if control sample
+        is_control = any(x in aa_file.stem for x in ['NT', 'Minus', 'Pre'])
+        
+        # Extract data
+        for gene in aa_mutations:
+            if 'syn_ratio' in aa_mutations[gene] and 'gene_len' in aa_mutations[gene]:
+                all_data['gene_lengths'].append(aa_mutations[gene]['gene_len'])
+                all_data['coverages'].append(aa_mutations[gene].get('avg_cov', 0))
+                all_data['syn_ratios'].append(aa_mutations[gene]['syn_ratio'])
+                all_data['is_control'].append(is_control)
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Plot dN/dS vs gene length
+    for is_control, color, label in [(True, 'lightgrey', 'Control'), (False, 'darkorange', 'EMS Treated')]:
+        mask = [x == is_control for x in all_data['is_control']]
+        ax1.scatter(
+            [l for l, m in zip(all_data['gene_lengths'], mask) if m],
+            [r for r, m in zip(all_data['syn_ratios'], mask) if m],
+            alpha=0.5,
+            color=color,
+            label=label
+        )
+    
+    ax1.set_xlabel('Gene Length (bp)')
+    ax1.set_ylabel('dN/dS Ratio')
+    ax1.set_title('dN/dS Ratio vs Gene Length - All Samples')
+    ax1.set_xscale('log')
+    ax1.set_yscale('log')
+    ax1.yaxis.set_major_formatter(plt.ScalarFormatter())
+    ax1.legend()
+    
+    # Plot dN/dS vs coverage
+    for is_control, color, label in [(True, 'lightgrey', 'Control'), (False, 'darkorange', 'EMS Treated')]:
+        mask = [x == is_control for x in all_data['is_control']]
+        ax2.scatter(
+            [c for c, m in zip(all_data['coverages'], mask) if m],
+            [r for r, m in zip(all_data['syn_ratios'], mask) if m],
+            alpha=0.5,
+            color=color,
+            label=label
+        )
+    
+    ax2.set_xlabel('Average Coverage')
+    ax2.set_ylabel('dN/dS Ratio')
+    ax2.set_title('dN/dS Ratio vs Coverage - All Samples')
+    ax2.set_xscale('log')
+    ax2.set_yscale('log')
+    ax2.yaxis.set_major_formatter(plt.ScalarFormatter())
+    ax2.legend()
+    
+    # Calculate and print average dN/dS for control and treated
+    control_ratios = [r for r, c in zip(all_data['syn_ratios'], all_data['is_control']) if c]
+    treated_ratios = [r for r, c in zip(all_data['syn_ratios'], all_data['is_control']) if not c]
+    
+    avg_control = sum(control_ratios) / len(control_ratios) if control_ratios else 0
+    avg_treated = sum(treated_ratios) / len(treated_ratios) if treated_ratios else 0
+    
+    print(f"\nAverage dN/dS ratios:")
+    print(f"Control samples: {avg_control:.3f}")
+    print(f"Treated samples: {avg_treated:.3f}")
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'dnds_relationships_combined.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_sample_dnds_vs_coverage(aa_mutations_files: list, output_dir: str) -> None:
+    '''Create plot comparing average dN/dS ratio vs average coverage across samples.
+    
+    Args:
+        aa_mutations_files (list): List of paths to amino acid mutation JSON files
+        output_dir (str): Directory to save output plots
+    '''
+    # Data structures for sample averages
+    sample_data = {
+        'names': [],
+        'avg_dnds': [],
+        'avg_coverage': [],
+        'is_control': []
+    }
+    
+    # Calculate averages for each sample
+    for aa_file in aa_mutations_files:
+        with open(aa_file) as f:
+            aa_mutations = json.load(f)
+            
+        # Get sample info
+        sample_name = aa_file.stem
+        is_control = any(x in sample_name for x in ['NT', 'Minus', 'Pre'])
+        
+        # Calculate averages across genes
+        dnds_values = []
+        coverage_values = []
+        for gene in aa_mutations:
+            if 'syn_ratio' in aa_mutations[gene] and 'avg_cov' in aa_mutations[gene]:
+                dnds_values.append(aa_mutations[gene]['syn_ratio'])
+                coverage_values.append(aa_mutations[gene]['avg_cov'])
+        
+        if dnds_values and coverage_values:  # Only add if we have data
+            sample_data['names'].append(sample_name)
+            sample_data['avg_dnds'].append(sum(dnds_values) / len(dnds_values))
+            sample_data['avg_coverage'].append(sum(coverage_values) / len(coverage_values))
+            sample_data['is_control'].append(is_control)
+    
+    # Create plot
+    plt.figure(figsize=(8, 6))
+    
+    # Plot points with different colors for control/treated
+    for is_control, color, label in [(True, 'lightgrey', 'Control'), (False, 'darkorange', 'EMS Treated')]:
+        mask = [x == is_control for x in sample_data['is_control']]
+        plt.scatter(
+            [c for c, m in zip(sample_data['avg_coverage'], mask) if m],
+            [d for d, m in zip(sample_data['avg_dnds'], mask) if m],
+            alpha=0.7,
+            color=color,
+            label=label,
+            s=100  # Larger point size
+        )
+    
+    # Add sample labels with abbreviated IDs
+    for i, txt in enumerate(sample_data['names']):
+        abbreviated_name = extract_sample_id(txt)
+        plt.annotate(abbreviated_name, 
+                    (sample_data['avg_coverage'][i], sample_data['avg_dnds'][i]),
+                    xytext=(10, 10),  # Increased offset from (5, 5)
+                    textcoords='offset points',
+                    fontsize=8,
+                    arrowprops=dict(arrowstyle='-', color='gray', alpha=0.5))  # Add connecting lines
+    
+    plt.xlabel('Average Coverage')
+    plt.ylabel('Average dN/dS Ratio')
+    plt.title('Sample Average dN/dS Ratio vs Coverage')
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.gca().yaxis.set_major_formatter(plt.ScalarFormatter())
+    plt.legend()
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'sample_dnds_vs_coverage.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
 def main():
-    parser = argparse.ArgumentParser(description='Plot data from a JSON file.')
-    parser.add_argument('-j', '--result_json', type=str, help='Path to the final results JSON file')
-    parser.add_argument('-m', '--mutation_jsons', type=str, help='Path to the nucleotide mutation JSON file directory')
-    parser.add_argument('-k', '--kmer_context', type=str, help='Path to the kmer context JSON file')
-    parser.add_argument('-o', '--output_dir', type=str, help='Path to the output directory')
+    parser = argparse.ArgumentParser(description='Generate plots from analysis results')
+    parser.add_argument('-r', '--results_dir', type=str, required=True,
+                       help='Path to results directory containing analysis outputs')
+    parser.add_argument('-o', '--output_dir', type=str, required=True,
+                       help='Path to output directory for plots')
     args = parser.parse_args()
 
-    if args.result_json:
-        json_file_path = args.result_json
-        result_data = load_json(json_file_path)
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Check for and process different result files
+    results_dir = Path(args.results_dir)
     
-    if args.mutation_jsons:
-        mutation_json_file_dir = args.mutation_jsons
-        
-        # collect all the mutation json files
-        jsons = glob(mutation_json_file_dir + '/*.json')
-        
-        # load the base counts json file into a dictionary  
-        with open(mutation_json_file_dir + '/../basecounts.json') as f:
-            base_counts = json.load(f)
-        
-        # plot the mutation type barplot
-        mutation_type_barplot(jsons, base_counts, args.output_dir)
-    
-    if args.kmer_context:
-        kmer_context_file_path = args.kmer_context
-        kmer_context_data = load_json(kmer_context_file_path)
-        genome_kmer_counts_file_path = mutation_json_file_dir + '/../kmer_counts.json'
-        genome_kmer_counts = load_json(genome_kmer_counts_file_path)
-        # plot the kmer context barplot
-        plot_kmer_context(kmer_context_data, genome_kmer_counts, args.output_dir)
-        
+    # Mutation frequency plots
+    nuc_mut_dir = results_dir / 'nuc_muts'
+    jsons = list(nuc_mut_dir.glob('*.json'))
+    if jsons:  # Only proceed if JSON files exist
+        basecounts_file = results_dir / 'basecounts.json'
+        if basecounts_file.exists():
+            print("Generating mutation frequency plots...")
+            with open(basecounts_file) as f:
+                base_counts = json.load(f)
+            # Remove basecounts.json from jsons list
+            jsons = [j for j in jsons if j.stem != 'basecounts']
+            if jsons:  # Check if there are mutation JSONs after filtering
+                mutation_type_barplot(jsons, base_counts, args.output_dir)
+
+    # dN/dS ratio plots
+    aa_mut_dir = results_dir / 'aa_muts'
+    aa_mut_files = list(aa_mut_dir.glob('*.json'))
+    if aa_mut_files:  # Only proceed if JSON files exist
+        # Filter out basecounts or other non-mutation files
+        aa_mut_files = [f for f in aa_mut_files if f.stem != 'basecounts']
+        if aa_mut_files:  # Check if there are mutation JSONs after filtering
+            # Generate individual sample plots
+            for aa_file in aa_mut_files:
+                print(f"Generating dN/dS plots for {aa_file.stem}...")
+                with open(aa_file) as f:
+                    aa_mutations = json.load(f)
+                plot_dnds_ratio(aa_mutations, args.output_dir, aa_file.stem)
+            
+            # Generate combined plot
+            print("\nGenerating combined dN/dS plot...")
+            plot_combined_dnds_ratios(aa_mut_files, args.output_dir)
+            
+            # Generate sample-level comparison plot
+            print("Generating sample-level dN/dS comparison plot...")
+            plot_sample_dnds_vs_coverage(aa_mut_files, args.output_dir)
+
+    # Kmer context plots
+    kmer_file = results_dir / 'kmer_context.json'
+    kmer_counts_file = results_dir / 'kmer_counts.json'
+    if kmer_file.exists() and kmer_counts_file.exists():
+        # Verify files contain data
+        if os.path.getsize(kmer_file) > 0 and os.path.getsize(kmer_counts_file) > 0:
+            print("Generating kmer context plots...")
+            with open(kmer_file) as f:
+                kmer_context = json.load(f)
+            with open(kmer_counts_file) as f:
+                genome_kmer_counts = json.load(f)
+            plot_kmer_context(kmer_context, genome_kmer_counts, args.output_dir)
         
 if __name__ == "__main__":
     main()

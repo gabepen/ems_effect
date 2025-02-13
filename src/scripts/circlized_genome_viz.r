@@ -276,11 +276,25 @@ circos.genomicTrackPlotRegion(
   track.height=0.2,
   ylim = c(0, ylimit),
   panel.fun=function(region, value, ...) {
+    # Split the counts into EMS and non-EMS
+    ems_count <- ifelse(grepl("C>T|G>A", value$color), value$count, 0)  # Adjust this condition based on your EMS criteria
+    non_ems_count <- value$count - ems_count
+    
+    # Plot EMS canonical mutations in dark orange
     circos.genomicRect(region, value,
-                      col=value$color,
-                      ytop=pmin(as.numeric(value$count), ylimit),
+                      col="darkorange",
+                      ytop=pmin(ems_count, ylimit),
                       ybottom=0,
                       border=NA, ...)
+    
+    # Plot non-EMS mutations in dark grey
+    circos.genomicRect(region, value,
+                      col="darkgrey",
+                      ytop=pmin(non_ems_count, ylimit),
+                      ybottom=0,
+                      border=NA, ...)
+    
+    # Add a line at the bottom of the track
     cell.xlim = get.cell.meta.data("cell.xlim")
     circos.lines(cell.xlim, c(0, 0), lty=1, col="#000000")
   }
