@@ -69,17 +69,15 @@ def setup_directories(outdir: str) -> Dict[str, str]:
         'provpath': f"{outdir}/provean_files"
     }
 
-def process_mpileups(pile: str, mutpath: str, wolgenome: Any, ems_only: bool) -> None:
+def process_mpileups(pile: str, mutpath: str, outdir: str, wolgenome: Any, ems_only: bool) -> None:
     '''Process mpileup files and generate nucleotide mutation JSONs.
     
     Args:
         pile (str): Path to directory containing mpileup files
         mutpath (str): Output directory path for mutation JSON files
+        outdir (str): Main output directory for summary files
         wolgenome (SeqContext): Genome context object containing sequence and annotation info
         ems_only (bool): Flag to process only EMS mutations
-        
-    Returns:
-        None: Results are written to JSON files in mutpath directory
     '''
     piles = glob(pile + '/*_variants.txt')
     base_counts: Dict[str, Dict[str, int]] = {}
@@ -104,16 +102,14 @@ def process_mpileups(pile: str, mutpath: str, wolgenome: Any, ems_only: bool) ->
         with open(f"{mutpath}/{sample}.json", 'w') as of:
             json.dump(nuc_muts, of)
     
-    # Save base counts
-    with open(f"{mutpath}/basecounts.json", 'w') as of:
+    # Save summary files to main results directory
+    with open(f"{outdir}/results/basecounts.json", 'w') as of:
         json.dump(base_counts, of)
         
-    # Save context counts
-    with open(f"{mutpath}/contextcounts.json", 'w') as of:
+    with open(f"{outdir}/results/contextcounts.json", 'w') as of:
         json.dump(context_counts, of)
         
-    # Save intergenic counts
-    with open(f"{mutpath}/intergeniccounts.json", 'w') as of:
+    with open(f"{outdir}/results/intergeniccounts.json", 'w') as of:
         json.dump(intergenic_counts, of)
 
 def process_mutations(
@@ -369,7 +365,7 @@ def main() -> None:
     
     # Process mpileups if not skipped
     if not args.skip_parse:
-        process_mpileups(args.mpileups, paths['mutpath'], wolgenome, args.exclude)
+        process_mpileups(args.mpileups, paths['mutpath'], args.output.rstrip('/'), wolgenome, args.exclude)
         print('nuc_mutation jsons generated')
         input()
     

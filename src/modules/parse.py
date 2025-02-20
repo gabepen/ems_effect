@@ -249,7 +249,7 @@ def process_mpileup_chunk(args: Tuple[str, List[str], SeqContext, bool, List[Tup
         )
         
         # Add mutations to appropriate collection
-        if current_gene and current_gene[0] <= pos <= current_gene[1]:
+        if current_gene and current_gene[0] <= pos < current_gene[1]:
             # Gene mutation handling remains the same
             gene_id = current_gene[2]
             if gene_id not in mutations:

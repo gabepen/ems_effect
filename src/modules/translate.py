@@ -9,7 +9,7 @@ import numpy as np
 from Bio import SeqIO
 from BCBio import GFF
 from modules.parse import SeqContext
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 def table_lookup(codon: str) -> str:
     '''Look up amino acid for a given codon using global codon table.
@@ -72,26 +72,21 @@ def ems_immune_codons(codon_table: Dict[str, List[str]]) -> List[str]:
     return sorted(immune_codons)
 
 
-def hgvs_notation(mut: str) -> str:
-    '''Convert mutation from internal format to HGVS notation.
-    
-    Args:
-        mut (str): Mutation in format "position_ref>alt"
-        
-    Returns:
-        str: Mutation in HGVS format "refPOSalt"
+def hgvs_notation(mut):
+    '''
+    Converts mutations from mut_jsons to hgvs notation
     '''
     pos = int(mut.split('_')[0]) + 1
     residues = mut.split('_')[1]
     ref = residues.split('>')[0]
     alt = residues.split('>')[1]
-    return ref + str(pos) + alt
+    return ref+str(pos)+alt
     
 def single_flip(base: str) -> str:
-    '''Get complementary base pair for a nucleotide.
+    '''Convert nucleotide to its complement.
     
     Args:
-        base (str): Single nucleotide (A, T, C, or G)
+        base (str): Single nucleotide character (A,T,C,G)
         
     Returns:
         str: Complementary nucleotide
@@ -106,7 +101,7 @@ def single_flip(base: str) -> str:
         return 'C'
 
 def translate(seq: str, fasta_bool: bool) -> Tuple[Optional[str], int]:
-    '''Convert nucleic acid sequence to amino acid sequence.
+    '''Translate nucleotide sequence to amino acid sequence.
     
     Args:
         seq (str): Nucleotide sequence
@@ -115,24 +110,26 @@ def translate(seq: str, fasta_bool: bool) -> Tuple[Optional[str], int]:
     Returns:
         Tuple containing:
             - Optional[str]: Amino acid sequence, or None if no start codon found
-            - int: Length of amino acid sequence, or 1 if translation failed
+            - int: Length of translated sequence, or 1 if translation failed
     '''
     aa_seq = ''
     start = -1
+    
+    # Find start codon
     for i in range(len(seq)):
         if seq[i:i+3] in table['starts']:
             start = i
             break
+            
     if start == -1:
         print(seq)
         return None, 1
         
-    # Split seq into codons
+    # Split into codons and translate
     codons = []
     for pos1, pos2, pos3 in zip(seq[start::3], seq[start+1::3], seq[start+2::3]):
        codons.append(''.join([pos1, pos2, pos3]))
        
-    # Convert codons to amino acids
     line_count = 0
     length = 0
     for codon in codons:
@@ -145,26 +142,49 @@ def translate(seq: str, fasta_bool: bool) -> Tuple[Optional[str], int]:
 
     return aa_seq, length
 
-def convertor(seq, mutations, rc): 
-    #find first start codon
+def convertor(seq: str, mutations: Dict[str, int], rc: bool, immune_codons: List[str]) -> Tuple[Dict[str, Any], int, Dict[str, float]]:
+    '''Convert nucleotide mutations to amino acid mutations and calculate dN/dS ratios.
+    
+    Args:
+        seq (str): DNA sequence
+        mutations (Dict[str, int]): Dictionary of mutations and their counts
+        rc (bool): Whether sequence is reverse complement
+        
+    Returns:
+        Tuple containing:
+            - Dict[str, Any]: Amino acid mutations and counts
+            - int: Error code (0 if successful)
+            - Dict[str, float]: Contains both raw and normalized dN/dS ratios
+    '''
+    
+    # Count potential mutation sites
+    non_syn_sites, syn_sites = count_ems_sites(seq, immune_codons)
+    
+    # Count observed mutations
+    syn = 0
+    nonsyn = 0
+    aa_mutations = {}
+    
     match = 0
     mis = 0
     start = -1
-    nonsyn = 0
-    syn = 0
+    
+    # Find start codon
     for i in range(len(seq)):
         if seq[i:i+3] in table['starts']:
             start = i
             break
+            
     if start == -1:
         print(seq)
-        return None, 1
-    #split seq into codons
+        return None, 1, {'raw': 0, 'normalized': 0}
+        
+    # Split into codons
     codons = []
     for pos1, pos2, pos3 in zip(seq[start::3], seq[start+1::3], seq[start+2::3]):
-       codons.append(''.join([pos1, pos2, pos3])) 
-    #determine aa change
-    aa_mutations = {}
+       codons.append(''.join([pos1, pos2, pos3]))
+       
+    # Convert mutations
     for mut in mutations.keys():
         if rc:
             old_mut = mut.split('_')
@@ -172,11 +192,14 @@ def convertor(seq, mutations, rc):
             new_ref = single_flip(old_mut[1].split('>')[0])
             new_alt = single_flip(old_mut[1].split('>')[1])
             new_mut = str(new_loc+1) +'_'+new_ref+'>'+new_alt
+            
         new_mut = mut.split('_')
         bp = (int(new_mut[0])-1) - start
-        if bp < 1: # not in frame 
+        if bp < 1:  # Not in frame
             continue
-        ref = mut[1].split('>')[0]
+            
+        # Get reference base from the split mutation
+        ref = new_mut[1].split('>')[0]
         
         try:
             if ref == seq[bp+start]:
@@ -185,40 +208,68 @@ def convertor(seq, mutations, rc):
                 mis += 1
         except IndexError:
             print("BPIndexError")
-            print(len(seq))
-            print(bp)
+            print(f"Sequence length: {len(seq)}")
+            print(f"Position: {bp+start}")
+            print(f"Mutation: {mut}")
+            continue  # Skip this mutation and continue processing
+            
         alt = new_mut[1].split('>')[1]
         aa_pos = (bp//3)
+        
         try:
             codon = codons[aa_pos]
         except IndexError:
-            return aa_mutations, 0, 0
+            return aa_mutations, 0, {'raw': 0, 'normalized': 0}
+            
         new = codon[:(bp%3)] + alt + codon[(bp%3)+1:]
         ref_aa = table_lookup(codon)
         alt_aa = table_lookup(new)
+        
         if ref_aa == alt_aa:
             syn += 1
             continue
         else:
             nonsyn += 1
+            
         aa_mut = str(aa_pos) + '_' + ref_aa + '>' + alt_aa
-        if aa_mut in aa_mutations.keys():
+        if aa_mut in aa_mutations:
             aa_mutations[aa_mut] += mutations[mut]
         else:
             aa_mutations[aa_mut] = mutations[mut]
 
+    # Filter low count mutations
     filtered = []
-    for mut in aa_mutations.keys():
+    for mut in aa_mutations:
         if aa_mutations[mut] < 1:
             filtered.append(mut)
     for mut in filtered:
         aa_mutations.pop(mut)
+        
+    # Check for genes with no synonymous sites (shouldn't happen)
+    if syn_sites == 0:
+        print(f"WARNING: Found gene with no potential synonymous sites.")
+        print(f"Sequence length: {len(seq)}")
+        print(f"Number of C/G sites: {sum(1 for base in seq if base in ['C', 'G'])}")
+        print(f"Immune codons found: {sum(1 for i in range(0, len(seq)-2, 3) if seq[i:i+3] in immune_codons)}")
+    
+    # Calculate both raw and normalized dN/dS ratios
+    dnds_rates = {'raw': 0, 'normalized': 0}
+    
     try:
-        synRatio = nonsyn / syn
+        # Raw dN/dS - use minimum of 1 synonymous mutation
+        dnds_rates['raw'] = nonsyn / max(syn, 1)
+        
+        # Normalized dN/dS - use minimum of 1 synonymous site
+        dn = nonsyn / non_syn_sites if non_syn_sites > 0 else 0
+        ds = syn / max(syn_sites, 1)  # Use at least 1 synonymous site
+        dnds_rates['normalized'] = dn/ds if ds > 0 else 0
+            
     except ZeroDivisionError:
-        synRatio = 0
+        print(f"WARNING: Unexpected division by zero in dN/dS calculation")
+        print(f"nonsyn: {nonsyn}, syn: {syn}")
+        print(f"non_syn_sites: {non_syn_sites}, syn_sites: {syn_sites}")
 
-    return aa_mutations, 0, synRatio
+    return aa_mutations, 0, dnds_rates
 
 def count_shared(jsons):
     '''
@@ -299,38 +350,66 @@ def generate_fasta(seq, name, codon_table):
     return fasta_str
 
 def convert_mutations(mut_dict, seqobject, codon_table, features):
-    ''''''
+    '''Convert nucleotide mutations to amino acid mutations.'''
     global table
     with open(codon_table) as jf:
         table = json.load(jf)
 
     refseq = seqobject.genome
-
-    # generate dictionary of GID keys and coordinate values
-    '''
-    features = {}
-    for rec in GFF.parse(seqobject.annot):
-        for feat in rec.features:
-            features[feat.qualifiers['Dbxref'][0].split(':')[-1]] = feat.location
-    '''
+    
+     # Get immune codons
+    immune_codons = ems_immune_codons(table)
+    
     for key in mut_dict:
         seq = refseq[features[key].start:features[key].end]
         if features[key].strand == -1:
-            #get reverse comp of gene seq 
             seq = seq.reverse_complement()
             rc = True
         else:
             rc = False
 
-        aa_muts, err, syn_ratio = convertor(seq, mut_dict[key]['mutations'], rc)
+        aa_muts, err, dnds_rates = convertor(seq, mut_dict[key]['mutations'], rc, immune_codons)
             
         if err != 0:
             if err == 1:
                 print('Conversion Error: No start codon in gene: ' + key)
             if err == 2: 
                 print('Conversion Error: ref does not match at bp  ' + str(aa_muts) + ' in gene: ' + key)
-                pp.pprint(mut_dict[key])
         else:
             mut_dict[key]['mutations'] = aa_muts
-            mut_dict[key]['syn_ratio'] = syn_ratio
+            mut_dict[key]['dnds_raw'] = dnds_rates['raw']
+            mut_dict[key]['dnds_norm'] = dnds_rates['normalized']
+            
     return mut_dict
+
+def count_ems_sites(seq: str, immune_codons: List[str]) -> Tuple[int, int]:
+    '''Count potential EMS mutation sites in a sequence.
+    
+    Args:
+        seq (str): DNA sequence
+        immune_codons (List[str]): List of codons immune to non-synonymous EMS mutations
+        
+    Returns:
+        Tuple containing:
+            - int: Number of sites that could cause non-synonymous mutations
+            - int: Number of sites that could only cause synonymous mutations
+    '''
+    non_syn_sites = 0
+    syn_sites = 0
+    
+    # Process sequence in codons
+    for i in range(0, len(seq)-2, 3):
+        codon = seq[i:i+3]
+        
+        # For immune codons, all C/G sites can only cause synonymous mutations
+        if codon in immune_codons:
+            for base in codon:
+                if base in ['C', 'G']:
+                    syn_sites += 1
+        # For non-immune codons, at least one C/G site can cause non-synonymous mutations
+        else:
+            for base in codon:
+                if base in ['C', 'G']:
+                    non_syn_sites += 1
+                    
+    return non_syn_sites, syn_sites

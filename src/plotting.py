@@ -330,36 +330,36 @@ def normalize_mutation_counts(total_freqs: dict, base_counts: dict, output_file_
     
     return output_file
 
-def plot_dnds_ratio(amino_acid_mutations: dict, output_dir: str, sample_name: str) -> None:
-    '''Plot dN/dS ratio vs gene length and coverage.
+def plot_dnds_ratio(amino_acid_mutations, output_dir, sample_name):
+    '''Plot dN/dS ratio relationships.
     
     Args:
-        amino_acid_mutations (dict): Dictionary containing amino acid mutation data per gene
+        amino_acid_mutations (dict): Dictionary of amino acid mutations per gene
         output_dir (str): Directory to save output plots
         sample_name (str): Name of the sample for plot labeling
     '''
     # Extract data from amino_acid_mutations
     genes = []
-    syn_ratios = []
+    dnds_ratios = []
     gene_lengths = []
     coverages = []
     
     for gene in amino_acid_mutations:
-        if 'syn_ratio' in amino_acid_mutations[gene] and 'gene_len' in amino_acid_mutations[gene]:
+        if 'dnds_norm' in amino_acid_mutations[gene] and 'gene_len' in amino_acid_mutations[gene]:
             genes.append(gene)
-            syn_ratios.append(amino_acid_mutations[gene]['syn_ratio'])
+            dnds_ratios.append(amino_acid_mutations[gene]['dnds_norm'])
             gene_lengths.append(amino_acid_mutations[gene]['gene_len'])
             coverages.append(amino_acid_mutations[gene].get('avg_cov', 0))
     
     # Calculate average dN/dS
-    avg_dnds = sum(syn_ratios) / len(syn_ratios) if syn_ratios else 0
+    avg_dnds = sum(dnds_ratios) / len(dnds_ratios) if dnds_ratios else 0
     print(f"Average dN/dS ratio for {sample_name}: {avg_dnds:.3f}")
     
     # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     
     # Plot dN/dS vs gene length
-    ax1.scatter(gene_lengths, syn_ratios, alpha=0.5, color='darkorange')
+    ax1.scatter(gene_lengths, dnds_ratios, alpha=0.5, color='darkorange')
     ax1.set_xlabel('Gene Length (bp)')
     ax1.set_ylabel('dN/dS Ratio')
     ax1.set_title(f'dN/dS Ratio vs Gene Length - {sample_name}')
@@ -368,7 +368,7 @@ def plot_dnds_ratio(amino_acid_mutations: dict, output_dir: str, sample_name: st
     ax1.yaxis.set_major_formatter(plt.ScalarFormatter())
     
     # Plot dN/dS vs coverage
-    ax2.scatter(coverages, syn_ratios, alpha=0.5, color='darkorange') 
+    ax2.scatter(coverages, dnds_ratios, alpha=0.5, color='darkorange') 
     ax2.set_xlabel('Average Coverage')
     ax2.set_ylabel('dN/dS Ratio')
     ax2.set_title(f'dN/dS Ratio vs Coverage - {sample_name}')
@@ -424,10 +424,10 @@ def plot_combined_dnds_ratios(aa_mutations_files: list, output_dir: str) -> None
         
         # Extract data
         for gene in aa_mutations:
-            if 'syn_ratio' in aa_mutations[gene] and 'gene_len' in aa_mutations[gene]:
+            if 'dnds_norm' in aa_mutations[gene] and 'gene_len' in aa_mutations[gene]:
                 all_data['gene_lengths'].append(aa_mutations[gene]['gene_len'])
                 all_data['coverages'].append(aa_mutations[gene].get('avg_cov', 0))
-                all_data['syn_ratios'].append(aa_mutations[gene]['syn_ratio'])
+                all_data['syn_ratios'].append(aa_mutations[gene]['dnds_norm'])
                 all_data['is_control'].append(is_control)
     
     # Create figure with two subplots
@@ -515,8 +515,8 @@ def plot_sample_dnds_vs_coverage(aa_mutations_files: list, output_dir: str) -> N
         dnds_values = []
         coverage_values = []
         for gene in aa_mutations:
-            if 'syn_ratio' in aa_mutations[gene] and 'avg_cov' in aa_mutations[gene]:
-                dnds_values.append(aa_mutations[gene]['syn_ratio'])
+            if 'dnds_norm' in aa_mutations[gene] and 'avg_cov' in aa_mutations[gene]:
+                dnds_values.append(aa_mutations[gene]['dnds_norm'])
                 coverage_values.append(aa_mutations[gene]['avg_cov'])
         
         if dnds_values and coverage_values:  # Only add if we have data
