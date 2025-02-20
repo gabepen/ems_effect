@@ -4,6 +4,7 @@ import argparse
 from typing import Dict, List, Any, Tuple
 from argparse import Namespace
 from pathlib import Path
+import yaml
 
 # Add src to path 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -26,6 +27,7 @@ def parse_args() -> Namespace:
         Namespace: Parsed command line arguments containing:
             - mpileups (str): Path to mpileup files
             - output (str): Working directory path
+            - config (str): Path to config file with reference paths
             - exclude (bool): Flag for EMS mutations only
             - skip_parse (bool): Flag to skip parsing step
     '''
@@ -34,11 +36,19 @@ def parse_args() -> Namespace:
                         help='Path to mpileup files')
     parser.add_argument('-o', '--output', required=True,
                         help='Working directory')
+    parser.add_argument('-c', '--config', required=True,
+                        help='Path to config file with reference paths')
     parser.add_argument('-e', '--exclude', action='store_true',
                         help='EMS mutations only')
     parser.add_argument('-s', '--skip_parse', action='store_true',
                         help='Skip parsing step')
     return parser.parse_args()
+
+def load_config(config_path: str) -> Dict[str, str]:
+    '''Load reference paths from config file.'''
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+    return config['references']
 
 def setup_directories(outdir: str) -> Dict[str, str]:
     '''Create necessary output directories if they don't exist.
@@ -242,7 +252,6 @@ def calculate_gene_scores(
     provpath: str
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, float]]]:
     '''Calculate PROVEAN scores for a specific gene.
-    
     Args:
         sample (str): Sample identifier
         gene (str): Gene identifier
@@ -352,14 +361,11 @@ def main() -> None:
     # Setup paths and directories
     paths = setup_directories(args.output.rstrip('/'))
     
-    # Define reference paths
-    genomic_fna = '/storage1/gabe/ems_effect_code/data/references/GCF_000008025.1_ASM802v1_genomic.fna.gz'
-    annotation = '/storage1/gabe/ems_effect_code/data/references/GCF_000008025.1_ASM802v1_genomic.gff'
-    codon_table = '/storage1/gabe/ems_effect_code/data/references/11.json'
-    prov_score_table_path = '/storage1/gabe/ems_effect_code/data/provean_tables/score_table_2.json'
+    # Load reference paths from config
+    refs = load_config(args.config)
     
     # Initialize genome context
-    wolgenome = parse.SeqContext(genomic_fna, annotation)
+    wolgenome = parse.SeqContext(refs['genomic_fna'], refs['annotation'])
     gene_seqs = wolgenome.gene_seqs()
     features = wolgenome.genome_features()
     
@@ -371,11 +377,11 @@ def main() -> None:
     
     # Process mutations
     nuc_mut_files = glob(paths['mutpath'] + '/*.json')
-    process_mutations(nuc_mut_files, wolgenome, codon_table, features, paths)
+    process_mutations(nuc_mut_files, wolgenome, refs['codon_table'], features, paths)
     
     # Calculate PROVEAN scores
     provean_jsons = glob(paths['provpath'] + '/*.json')
-    results = calculate_provean_scores(provean_jsons, prov_score_table_path, paths)
+    results = calculate_provean_scores(provean_jsons, refs['prov_score_table'], paths)
     
     # Save final results
     with open(f"{args.output.rstrip('/')}/results/normalized_scores.json", 'w') as of:

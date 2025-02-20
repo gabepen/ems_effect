@@ -1,0 +1,5 @@
+references:
+  genomic_fna: 'GCF_000008025.1_ASM802v1_genomic.fna.gz'
+  annotation: 'GCF_000008025.1_ASM802v1_genomic.gff'
+  codon_table: '11.json'
+  prov_score_table: 'score_table_2.json' 
