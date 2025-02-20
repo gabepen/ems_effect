@@ -64,6 +64,48 @@ def compare_mutations(json1: str, json2: str, output_dir: str) -> None:
     types1, counts1 = get_mutation_stats(data1)
     types2, counts2 = get_mutation_stats(data2)
     
+    # Compare gene sets first
+    genes_in_both = set(counts1.keys()) & set(counts2.keys())
+    genes_only_1 = set(counts1.keys()) - set(counts2.keys())
+    genes_only_2 = set(counts2.keys()) - set(counts1.keys())
+    
+    # Extract EMS canonical mutation positions for each gene
+    ems_positions1 = {}  # gene -> set of positions for C>T or G>A mutations
+    ems_positions2 = {}
+    
+    for gene in data1:
+        positions = set()
+        for mutation in data1[gene]['mutations']:
+            mut_type = mutation.split('_')[1]
+            if mut_type in ['C>T', 'G>A']:
+                pos = int(mutation.split('_')[0])
+                positions.add(pos)
+        if positions:  # Only add if there are EMS mutations
+            ems_positions1[gene] = positions
+            
+    for gene in data2:
+        positions = set()
+        for mutation in data2[gene]['mutations']:
+            mut_type = mutation.split('_')[1]
+            if mut_type in ['C>T', 'G>A']:
+                pos = int(mutation.split('_')[0])
+                positions.add(pos)
+        if positions:  # Only add if there are EMS mutations
+            ems_positions2[gene] = positions
+    
+    # Compare EMS mutation positions
+    ems_mismatches = []
+    for gene in genes_in_both:
+        pos1 = ems_positions1.get(gene, set())
+        pos2 = ems_positions2.get(gene, set())
+        
+        if pos1 != pos2:
+            ems_mismatches.append({
+                'gene': gene,
+                'unique_to_sample1': sorted(list(pos1 - pos2)),
+                'unique_to_sample2': sorted(list(pos2 - pos1))
+            })
+    
     # Get overall mutation type frequencies
     total_types1 = Counter()
     total_types2 = Counter()
@@ -71,11 +113,6 @@ def compare_mutations(json1: str, json2: str, output_dir: str) -> None:
         total_types1.update(types1[gene])
     for gene in types2:
         total_types2.update(types2[gene])
-    
-    # Compare gene sets
-    genes_in_both = set(counts1.keys()) & set(counts2.keys())
-    genes_only_1 = set(counts1.keys()) - set(counts2.keys())
-    genes_only_2 = set(counts2.keys()) - set(counts1.keys())
     
     # Find genes with significant differences
     count_differences = {}
@@ -140,14 +177,34 @@ def compare_mutations(json1: str, json2: str, output_dir: str) -> None:
             for gene in sorted(count_differences, key=lambda x: count_differences[x]['diff'], reverse=True):
                 diff = count_differences[gene]
                 # Get most common mutation types
-                main_types1 = sorted(diff['types1'].items(), key=lambda x: x[1], reverse=True)[:2]
-                main_types2 = sorted(diff['types2'].items(), key=lambda x: x[1], reverse=True)[:2]
-                main_types_str = f"{main_types1[0][0]}:{main_types1[0][1]}"
+                main_types1 = sorted(diff['types1'].items(), key=lambda x: x[1], reverse=True)
+                main_types2 = sorted(diff['types2'].items(), key=lambda x: x[1], reverse=True)
+                
+                # More detailed handling
+                if main_types1:
+                    main_types_str = f"{main_types1[0][0]}:{main_types1[0][1]}"
+                    if len(main_types1) > 1:
+                        main_types_str += f", {main_types1[1][0]}:{main_types1[1][1]}"
+                else:
+                    main_types_str = "No mutations"
                 
                 f.write(f"{gene:<15} {diff['sample1']:<10} {diff['sample2']:<10} "
                        f"{diff['diff']:<10} {main_types_str:<20}\n")
         else:
             f.write("No significant differences in mutation counts found between samples.\n")
+        
+        f.write(f"\nEMS Canonical Mutation Position Comparison:\n")
+        f.write(f"----------------------------------------\n")
+        if not ems_mismatches:
+            f.write("All EMS canonical mutation positions match between samples!\n")
+        else:
+            f.write(f"Found {len(ems_mismatches)} genes with mismatched EMS mutation positions:\n\n")
+            for mismatch in ems_mismatches:
+                f.write(f"Gene: {mismatch['gene']}\n")
+                if mismatch['unique_to_sample1']:
+                    f.write(f"  Positions only in {sample1}: {mismatch['unique_to_sample1']}\n")
+                if mismatch['unique_to_sample2']:
+                    f.write(f"  Positions only in {sample2}: {mismatch['unique_to_sample2']}\n")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Compare two nucleotide mutation JSON files')
