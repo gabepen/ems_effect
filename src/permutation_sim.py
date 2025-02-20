@@ -11,6 +11,7 @@ import psutil
 import subprocess
 from glob import glob
 import yaml
+from loguru import logger
 
 from modules import parse
 from modules import translate
@@ -65,10 +66,29 @@ def precompute_mutation_sites(gene_seqs: Dict[str, str]) -> Dict[str, Dict[str, 
         }
     return site_cache
 
+def setup_logging(outdir: str) -> None:
+    '''Setup loguru logger with file and console outputs.'''
+    log_path = Path(outdir) / 'logs'
+    log_path.mkdir(exist_ok=True)
+    
+    # Remove any existing handlers
+    logger.remove()
+    
+    # Add console handler with INFO level
+    logger.add(sys.stderr, level="INFO")
+    
+    # Add file handler with DEBUG level
+    logger.add(
+        log_path / "permutation_sim_{time}.log",
+        level="DEBUG",
+        rotation="1 day"
+    )
+
 def shuffle_mutations(mut_dict: Dict[str, Any], site_cache: Dict[str, Dict[str, List[int]]]) -> Dict[str, Any]:
     '''Shuffle EMS mutations to random C/G sites within each gene.'''
     shuffled = {}
     
+    logger.debug(f"Shuffling mutations across {len(mut_dict)} genes")
     for gene in tqdm(mut_dict):
         shuffled[gene] = {
             'mutations': {},
@@ -116,29 +136,54 @@ def load_partial_results(outdir: str) -> tuple[Dict, int]:
             results = json.load(f)
         return results, p
     except FileNotFoundError:
-        print('No partial results found to resume, remove -r flag.')
+        logger.error('No partial results found to resume, remove -r flag.')
         sys.exit(1)
 
-def load_config(config_path: str) -> Dict[str, str]:
+def load_config(config_path: str) -> tuple[Dict[str, str], Dict[str, str]]:
     '''Load reference paths from config file.'''
     with open(config_path) as f:
         config = yaml.safe_load(f)
-    return config['references']
+    return config['references'], config['provean_config']
 
 def main() -> None:
     '''Main function to run permutation simulation.'''
     args = parse_args()
+    
+    # Setup logging first
+    setup_logging(args.output.rstrip('/'))
+    logger.info("Starting permutation simulation")
+    
     paths = setup_directories(args.output.rstrip('/'))
     
     # Load reference paths from config
-    refs = load_config(args.config)
+    refs, provean_config = load_config(args.config)
+    logger.info("Loaded configuration files")
+    
+    # Log configuration settings
+    logger.info("Configuration settings:")
+    logger.info(f"Reference files:")
+    logger.info(f"  Genome: {refs['genomic_fna']}")
+    logger.info(f"  Annotation: {refs['annotation']}")
+    logger.info(f"  Codon table: {refs['codon_table']}")
+    logger.info(f"  PROVEAN score table: {refs['prov_score_table']}")
+    logger.info(f"PROVEAN settings:")
+    logger.info(f"  Data directory: {provean_config['data_dir']}")
+    logger.info(f"  Executable: {provean_config['executable']}")
+    logger.info(f"  Threads: {provean_config['num_threads']}")
+    logger.info(f"Run parameters:")
+    logger.info(f"  Number of permutations: {args.permutations}")
+    logger.info(f"  Input mpileups: {args.mpileups}")
+    logger.info(f"  Output directory: {args.output}")
+    logger.info(f"  Resume from partial: {args.resume}")
     
     # Initialize genome context
+    logger.info("Initializing genome context")
     wolgenome = parse.SeqContext(refs['genomic_fna'], refs['annotation'])
     gene_seqs = wolgenome.gene_seqs()
     features = wolgenome.genome_features()
     
     # Precompute mutation sites
+    logger.info("Precomputing mutation sites")
     site_cache = precompute_mutation_sites(gene_seqs)
     
     # Resume or start new
@@ -150,7 +195,7 @@ def main() -> None:
     
     # Run permutations
     while p < args.permutations:
-        print(f"\nPermutation {p+1}/{args.permutations}")
+        logger.info(f"\nStarting permutation {p+1}/{args.permutations}")
         tic = time.perf_counter()
         
         # Process each sample
@@ -170,9 +215,14 @@ def main() -> None:
         nuc_muts_shuffled = glob(f"{paths['shuffled']}/*.json")
         process_mutations(nuc_muts_shuffled, wolgenome, refs['codon_table'], features, paths)
         
-        # Calculate PROVEAN scores
+        # Calculate PROVEAN scores with updated config handling
         provean_jsons = glob(f"{paths['provean']}/*.json")
-        scores = calculate_provean_scores(provean_jsons, refs['prov_score_table'], paths)
+        scores = calculate_provean_scores(
+            provean_jsons, 
+            refs['prov_score_table'], 
+            paths,
+            provean_config
+        )
         
         # Store results
         for sample in scores:
@@ -184,7 +234,7 @@ def main() -> None:
                 results[sample][gene].append(scores[sample][gene]['effect'])
         
         toc = time.perf_counter()
-        print(f"Permutation {p} took {(toc-tic)/60:.4f} minutes")
+        logger.info(f"Permutation {p} took {(toc-tic)/60:.4f} minutes")
         
         p += 1
         
@@ -202,11 +252,13 @@ def main() -> None:
         if p % 1000 == 0:
             process = psutil.Process(os.getpid())
             usage_kb = process.memory_info().rss / 1000
-            print(f"Memory usage: {usage_kb}kb")
+            logger.debug(f"Memory usage: {usage_kb}kb")
     
     # Save final results
     with open(f"{paths['results']}/scored.complete.json", 'w') as f:
         json.dump(results, f)
+    
+    logger.success("Permutation simulation completed successfully")
 
 if __name__ == '__main__':
     main() 
