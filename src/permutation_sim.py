@@ -48,7 +48,24 @@ def setup_directories(outdir: str) -> Dict[str, str]:
         
     return paths
 
-def shuffle_mutations(mut_dict: Dict[str, Any], gene_seqs: Dict[str, str]) -> Dict[str, Any]:
+def precompute_mutation_sites(gene_seqs: Dict[str, str]) -> Dict[str, Dict[str, List[int]]]:
+    '''Precompute C/G sites for each gene to avoid repeated scanning.
+    
+    Args:
+        gene_seqs: Dictionary mapping gene IDs to sequences
+        
+    Returns:
+        Dictionary mapping gene IDs to their C and G site positions
+    '''
+    site_cache = {}
+    for gene, seq in gene_seqs.items():
+        site_cache[gene] = {
+            'C': [i for i, base in enumerate(seq) if base == 'C'],
+            'G': [i for i, base in enumerate(seq) if base == 'G']
+        }
+    return site_cache
+
+def shuffle_mutations(mut_dict: Dict[str, Any], site_cache: Dict[str, Dict[str, List[int]]]) -> Dict[str, Any]:
     '''Shuffle EMS mutations to random C/G sites within each gene.'''
     shuffled = {}
     
@@ -59,14 +76,9 @@ def shuffle_mutations(mut_dict: Dict[str, Any], gene_seqs: Dict[str, str]) -> Di
             'gene_len': mut_dict[gene]['gene_len']
         }
         
-        # Find all C and G positions
-        G_sites = []
-        C_sites = []
-        for i, base in enumerate(gene_seqs[gene]):
-            if base == 'G':
-                G_sites.append(i)
-            elif base == 'C':
-                C_sites.append(i)
+        # Use precomputed sites
+        C_sites = site_cache[gene]['C']
+        G_sites = site_cache[gene]['G']
                 
         # Shuffle mutations
         for mut in mut_dict[gene]['mutations']:
@@ -126,6 +138,9 @@ def main() -> None:
     gene_seqs = wolgenome.gene_seqs()
     features = wolgenome.genome_features()
     
+    # Precompute mutation sites
+    site_cache = precompute_mutation_sites(gene_seqs)
+    
     # Resume or start new
     if args.resume:
         results, p = load_partial_results(args.output)
@@ -145,7 +160,7 @@ def main() -> None:
             # Load and shuffle mutations
             with open(mut_file) as f:
                 mut_dict = json.load(f)
-            shuffled = shuffle_mutations(mut_dict, gene_seqs)
+            shuffled = shuffle_mutations(mut_dict, site_cache)
             
             # Save shuffled mutations
             with open(f"{paths['shuffled']}/{sample}.json", 'w') as f:
