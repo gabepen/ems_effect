@@ -354,7 +354,7 @@ def main() -> None:
     
     # Calculate PROVEAN scores
     provean_jsons = glob(paths['provpath'] + '/*.json')
-    results = calculate_provean_scores(provean_jsons, refs['prov_score_table'], paths, refs)
+    results = calculate_provean_scores(provean_jsons, refs['prov_score_table'], paths, provean_config)
     
     # Save final results
     with open(f"{args.output.rstrip('/')}/results/normalized_scores.json", 'w') as of:
