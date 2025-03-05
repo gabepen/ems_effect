@@ -143,33 +143,22 @@ def translate(seq: str, fasta_bool: bool) -> Tuple[Optional[str], int]:
     return aa_seq, length
 
 def convertor(seq: str, mutations: Dict[str, int], rc: bool, immune_codons: List[str]) -> Tuple[Dict[str, Any], int, Dict[str, float]]:
-    '''Convert nucleotide mutations to amino acid mutations and calculate dN/dS ratios.
+    '''Convert nucleotide mutations to amino acid mutations and calculate dN/dS ratios.'''
     
-    Args:
-        seq (str): DNA sequence
-        mutations (Dict[str, int]): Dictionary of mutations and their counts
-        rc (bool): Whether sequence is reverse complement
-        
-    Returns:
-        Tuple containing:
-            - Dict[str, Any]: Amino acid mutations and counts
-            - int: Error code (0 if successful)
-            - Dict[str, float]: Contains both raw and normalized dN/dS ratios
-    '''
-    
-    # Count potential mutation sites
-    non_syn_sites, syn_sites = count_ems_sites(seq, immune_codons)
-    
-    # Count observed mutations
-    syn = 0
-    nonsyn = 0
-    aa_mutations = {}
-    
-    match = 0
-    mis = 0
-    start = -1
+    # Initialize empty rates dictionary with all required keys
+    empty_rates = {
+        'raw': 0,
+        'normalized': 0,
+        'non_syn_sites': 0,
+        'syn_sites': 0,
+        'syn_sites_mutated': 0,
+        'non_syn_sites_mutated': 0,
+        'non_syn_muts': 0,
+        'syn_muts': 0
+    }
     
     # Find start codon
+    start = -1
     for i in range(len(seq)):
         if seq[i:i+3] in table['starts']:
             start = i
@@ -177,8 +166,24 @@ def convertor(seq: str, mutations: Dict[str, int], rc: bool, immune_codons: List
             
     if start == -1:
         print(seq)
-        return None, 1, {'raw': 0, 'normalized': 0}
-        
+        return None, 1, empty_rates
+    
+    # Count potential mutation sites
+    non_syn_sites, syn_sites = count_ems_sites(seq, immune_codons)
+    
+    # Track unique mutated sites
+    mutated_sites = set()  # Keep track of which sites have been mutated
+    syn_sites_mutated = set()  # Sites with synonymous mutations
+    non_syn_sites_mutated = set()  # Sites with non-synonymous mutations
+    
+    # Count observed mutations
+    syn = 0  # Total synonymous mutations (including multiple at same site)
+    nonsyn = 0  # Total non-synonymous mutations (including multiple at same site)
+    aa_mutations = {}
+    
+    match = 0
+    mis = 0
+    
     # Split into codons
     codons = []
     for pos1, pos2, pos3 in zip(seq[start::3], seq[start+1::3], seq[start+2::3]):
@@ -219,17 +224,25 @@ def convertor(seq: str, mutations: Dict[str, int], rc: bool, immune_codons: List
         try:
             codon = codons[aa_pos]
         except IndexError:
-            return aa_mutations, 0, {'raw': 0, 'normalized': 0}
+            return aa_mutations, 0, empty_rates
             
         new = codon[:(bp%3)] + alt + codon[(bp%3)+1:]
         ref_aa = table_lookup(codon)
         alt_aa = table_lookup(new)
         
+        site_key = f"{aa_pos}_{bp%3}"  # Unique key for this mutation site
+        
         if ref_aa == alt_aa:
             syn += 1
+            if site_key not in mutated_sites:
+                syn_sites_mutated.add(site_key)
+                mutated_sites.add(site_key)
             continue
         else:
             nonsyn += 1
+            if site_key not in mutated_sites:
+                non_syn_sites_mutated.add(site_key)
+                mutated_sites.add(site_key)
             
         aa_mut = str(aa_pos) + '_' + ref_aa + '>' + alt_aa
         if aa_mut in aa_mutations:
@@ -252,8 +265,16 @@ def convertor(seq: str, mutations: Dict[str, int], rc: bool, immune_codons: List
         print(f"Number of C/G sites: {sum(1 for base in seq if base in ['C', 'G'])}")
         print(f"Immune codons found: {sum(1 for i in range(0, len(seq)-2, 3) if seq[i:i+3] in immune_codons)}")
     
-    # Calculate both raw and normalized dN/dS ratios
-    dnds_rates = {'raw': 0, 'normalized': 0}
+    dnds_rates = {
+        'raw': 0, 
+        'normalized': 0,
+        'non_syn_sites': non_syn_sites,
+        'syn_sites': syn_sites,
+        'syn_sites_mutated': len(syn_sites_mutated),
+        'non_syn_sites_mutated': len(non_syn_sites_mutated),
+        'non_syn_muts': nonsyn,
+        'syn_muts': syn
+    }
     
     try:
         # Raw dN/dS - use minimum of 1 synonymous mutation
@@ -349,16 +370,48 @@ def generate_fasta(seq, name, codon_table):
     fasta_str += aa_seq
     return fasta_str
 
-def convert_mutations(mut_dict, seqobject, codon_table, features):
-    '''Convert nucleotide mutations to amino acid mutations.'''
+def convert_mutations(mut_dict, seqobject, codon_table, features) -> Tuple[Dict, Dict]:
+    '''Convert nucleotide mutations to amino acid mutations.
+    
+    Args:
+        mut_dict: Dictionary of mutations per gene
+        seqobject: Genome sequence context
+        codon_table: Path to codon table file
+        features: Dictionary of genome features
+        
+    Returns:
+        Tuple containing:
+            - Dict: Mutation dictionary with amino acid mutations per gene
+            - Dict: Genome-wide dN/dS statistics including:
+                - non_syn_sites: Total potential non-synonymous sites
+                - syn_sites: Total potential synonymous sites
+                - non_syn_muts: Total non-synonymous mutations observed
+                - syn_muts: Total synonymous mutations observed
+                - syn_sites_mutated: Number of unique synonymous sites with mutations
+                - non_syn_sites_mutated: Number of unique non-synonymous sites with mutations
+                - dnds_raw: Raw genome-wide dN/dS ratio
+                - dnds_norm: Coverage-normalized genome-wide dN/dS ratio
+    '''
     global table
     with open(codon_table) as jf:
         table = json.load(jf)
 
     refseq = seqobject.genome
     
-     # Get immune codons
+    # Get immune codons
     immune_codons = ems_immune_codons(table)
+    
+    # Track genome-wide stats
+    genome_stats = {
+        'non_syn_sites': 0,
+        'syn_sites': 0,
+        'non_syn_muts': 0,
+        'syn_muts': 0,
+        'syn_sites_mutated': 0,
+        'non_syn_sites_mutated': 0,
+        'total_coverage': 0,
+        'gene_count': 0  # Track number of genes for averaging coverage
+    }
     
     for key in mut_dict:
         seq = refseq[features[key].start:features[key].end]
@@ -375,12 +428,50 @@ def convert_mutations(mut_dict, seqobject, codon_table, features):
                 print('Conversion Error: No start codon in gene: ' + key)
             if err == 2: 
                 print('Conversion Error: ref does not match at bp  ' + str(aa_muts) + ' in gene: ' + key)
+            continue
         else:
             mut_dict[key]['mutations'] = aa_muts
             mut_dict[key]['dnds_raw'] = dnds_rates['raw']
             mut_dict[key]['dnds_norm'] = dnds_rates['normalized']
             
-    return mut_dict
+            # Accumulate genome-wide stats
+            genome_stats['non_syn_sites'] += dnds_rates['non_syn_sites']
+            genome_stats['syn_sites'] += dnds_rates['syn_sites']
+            genome_stats['non_syn_muts'] += dnds_rates['non_syn_muts']
+            genome_stats['syn_muts'] += dnds_rates['syn_muts']
+            genome_stats['syn_sites_mutated'] += dnds_rates['syn_sites_mutated']
+            genome_stats['non_syn_sites_mutated'] += dnds_rates['non_syn_sites_mutated']
+            
+            # Track coverage
+            genome_stats['total_coverage'] += mut_dict[key]['avg_cov']
+            genome_stats['gene_count'] += 1
+    
+    # Calculate average coverage across all genes
+    avg_coverage = genome_stats['total_coverage'] / genome_stats['gene_count'] if genome_stats['gene_count'] > 0 else 1
+    
+    # Calculate raw genome-wide dN/dS
+    dn_raw = genome_stats['non_syn_muts'] / genome_stats['non_syn_sites'] if genome_stats['non_syn_sites'] > 0 else 0
+    ds_raw = genome_stats['syn_muts'] / genome_stats['syn_sites'] if genome_stats['syn_sites'] > 0 else 0
+    genome_stats['dnds_raw'] = dn_raw/ds_raw if ds_raw > 0 else 0
+    
+    # Calculate coverage-normalized genome-wide dN/dS
+    normalized_non_syn_muts = genome_stats['non_syn_muts'] / avg_coverage
+    normalized_syn_muts = genome_stats['syn_muts'] / avg_coverage
+    
+    dn_norm = normalized_non_syn_muts / genome_stats['non_syn_sites'] if genome_stats['non_syn_sites'] > 0 else 0
+    ds_norm = normalized_syn_muts / genome_stats['syn_sites'] if genome_stats['syn_sites'] > 0 else 0
+    genome_stats['dnds_norm'] = dn_norm/ds_norm if ds_norm > 0 else 0
+    
+    # Store all values for reference
+    genome_stats['avg_coverage'] = avg_coverage
+    genome_stats['normalized_non_syn_muts'] = normalized_non_syn_muts
+    genome_stats['normalized_syn_muts'] = normalized_syn_muts
+    genome_stats['dn_raw'] = dn_raw
+    genome_stats['ds_raw'] = ds_raw
+    genome_stats['dn_norm'] = dn_norm
+    genome_stats['ds_norm'] = ds_norm
+            
+    return mut_dict, genome_stats
 
 def count_ems_sites(seq: str, immune_codons: List[str]) -> Tuple[int, int]:
     '''Count potential EMS mutation sites in a sequence.
@@ -400,7 +491,11 @@ def count_ems_sites(seq: str, immune_codons: List[str]) -> Tuple[int, int]:
     # Process sequence in codons
     for i in range(0, len(seq)-2, 3):
         codon = seq[i:i+3]
-        
+        # Check if any position in codon is masked
+        codon_positions = range(start_pos + i, start_pos + i + 3)
+        if not all(mask[pos] for pos in codon_positions):
+            continue
+            
         # For immune codons, all C/G sites can only cause synonymous mutations
         if codon in immune_codons:
             for base in codon:

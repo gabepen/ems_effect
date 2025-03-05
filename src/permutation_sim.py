@@ -143,7 +143,7 @@ def load_config(config_path: str) -> tuple[Dict[str, str], Dict[str, str]]:
     '''Load reference paths from config file.'''
     with open(config_path) as f:
         config = yaml.safe_load(f)
-    return config['references'], config['provean_config']
+    return config['references'], config['provean']
 
 def main() -> None:
     '''Main function to run permutation simulation.'''
@@ -165,7 +165,7 @@ def main() -> None:
     logger.info(f"  Genome: {refs['genomic_fna']}")
     logger.info(f"  Annotation: {refs['annotation']}")
     logger.info(f"  Codon table: {refs['codon_table']}")
-    logger.info(f"  PROVEAN score table: {refs['prov_score_table']}")
+    logger.info(f"  PROVEAN score table: {refs['prov_score_db']}")
     logger.info(f"PROVEAN settings:")
     logger.info(f"  Data directory: {provean_config['data_dir']}")
     logger.info(f"  Executable: {provean_config['executable']}")
@@ -181,6 +181,44 @@ def main() -> None:
     wolgenome = parse.SeqContext(refs['genomic_fna'], refs['annotation'])
     gene_seqs = wolgenome.gene_seqs()
     features = wolgenome.genome_features()
+    
+    # First process mpileups to generate nucleotide mutation JSONs
+    logger.info("Processing mpileup files to generate mutation JSONs")
+    base_counts = {'A': 0, 'T': 0, 'G': 0, 'C': 0}
+    context_counts = {}
+    
+    # Process mpileups if directory
+    if os.path.isdir(args.mpileups):
+        mpileup_files = glob(os.path.join(args.mpileups, "*.mpileup*"))
+    else:
+        mpileup_files = [args.mpileups]
+        
+    for mpileup in mpileup_files:
+        sample = Path(mpileup).stem
+        logger.info(f"Processing {sample}")
+        
+        # Process mutations and count bases/contexts
+        nuc_muts, contexts, intergenic_counts = parse.parse_mpile(
+            mpileup, 
+            wolgenome, 
+            True,  # ems_only=True since this is EMS analysis
+            base_counts,
+            context_counts
+        )
+        
+        # Save mutation data
+        with open(f"{paths['nuc_muts']}/{sample}.json", 'w') as of:
+            json.dump(nuc_muts, of)
+    
+    # Save summary files
+    with open(f"{paths['results']}/basecounts.json", 'w') as of:
+        json.dump(base_counts, of)
+        
+    with open(f"{paths['results']}/contextcounts.json", 'w') as of:
+        json.dump(context_counts, of)
+        
+    with open(f"{paths['results']}/intergeniccounts.json", 'w') as of:
+        json.dump(intergenic_counts, of)
     
     # Precompute mutation sites
     logger.info("Precomputing mutation sites")
@@ -203,15 +241,18 @@ def main() -> None:
             sample = mut_file.stem
             
             # Load and shuffle mutations
+            logger.info(f"Shuffling mutations for {sample}")   
             with open(mut_file) as f:
                 mut_dict = json.load(f)
             shuffled = shuffle_mutations(mut_dict, site_cache)
             
             # Save shuffled mutations
+            logger.info(f"Saving shuffled mutations for {sample}")
             with open(f"{paths['shuffled']}/{sample}.json", 'w') as f:
                 json.dump(shuffled, f)
         
         # Convert mutations and calculate PROVEAN scores
+        logger.info("Converting mutations and calculating PROVEAN scores")
         nuc_muts_shuffled = glob(f"{paths['shuffled']}/*.json")
         process_mutations(nuc_muts_shuffled, wolgenome, refs['codon_table'], features, paths)
         
@@ -219,7 +260,7 @@ def main() -> None:
         provean_jsons = glob(f"{paths['provean']}/*.json")
         scores = calculate_provean_scores(
             provean_jsons, 
-            refs['prov_score_table'], 
+            refs['prov_score_db'], 
             paths,
             provean_config
         )

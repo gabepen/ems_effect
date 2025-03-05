@@ -563,6 +563,189 @@ def plot_sample_dnds_vs_coverage(aa_mutations_files: list, output_dir: str) -> N
     plt.savefig(os.path.join(output_dir, 'sample_dnds_vs_coverage.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
+def plot_dnds_vs_intergenic(results_dir: str, output_dir: str) -> None:
+    '''Create plot comparing genome-wide dN/dS ratios vs mutation rates.
+    Also outputs a CSV comparing key metrics per sample.
+    
+    Args:
+        results_dir (str): Directory containing analysis results
+        output_dir (str): Directory to save output plots and CSV
+    '''
+    # Load the data
+    with open(f"{results_dir}/results/genome_dnds.json") as f:
+        dnds_data = json.load(f)
+    with open(f"{results_dir}/results/intergeniccounts.json") as f:
+        intergenic_data = json.load(f)
+        
+    # Prepare data for plotting and CSV
+    plot_data = {
+        'sample': [],
+        'dnds': [],
+        'intergenic_rate': [],
+        'syn_sites_mutated_rate': [],
+        'non_syn_sites_mutated_rate': [],  # Added non-syn rate
+        'is_control': []
+    }
+    
+    # Prepare CSV data
+    csv_data = []
+    
+    for sample in dnds_data:
+        if sample in intergenic_data:
+            # Calculate rates
+            total_mutations = sum(intergenic_data[sample]['mutations'].values())
+            total_sites = intergenic_data[sample]['total_sites']
+            intergenic_rate = total_mutations / total_sites if total_sites > 0 else 0
+            
+            # Calculate mutation rates
+            syn_sites_mutated_rate = (dnds_data[sample]['syn_sites_mutated'] / 
+                                    dnds_data[sample]['syn_sites']) if dnds_data[sample]['syn_sites'] > 0 else 0
+            non_syn_sites_mutated_rate = (dnds_data[sample]['non_syn_sites_mutated'] / 
+                                        dnds_data[sample]['non_syn_sites']) if dnds_data[sample]['non_syn_sites'] > 0 else 0
+            
+            # Store for plotting
+            plot_data['sample'].append(sample)
+            plot_data['dnds'].append(dnds_data[sample]['dnds'])
+            plot_data['intergenic_rate'].append(intergenic_rate)
+            plot_data['syn_sites_mutated_rate'].append(syn_sites_mutated_rate)
+            plot_data['non_syn_sites_mutated_rate'].append(non_syn_sites_mutated_rate)
+            plot_data['is_control'].append(any(x in sample for x in ['NT', 'Minus', 'Pre']))
+            
+            # Store for CSV
+            csv_data.append({
+                'Sample': sample,
+                'dN/dS': dnds_data[sample]['dnds'],
+                'Intergenic_Rate': intergenic_rate,
+                'Syn_Sites_Mutated_Rate': syn_sites_mutated_rate,
+                'Non_Syn_Sites_Mutated_Rate': non_syn_sites_mutated_rate,
+                'Total_Intergenic_Mutations': total_mutations,
+                'Total_Intergenic_Sites': total_sites,
+                'Syn_Sites_Mutated': dnds_data[sample]['syn_sites_mutated'],
+                'Total_Syn_Sites': dnds_data[sample]['syn_sites'],
+                'Non_Syn_Sites_Mutated': dnds_data[sample]['non_syn_sites_mutated'],
+                'Total_Non_Syn_Sites': dnds_data[sample]['non_syn_sites'],
+                'Is_Control': 'Yes' if any(x in sample for x in ['NT', 'Minus', 'Pre']) else 'No'
+            })
+    
+    # Create figure with three subplots
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
+    
+    # Plot 1: dN/dS vs Intergenic Rate
+    for is_control, color, label in [(True, 'lightgrey', 'Control'), (False, 'darkorange', 'EMS Treated')]:
+        mask = [x == is_control for x in plot_data['is_control']]
+        ax1.scatter(
+            [r for r, m in zip(plot_data['intergenic_rate'], mask) if m],
+            [d for d, m in zip(plot_data['dnds'], mask) if m],
+            alpha=0.7,
+            color=color,
+            label=label,
+            s=100
+        )
+    
+    # Add sample labels to first plot
+    for i, txt in enumerate(plot_data['sample']):
+        abbreviated_name = extract_sample_id(txt)
+        ax1.annotate(
+            abbreviated_name,
+            (plot_data['intergenic_rate'][i], plot_data['dnds'][i]),
+            xytext=(10, 10),
+            textcoords='offset points',
+            fontsize=8,
+            arrowprops=dict(arrowstyle='-', color='gray', alpha=0.5)
+        )
+    
+    ax1.set_xlabel('Intergenic Mutation Rate')
+    ax1.set_ylabel('Genome-wide dN/dS Ratio')
+    ax1.set_title('dN/dS vs Intergenic Mutation Rate')
+    
+    # Add correlation coefficient to first plot
+    r1 = np.corrcoef(plot_data['intergenic_rate'], plot_data['dnds'])[0,1]
+    ax1.text(0.05, 0.95, f'Correlation: {r1:.3f}', 
+             transform=ax1.transAxes,
+             bbox=dict(facecolor='white', alpha=0.8))
+    
+    # Plot 2: dN/dS vs Synonymous Sites Mutated Rate
+    for is_control, color, label in [(True, 'lightgrey', 'Control'), (False, 'darkorange', 'EMS Treated')]:
+        mask = [x == is_control for x in plot_data['is_control']]
+        ax2.scatter(
+            [r for r, m in zip(plot_data['syn_sites_mutated_rate'], mask) if m],
+            [d for d, m in zip(plot_data['dnds'], mask) if m],
+            alpha=0.7,
+            color=color,
+            label=label,
+            s=100
+        )
+    
+    # Add sample labels to second plot
+    for i, txt in enumerate(plot_data['sample']):
+        abbreviated_name = extract_sample_id(txt)
+        ax2.annotate(
+            abbreviated_name,
+            (plot_data['syn_sites_mutated_rate'][i], plot_data['dnds'][i]),
+            xytext=(10, 10),
+            textcoords='offset points',
+            fontsize=8,
+            arrowprops=dict(arrowstyle='-', color='gray', alpha=0.5)
+        )
+    
+    ax2.set_xlabel('Synonymous Sites Mutated Rate')
+    ax2.set_ylabel('Genome-wide dN/dS Ratio')
+    ax2.set_title('dN/dS vs Synonymous Sites Mutated Rate')
+    
+    # Add correlation coefficient to second plot
+    r2 = np.corrcoef(plot_data['syn_sites_mutated_rate'], plot_data['dnds'])[0,1]
+    ax2.text(0.05, 0.95, f'Correlation: {r2:.3f}', 
+             transform=ax2.transAxes,
+             bbox=dict(facecolor='white', alpha=0.8))
+
+    # Plot 3: dN/dS vs Non-synonymous Sites Mutated Rate
+    for is_control, color, label in [(True, 'lightgrey', 'Control'), (False, 'darkorange', 'EMS Treated')]:
+        mask = [x == is_control for x in plot_data['is_control']]
+        ax3.scatter(
+            [r for r, m in zip(plot_data['non_syn_sites_mutated_rate'], mask) if m],
+            [d for d, m in zip(plot_data['dnds'], mask) if m],
+            alpha=0.7,
+            color=color,
+            label=label,
+            s=100
+        )
+    
+    # Add sample labels to third plot
+    for i, txt in enumerate(plot_data['sample']):
+        abbreviated_name = extract_sample_id(txt)
+        ax3.annotate(
+            abbreviated_name,
+            (plot_data['non_syn_sites_mutated_rate'][i], plot_data['dnds'][i]),
+            xytext=(10, 10),
+            textcoords='offset points',
+            fontsize=8,
+            arrowprops=dict(arrowstyle='-', color='gray', alpha=0.5)
+        )
+    
+    ax3.set_xlabel('Non-synonymous Sites Mutated Rate')
+    ax3.set_ylabel('Genome-wide dN/dS Ratio')
+    ax3.set_title('dN/dS vs Non-synonymous Sites Mutated Rate')
+    
+    # Add correlation coefficient to third plot
+    r3 = np.corrcoef(plot_data['non_syn_sites_mutated_rate'], plot_data['dnds'])[0,1]
+    ax3.text(0.05, 0.95, f'Correlation: {r3:.3f}', 
+             transform=ax3.transAxes,
+             bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.legend()
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'dnds_vs_rates.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Save CSV data
+    csv_path = os.path.join(output_dir, 'mutation_rates_comparison.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=csv_data[0].keys())
+        writer.writeheader()
+        writer.writerows(csv_data)
+
 def main():
     parser = argparse.ArgumentParser(description='Generate plots from analysis results')
     parser.add_argument('-r', '--results_dir', type=str, required=True,
@@ -594,10 +777,10 @@ def main():
     # dN/dS ratio plots
     aa_mut_dir = results_dir / 'aa_muts'
     aa_mut_files = list(aa_mut_dir.glob('*.json'))
-    if aa_mut_files:  # Only proceed if JSON files exist
+    if aa_mut_files:
         # Filter out basecounts or other non-mutation files
         aa_mut_files = [f for f in aa_mut_files if f.stem != 'basecounts']
-        if aa_mut_files:  # Check if there are mutation JSONs after filtering
+        if aa_mut_files:
             # Generate individual sample plots
             for aa_file in aa_mut_files:
                 print(f"Generating dN/dS plots for {aa_file.stem}...")
@@ -612,6 +795,13 @@ def main():
             # Generate sample-level comparison plot
             print("Generating sample-level dN/dS comparison plot...")
             plot_sample_dnds_vs_coverage(aa_mut_files, args.output_dir)
+            
+            # Generate dN/dS vs intergenic plot if both files exist
+            genome_dnds = results_dir / 'results' / 'genome_dnds.json'
+            intergenic = results_dir / 'results' / 'intergeniccounts.json'
+            if genome_dnds.exists() and intergenic.exists():
+                print("Generating dN/dS vs intergenic mutation plot...")
+                plot_dnds_vs_intergenic(str(results_dir), args.output_dir)
 
     # Kmer context plots
     kmer_file = results_dir / 'kmer_context.json'
