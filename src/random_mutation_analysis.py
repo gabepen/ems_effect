@@ -102,7 +102,7 @@ def randomize_mutations_preserve_type(
                 if ref_base not in ['C', 'G']:
                     continue
                     
-                genome_pos = feature.start + abs_pos
+                    genome_pos = feature.start + abs_pos
                 if not seqobject.overlap_mask[genome_pos]:
                     continue
                 
@@ -193,8 +193,8 @@ def randomize_mutations_preserve_type(
             
             # Get codon position
             pos = int(pos)
-            codon_pos = (pos // 3) * 3
-            base_pos = pos % 3
+            codon_pos = (pos - start) // 3 * 3 + start
+            base_pos = (pos - start) % 3
             
             if codon_pos + 2 >= len(seq):
                 continue
@@ -350,8 +350,8 @@ def analyze_original_mutations(
                 continue
                 
             # Get codon position
-            codon_pos = (pos // 3) * 3
-            base_pos = pos % 3
+            codon_pos = (pos - start) // 3 * 3 + start
+            base_pos = (pos - start) % 3
             
             if codon_pos + 2 >= len(seq):
                 continue
