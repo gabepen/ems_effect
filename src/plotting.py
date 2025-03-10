@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import re
 from pathlib import Path
+from typing import Dict, List, Optional
 
 def load_json(file_path):
     with open(file_path, 'r') as file:
@@ -593,7 +594,7 @@ def plot_dnds_vs_intergenic(results_dir: str, output_dir: str) -> None:
     for sample in dnds_data:
         if sample in intergenic_data:
             # Calculate rates
-            total_mutations = sum(intergenic_data[sample]['mutations'].values())
+            total_mutations = sum(intergenic_data[sample]['mutation_types'].values())
             total_sites = intergenic_data[sample]['total_sites']
             intergenic_rate = total_mutations / total_sites if total_sites > 0 else 0
             
@@ -605,7 +606,7 @@ def plot_dnds_vs_intergenic(results_dir: str, output_dir: str) -> None:
             
             # Store for plotting
             plot_data['sample'].append(sample)
-            plot_data['dnds'].append(dnds_data[sample]['dnds'])
+            plot_data['dnds'].append(dnds_data[sample]['dnds_norm'])
             plot_data['intergenic_rate'].append(intergenic_rate)
             plot_data['syn_sites_mutated_rate'].append(syn_sites_mutated_rate)
             plot_data['non_syn_sites_mutated_rate'].append(non_syn_sites_mutated_rate)
@@ -614,7 +615,7 @@ def plot_dnds_vs_intergenic(results_dir: str, output_dir: str) -> None:
             # Store for CSV
             csv_data.append({
                 'Sample': sample,
-                'dN/dS': dnds_data[sample]['dnds'],
+                'dN/dS': dnds_data[sample]['dnds_norm'],
                 'Intergenic_Rate': intergenic_rate,
                 'Syn_Sites_Mutated_Rate': syn_sites_mutated_rate,
                 'Non_Syn_Sites_Mutated_Rate': non_syn_sites_mutated_rate,
@@ -746,12 +747,225 @@ def plot_dnds_vs_intergenic(results_dir: str, output_dir: str) -> None:
         writer.writeheader()
         writer.writerows(csv_data)
 
+def plot_dnds_analysis(
+    results_csv: str, 
+    output_dir: str,
+    title: str = "dN/dS Analysis Results",
+    figsize: tuple = (12, 10)
+) -> None:
+    """
+    Create visualizations for dN/dS analysis results.
+    
+    Args:
+        results_csv: Path to the CSV file with dN/dS results
+        output_dir: Directory to save the plots
+        title: Main title for the plots
+        figsize: Figure size (width, height) in inches
+    """
+    # Create output directory if it doesn't exist
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Load data
+    df = pd.read_csv(results_csv)
+    
+    # Create abbreviated sample names for plotting
+    df['Sample_ID'] = df['Sample'].apply(extract_sample_id)
+    
+    # Set up the figure with subplots
+    fig = plt.figure(figsize=figsize)
+    
+    # 1. Bar plot comparing original vs random dN/dS with error bars
+    ax1 = plt.subplot(2, 2, 1)
+    
+    # Reshape data for plotting
+    plot_data = pd.melt(
+        df, 
+        id_vars=['Sample_ID'], 
+        value_vars=['Original_dNdS', 'Random_dNdS'],
+        var_name='Type', 
+        value_name='dN/dS'
+    )
+    
+    # Add error data
+    error_data = []
+    for _, row in plot_data.iterrows():
+        if row['Type'] == 'Original_dNdS':
+            sample_row = df[df['Sample_ID'] == row['Sample_ID']].iloc[0]
+            lower = row['dN/dS'] - sample_row['Original_dNdS_Lower_CI']
+            upper = sample_row['Original_dNdS_Upper_CI'] - row['dN/dS']
+            error_data.append([lower, upper])
+        else:
+            sample_row = df[df['Sample_ID'] == row['Sample_ID']].iloc[0]
+            lower = row['dN/dS'] - sample_row['Random_dNdS_Lower_CI']
+            upper = sample_row['Random_dNdS_Upper_CI'] - row['dN/dS']
+            error_data.append([lower, upper])
+    
+    error_data = np.array(error_data).T
+    
+    # Create bar plot with error bars
+    sns.barplot(x='Sample_ID', y='dN/dS', hue='Type', data=plot_data, ax=ax1)
+    
+    # Add error bars manually
+    bars = ax1.patches
+    for i, (bar, err) in enumerate(zip(bars, zip(error_data[0], error_data[1]))):
+        x = bar.get_x() + bar.get_width() / 2
+        y = bar.get_height()
+        ax1.errorbar(x, y, yerr=[[err[0]], [err[1]]], fmt='none', color='black', capsize=3)
+    
+    ax1.set_title('Original vs Random dN/dS')
+    ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+    ax1.axhline(y=1.0, color='red', linestyle='--', alpha=0.7)
+    ax1.set_ylabel('dN/dS Ratio')
+    
+    # 2. Bar plot of selection ratio (Original/Random) with significance
+    ax2 = plt.subplot(2, 2, 2)
+    
+    # Create bar plot with different colors based on significance
+    bars = sns.barplot(x='Sample_ID', y='Ratio', data=df, ax=ax2, palette=df['Significant'].map({'Yes': 'darkred', 'No': 'teal'}))
+    
+    # Add significance markers
+    for i, (is_sig, ratio) in enumerate(zip(df['Significant'], df['Ratio'])):
+        if is_sig == 'Yes':
+            ax2.text(i, ratio + 0.05, '*', ha='center', va='bottom', fontsize=16, color='black')
+    
+    ax2.set_title('Selection Ratio (Original/Random)')
+    ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
+    ax2.axhline(y=1.0, color='red', linestyle='--', alpha=0.7)
+    ax2.set_ylabel('Selection Ratio')
+    
+    # Add legend for significance
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='darkred', label='Significant'),
+        Patch(facecolor='teal', label='Not Significant')
+    ]
+    ax2.legend(handles=legend_elements, loc='upper right')
+    
+    # 3. Stacked bar chart of synonymous vs non-synonymous mutations
+    ax3 = plt.subplot(2, 2, 3)
+    
+    # Create stacked bar data
+    stack_data = df[['Sample_ID', 'Syn_Mutations', 'NonSyn_Mutations']].copy()
+    stack_data.set_index('Sample_ID', inplace=True)
+    stack_data.plot(kind='bar', stacked=True, ax=ax3, colormap='viridis')
+    
+    ax3.set_title('Mutation Composition')
+    ax3.set_xticklabels(ax3.get_xticklabels(), rotation=45, ha='right')
+    ax3.set_ylabel('Number of Mutations')
+    
+    # 4. Scatter plot of dN/dS vs total mutations with confidence intervals
+    ax4 = plt.subplot(2, 2, 4)
+    
+    # Create scatter plot
+    scatter = sns.scatterplot(
+        x='Total_Mutations', 
+        y='Original_dNdS', 
+        data=df, 
+        ax=ax4, 
+        s=80,
+        alpha=0.7,
+        hue='Significant',
+        palette={'Yes': 'darkred', 'No': 'teal'}
+    )
+    
+    # Add error bars for dN/dS
+    for _, row in df.iterrows():
+        ax4.errorbar(
+            row['Total_Mutations'],
+            row['Original_dNdS'],
+            yerr=[[row['Original_dNdS'] - row['Original_dNdS_Lower_CI']], 
+                  [row['Original_dNdS_Upper_CI'] - row['Original_dNdS']]],
+            fmt='none',
+            color='gray',
+            alpha=0.5,
+            capsize=3
+        )
+    
+    # Add sample labels to points (using abbreviated IDs)
+    for _, row in df.iterrows():
+        ax4.annotate(
+            row['Sample_ID'], 
+            (row['Total_Mutations'], row['Original_dNdS']),
+            xytext=(7, 0),
+            textcoords='offset points',
+            fontsize=8,
+            ha='left',
+            va='center'
+        )
+    
+    ax4.set_title('dN/dS vs Mutation Load')
+    ax4.set_xlabel('Total Mutations')
+    ax4.set_ylabel('Original dN/dS')
+    ax4.axhline(y=1.0, color='red', linestyle='--', alpha=0.7)
+    
+    # Remove legend from scatter plot (redundant with plot 2)
+    ax4.get_legend().remove()
+    
+    # Add overall title and adjust layout
+    plt.suptitle(title, fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    # Save the figure
+    plt.savefig(f"{output_dir}/dnds_analysis_summary.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/dnds_analysis_summary.pdf", bbox_inches='tight')
+    
+    # Create individual plots for each sample
+    for sample, sample_id in zip(df['Sample'], df['Sample_ID']):
+        sample_data = df[df['Sample'] == sample]
+        
+        # Create figure for individual sample
+        plt.figure(figsize=(10, 6))
+        
+        # Bar plot for this sample with error bars
+        plt.subplot(1, 2, 1)
+        values = [sample_data['Original_dNdS'].values[0], sample_data['Random_dNdS'].values[0]]
+        labels = ['Original', 'Random']
+        
+        bars = plt.bar(labels, values, color=['blue', 'orange'])
+        
+        # Add error bars
+        orig_err = [[sample_data['Original_dNdS'].values[0] - sample_data['Original_dNdS_Lower_CI'].values[0]],
+                    [sample_data['Original_dNdS_Upper_CI'].values[0] - sample_data['Original_dNdS'].values[0]]]
+        rand_err = [[sample_data['Random_dNdS'].values[0] - sample_data['Random_dNdS_Lower_CI'].values[0]],
+                    [sample_data['Random_dNdS_Upper_CI'].values[0] - sample_data['Random_dNdS'].values[0]]]
+        
+        plt.errorbar(0, values[0], yerr=orig_err, fmt='none', color='black', capsize=3)
+        plt.errorbar(1, values[1], yerr=rand_err, fmt='none', color='black', capsize=3)
+        
+        plt.axhline(y=1.0, color='red', linestyle='--', alpha=0.7)
+        plt.title(f'dN/dS Comparison - {sample_id}')
+        plt.ylabel('dN/dS Ratio')
+        
+        # Add significance marker if applicable
+        if sample_data['Significant'].values[0] == 'Yes':
+            plt.text(0, values[0] + max(orig_err[1][0], 0.1), '*', ha='center', fontsize=16)
+        
+        # Pie chart of mutation types
+        plt.subplot(1, 2, 2)
+        labels = ['Synonymous', 'Non-synonymous']
+        sizes = [sample_data['Syn_Mutations'].values[0], sample_data['NonSyn_Mutations'].values[0]]
+        plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, colors=['lightblue', 'lightgreen'])
+        plt.axis('equal')
+        plt.title('Mutation Types')
+        
+        plt.suptitle(f'Analysis for {sample_id}', fontsize=14)
+        plt.tight_layout(rect=[0, 0, 1, 0.90])
+        
+        # Save individual sample plot
+        plt.savefig(f"{output_dir}/{sample}_analysis.png", dpi=300, bbox_inches='tight')
+        
+        plt.close()
+    
+    print(f"Plots saved to {output_dir}")
+
 def main():
     parser = argparse.ArgumentParser(description='Generate plots from analysis results')
     parser.add_argument('-r', '--results_dir', type=str, required=True,
                        help='Path to results directory containing analysis outputs')
     parser.add_argument('-o', '--output_dir', type=str, required=True,
                        help='Path to output directory for plots')
+    parser.add_argument('--dnds-csv', type=str, 
+                       help='Path to dN/dS analysis CSV file (for random mutation analysis)')
     args = parser.parse_args()
 
     # Create output directory if it doesn't exist
@@ -781,12 +995,15 @@ def main():
         # Filter out basecounts or other non-mutation files
         aa_mut_files = [f for f in aa_mut_files if f.stem != 'basecounts']
         if aa_mut_files:
+            
             # Generate individual sample plots
+            '''
             for aa_file in aa_mut_files:
                 print(f"Generating dN/dS plots for {aa_file.stem}...")
                 with open(aa_file) as f:
                     aa_mutations = json.load(f)
                 plot_dnds_ratio(aa_mutations, args.output_dir, aa_file.stem)
+            '''
             
             # Generate combined plot
             print("\nGenerating combined dN/dS plot...")
@@ -815,6 +1032,15 @@ def main():
             with open(kmer_counts_file) as f:
                 genome_kmer_counts = json.load(f)
             plot_kmer_context(kmer_context, genome_kmer_counts, args.output_dir)
+        
+    # Plot dN/dS analysis results if CSV file is provided
+    if args.dnds_csv and os.path.exists(args.dnds_csv):
+        print("Generating dN/dS analysis plots...")
+        plot_dnds_analysis(
+            results_csv=args.dnds_csv,
+            output_dir=args.output_dir,
+            title="dN/dS Analysis of EMS Mutations"
+        )
         
 if __name__ == "__main__":
     main()

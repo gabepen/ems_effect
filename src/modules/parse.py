@@ -76,7 +76,7 @@ class SeqContext:
         return mask
 
     def gene_seqs(self) -> Dict[str, Seq]:
-        '''Extract sequences for all genes in the genome.
+        '''Extract sequences for all protein-coding genes in the genome.
         
         Returns:
             Dict[str, Seq]: Dictionary mapping gene IDs to their sequences.
@@ -86,7 +86,10 @@ class SeqContext:
         seqs: Dict[str, Seq] = {}
         for rec in GFF.parse(self.annot):
             for feat in rec.features:
-                if feat.type == 'gene':
+                if (feat.type == 'gene' and 
+                    'gene_biotype' in feat.qualifiers and
+                    feat.qualifiers['gene_biotype'][0] == 'protein_coding'):
+                    
                     refid = feat.qualifiers['Dbxref'][0].split(':')[-1]
                     # Skip genes that are entirely masked
                     if not any(self.overlap_mask[feat.location.start:feat.location.end]):
@@ -98,19 +101,17 @@ class SeqContext:
         return seqs
     
     def genome_features(self) -> Dict[str, FeatureLocation]:
-        '''Get locations for all features in the genome.
-        
-        Returns:
-            Dict[str, FeatureLocation]: Dictionary mapping feature IDs to their locations.
-                Keys are feature reference IDs (from Dbxref)
-                Values are BioPython FeatureLocation objects
-        '''
+        '''Get locations for all protein-coding genes in the genome.'''
         features: Dict[str, FeatureLocation] = {}
         for rec in GFF.parse(self.annot):
             for feat in rec.features:
-                features[feat.qualifiers['Dbxref'][0].split(':')[-1]] = feat.location
+                if (feat.type == 'gene' and
+                    'gene_biotype' in feat.qualifiers and 
+                    feat.qualifiers['gene_biotype'][0] == 'protein_coding'):
+                    features[feat.qualifiers['Dbxref'][0].split(':')[-1]] = feat.location
         return features 
                     
+
 def get_sequence_context(
     position: int, 
     ref_base: str,
@@ -395,12 +396,14 @@ def parse_mpile(mpile: str, seqobject: SeqContext, ems_only: bool, base_counts: 
             - Dict: Context counts
             - Dict: Intergenic counts
     '''
-    # Load and sort GFF features once
+    # Load and sort GFF features once, filtering for protein-coding genes only
     gff_features = []
     with open(seqobject.annot) as gff_file:
         for rec in GFF.parse(gff_file):
             for feat in rec.features:
-                if feat.type == 'gene':
+                if (feat.type == 'gene' and
+                    'gene_biotype' in feat.qualifiers and 
+                    feat.qualifiers['gene_biotype'][0] == 'protein_coding'):
                     gff_features.append((
                         feat.location.start,
                         feat.location.end,
