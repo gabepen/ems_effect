@@ -747,216 +747,139 @@ def plot_dnds_vs_intergenic(results_dir: str, output_dir: str) -> None:
         writer.writeheader()
         writer.writerows(csv_data)
 
-def plot_dnds_analysis(
-    results_csv: str, 
-    output_dir: str,
-    title: str = "dN/dS Analysis Results",
-    figsize: tuple = (12, 10)
-) -> None:
-    """
-    Create visualizations for dN/dS analysis results.
-    
-    Args:
-        results_csv: Path to the CSV file with dN/dS results
-        output_dir: Directory to save the plots
-        title: Main title for the plots
-        figsize: Figure size (width, height) in inches
-    """
-    # Create output directory if it doesn't exist
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Load data
+def plot_dnds_analysis(results_csv: str, output_dir: str, title: str = "dN/dS Analysis"):
+    """Generate plots for dN/dS analysis."""
+    # Load results
     df = pd.read_csv(results_csv)
     
-    # Create abbreviated sample names for plotting
-    df['Sample_ID'] = df['Sample'].apply(extract_sample_id)
+    # Create a shorter sample ID for plotting
+    df['Sample_ID'] = df['Sample'].str.replace('_wmelASM802v1_variants', '')
     
-    # Set up the figure with subplots
-    fig = plt.figure(figsize=figsize)
+    # Convert 'Significant' column to boolean if it's not already
+    if df['Significant'].dtype == 'object':
+        df['Significant'] = df['Significant'].map({'True': True, 'Yes': True, 'False': False, 'No': False})
     
-    # 1. Bar plot comparing original vs random dN/dS with error bars
-    ax1 = plt.subplot(2, 2, 1)
+    # Sort by ratio
+    df = df.sort_values('Ratio', ascending=False)
     
-    # Reshape data for plotting
-    plot_data = pd.melt(
-        df, 
-        id_vars=['Sample_ID'], 
-        value_vars=['Original_dNdS', 'Random_dNdS'],
-        var_name='Type', 
-        value_name='dN/dS'
-    )
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), gridspec_kw={'height_ratios': [2, 1]})
     
-    # Add error data
-    error_data = []
-    for _, row in plot_data.iterrows():
-        if row['Type'] == 'Original_dNdS':
-            sample_row = df[df['Sample_ID'] == row['Sample_ID']].iloc[0]
-            lower = row['dN/dS'] - sample_row['Original_dNdS_Lower_CI']
-            upper = sample_row['Original_dNdS_Upper_CI'] - row['dN/dS']
-            error_data.append([lower, upper])
-        else:
-            sample_row = df[df['Sample_ID'] == row['Sample_ID']].iloc[0]
-            lower = row['dN/dS'] - sample_row['Random_dNdS_Lower_CI']
-            upper = sample_row['Random_dNdS_Upper_CI'] - row['dN/dS']
-            error_data.append([lower, upper])
+    # Plot 1: dN/dS values with confidence intervals
+    x = np.arange(len(df))
+    width = 0.35
     
-    error_data = np.array(error_data).T
+    # Original dN/dS with error bars
+    original = ax1.bar(x - width/2, df['Original_dNdS'], width, label='Original dN/dS',
+                      yerr=[df['Original_dNdS'] - df['Original_dNdS_Lower_CI'], 
+                            df['Original_dNdS_Upper_CI'] - df['Original_dNdS']], 
+                      capsize=5, color='darkblue', alpha=0.7)
     
-    # Create bar plot with error bars
-    sns.barplot(x='Sample_ID', y='dN/dS', hue='Type', data=plot_data, ax=ax1)
+    # Random dN/dS with error bars
+    random = ax1.bar(x + width/2, df['Random_dNdS'], width, label='Random dN/dS',
+                    yerr=[df['Random_dNdS'] - df['Random_dNdS_Lower_CI'], 
+                          df['Random_dNdS_Upper_CI'] - df['Random_dNdS']], 
+                    capsize=5, color='darkgreen', alpha=0.7)
     
-    # Add error bars manually
-    bars = ax1.patches
-    for i, (bar, err) in enumerate(zip(bars, zip(error_data[0], error_data[1]))):
-        x = bar.get_x() + bar.get_width() / 2
-        y = bar.get_height()
-        ax1.errorbar(x, y, yerr=[[err[0]], [err[1]]], fmt='none', color='black', capsize=3)
+    # Add horizontal line at dN/dS = 1
+    ax1.axhline(y=1, color='red', linestyle='--', alpha=0.7)
     
-    ax1.set_title('Original vs Random dN/dS')
-    ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
-    ax1.axhline(y=1.0, color='red', linestyle='--', alpha=0.7)
+    # Customize plot
     ax1.set_ylabel('dN/dS Ratio')
+    ax1.set_title(f'{title} - dN/dS Values')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(df['Sample_ID'])
+    ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+    ax1.legend()
     
-    # 2. Bar plot of selection ratio (Original/Random) with significance
-    ax2 = plt.subplot(2, 2, 2)
+    # Plot 2: Ratio of Original/Random dN/dS
+    # Create a color map based on significance
+    colors = df['Significant'].map({True: 'darkred', False: 'teal'}).tolist()
     
-    # Create bar plot with different colors based on significance
-    bars = sns.barplot(x='Sample_ID', y='Ratio', data=df, ax=ax2, palette=df['Significant'].map({'Yes': 'darkred', 'No': 'teal'}))
+    # Create the bar plot with explicit colors
+    bars = ax2.bar(x, df['Ratio'], color=colors)
     
-    # Add significance markers
-    for i, (is_sig, ratio) in enumerate(zip(df['Significant'], df['Ratio'])):
-        if is_sig == 'Yes':
-            ax2.text(i, ratio + 0.05, '*', ha='center', va='bottom', fontsize=16, color='black')
+    # Add horizontal line at ratio = 1
+    ax2.axhline(y=1, color='black', linestyle='--', alpha=0.7)
     
-    ax2.set_title('Selection Ratio (Original/Random)')
+    # Customize plot
+    ax2.set_ylabel('Original/Random Ratio')
+    ax2.set_title('Ratio of Original to Random dN/dS')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(df['Sample_ID'])
     ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
-    ax2.axhline(y=1.0, color='red', linestyle='--', alpha=0.7)
-    ax2.set_ylabel('Selection Ratio')
     
-    # Add legend for significance
+    # Add a legend for significance
     from matplotlib.patches import Patch
     legend_elements = [
         Patch(facecolor='darkred', label='Significant'),
         Patch(facecolor='teal', label='Not Significant')
     ]
-    ax2.legend(handles=legend_elements, loc='upper right')
+    ax2.legend(handles=legend_elements)
     
-    # 3. Stacked bar chart of synonymous vs non-synonymous mutations
-    ax3 = plt.subplot(2, 2, 3)
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/dnds_analysis.png", dpi=300)
+    plt.savefig(f"{output_dir}/dnds_analysis.pdf")
+    plt.close()
     
-    # Create stacked bar data
-    stack_data = df[['Sample_ID', 'Syn_Mutations', 'NonSyn_Mutations']].copy()
-    stack_data.set_index('Sample_ID', inplace=True)
-    stack_data.plot(kind='bar', stacked=True, ax=ax3, colormap='viridis')
+    # Also create a version with samples sorted by type (NT vs EMS)
+    df['Sample_Type'] = df['Sample_ID'].str.extract(r'(NT|EMS)')
+    df = df.sort_values(['Sample_Type', 'Ratio'], ascending=[True, False])
     
-    ax3.set_title('Mutation Composition')
-    ax3.set_xticklabels(ax3.get_xticklabels(), rotation=45, ha='right')
-    ax3.set_ylabel('Number of Mutations')
+    # Repeat the plotting with the new sorting
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), gridspec_kw={'height_ratios': [2, 1]})
     
-    # 4. Scatter plot of dN/dS vs total mutations with confidence intervals
-    ax4 = plt.subplot(2, 2, 4)
+    x = np.arange(len(df))
     
-    # Create scatter plot
-    scatter = sns.scatterplot(
-        x='Total_Mutations', 
-        y='Original_dNdS', 
-        data=df, 
-        ax=ax4, 
-        s=80,
-        alpha=0.7,
-        hue='Significant',
-        palette={'Yes': 'darkred', 'No': 'teal'}
-    )
+    # Original dN/dS with error bars
+    original = ax1.bar(x - width/2, df['Original_dNdS'], width, label='Original dN/dS',
+                      yerr=[df['Original_dNdS'] - df['Original_dNdS_Lower_CI'], 
+                            df['Original_dNdS_Upper_CI'] - df['Original_dNdS']], 
+                      capsize=5, color='darkblue', alpha=0.7)
     
-    # Add error bars for dN/dS
-    for _, row in df.iterrows():
-        ax4.errorbar(
-            row['Total_Mutations'],
-            row['Original_dNdS'],
-            yerr=[[row['Original_dNdS'] - row['Original_dNdS_Lower_CI']], 
-                  [row['Original_dNdS_Upper_CI'] - row['Original_dNdS']]],
-            fmt='none',
-            color='gray',
-            alpha=0.5,
-            capsize=3
-        )
+    # Random dN/dS with error bars
+    random = ax1.bar(x + width/2, df['Random_dNdS'], width, label='Random dN/dS',
+                    yerr=[df['Random_dNdS'] - df['Random_dNdS_Lower_CI'], 
+                          df['Random_dNdS_Upper_CI'] - df['Random_dNdS']], 
+                    capsize=5, color='darkgreen', alpha=0.7)
     
-    # Add sample labels to points (using abbreviated IDs)
-    for _, row in df.iterrows():
-        ax4.annotate(
-            row['Sample_ID'], 
-            (row['Total_Mutations'], row['Original_dNdS']),
-            xytext=(7, 0),
-            textcoords='offset points',
-            fontsize=8,
-            ha='left',
-            va='center'
-        )
+    # Add horizontal line at dN/dS = 1
+    ax1.axhline(y=1, color='red', linestyle='--', alpha=0.7)
     
-    ax4.set_title('dN/dS vs Mutation Load')
-    ax4.set_xlabel('Total Mutations')
-    ax4.set_ylabel('Original dN/dS')
-    ax4.axhline(y=1.0, color='red', linestyle='--', alpha=0.7)
+    # Customize plot
+    ax1.set_ylabel('dN/dS Ratio')
+    ax1.set_title(f'{title} - dN/dS Values (Sorted by Sample Type)')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(df['Sample_ID'])
+    ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+    ax1.legend()
     
-    # Remove legend from scatter plot (redundant with plot 2)
-    ax4.get_legend().remove()
+    # Plot 2: Ratio of Original/Random dN/dS
+    # Create a color map based on significance
+    colors = df['Significant'].map({True: 'darkred', False: 'teal'}).tolist()
     
-    # Add overall title and adjust layout
-    plt.suptitle(title, fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    # Create the bar plot with explicit colors
+    bars = ax2.bar(x, df['Ratio'], color=colors)
     
-    # Save the figure
-    plt.savefig(f"{output_dir}/dnds_analysis_summary.png", dpi=300, bbox_inches='tight')
-    plt.savefig(f"{output_dir}/dnds_analysis_summary.pdf", bbox_inches='tight')
+    # Add horizontal line at ratio = 1
+    ax2.axhline(y=1, color='black', linestyle='--', alpha=0.7)
     
-    # Create individual plots for each sample
-    for sample, sample_id in zip(df['Sample'], df['Sample_ID']):
-        sample_data = df[df['Sample'] == sample]
-        
-        # Create figure for individual sample
-        plt.figure(figsize=(10, 6))
-        
-        # Bar plot for this sample with error bars
-        plt.subplot(1, 2, 1)
-        values = [sample_data['Original_dNdS'].values[0], sample_data['Random_dNdS'].values[0]]
-        labels = ['Original', 'Random']
-        
-        bars = plt.bar(labels, values, color=['blue', 'orange'])
-        
-        # Add error bars
-        orig_err = [[sample_data['Original_dNdS'].values[0] - sample_data['Original_dNdS_Lower_CI'].values[0]],
-                    [sample_data['Original_dNdS_Upper_CI'].values[0] - sample_data['Original_dNdS'].values[0]]]
-        rand_err = [[sample_data['Random_dNdS'].values[0] - sample_data['Random_dNdS_Lower_CI'].values[0]],
-                    [sample_data['Random_dNdS_Upper_CI'].values[0] - sample_data['Random_dNdS'].values[0]]]
-        
-        plt.errorbar(0, values[0], yerr=orig_err, fmt='none', color='black', capsize=3)
-        plt.errorbar(1, values[1], yerr=rand_err, fmt='none', color='black', capsize=3)
-        
-        plt.axhline(y=1.0, color='red', linestyle='--', alpha=0.7)
-        plt.title(f'dN/dS Comparison - {sample_id}')
-        plt.ylabel('dN/dS Ratio')
-        
-        # Add significance marker if applicable
-        if sample_data['Significant'].values[0] == 'Yes':
-            plt.text(0, values[0] + max(orig_err[1][0], 0.1), '*', ha='center', fontsize=16)
-        
-        # Pie chart of mutation types
-        plt.subplot(1, 2, 2)
-        labels = ['Synonymous', 'Non-synonymous']
-        sizes = [sample_data['Syn_Mutations'].values[0], sample_data['NonSyn_Mutations'].values[0]]
-        plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, colors=['lightblue', 'lightgreen'])
-        plt.axis('equal')
-        plt.title('Mutation Types')
-        
-        plt.suptitle(f'Analysis for {sample_id}', fontsize=14)
-        plt.tight_layout(rect=[0, 0, 1, 0.90])
-        
-        # Save individual sample plot
-        plt.savefig(f"{output_dir}/{sample}_analysis.png", dpi=300, bbox_inches='tight')
-        
-        plt.close()
+    # Customize plot
+    ax2.set_ylabel('Original/Random Ratio')
+    ax2.set_title('Ratio of Original to Random dN/dS')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(df['Sample_ID'])
+    ax2.set_xticklabels(ax2.get_xticklabels(), rotation=45, ha='right')
     
-    print(f"Plots saved to {output_dir}")
+    # Add a legend for significance
+    ax2.legend(handles=legend_elements)
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/dnds_analysis_by_type.png", dpi=300)
+    plt.savefig(f"{output_dir}/dnds_analysis_by_type.pdf")
+    plt.close()
 
 def main():
     parser = argparse.ArgumentParser(description='Generate plots from analysis results')

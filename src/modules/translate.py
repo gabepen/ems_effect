@@ -211,9 +211,6 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
     nonsyn = 0  # Total non-synonymous mutations
     aa_mutations = {}
     
-    match = 0
-    mis = 0
-    
     # Find start codon first
     start = -1
     for i in range(len(seq)-2):
@@ -224,19 +221,40 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
     if start == -1:
         return None, 1, empty_rates
     
+    
     # Process each mutation
     for mut_key, count in mutations.items():
         # Parse mutation
         pos_str, mut_type = mut_key.split('_')
-        pos = int(pos_str)
+        pos = int(pos_str)  # Position from mutation key (1-based)
+        
+        # Parse mutation type
+        ref_base_key, alt_base_key = mut_type.split('>')
+        
+        # Handle position and bases based on strand
+        if rc:
+            # For reverse strand genes
+            # Complement the bases
+            complement = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
+            ref_base_key = complement.get(ref_base_key, ref_base_key)
+            alt_base_key = complement.get(alt_base_key, alt_base_key)
+            
+            # Convert to 0-based and invert position
+            gene_pos = len(seq) - (pos - 1) - 1
+        else:
+            # For forward strand genes
+            gene_pos = pos - 1  # Convert to 0-based
         
         # Skip positions before start codon
-        if pos < start:
+        if gene_pos < start:
             continue
             
-        # Get codon position - FIXED to calculate relative to start codon
-        codon_pos = (pos - start) // 3 * 3 + start
-        base_pos = (pos - start) % 3
+        # Calculate position relative to start codon
+        rel_pos = gene_pos - start
+        
+        # Get codon position and base position within codon
+        codon_pos = (rel_pos // 3) * 3 + start
+        base_pos = rel_pos % 3
         
         if codon_pos + 2 >= len(seq):
             continue
@@ -245,14 +263,11 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
         
         # Make mutation
         ref_base = codon[base_pos]
-        alt_base = mut_type.split('>')[1]
+        alt_base = alt_base_key
         
         # Verify reference base matches
-        if ref_base != mut_type.split('>')[0]:
-            mis += 1
+        if ref_base != ref_base_key:
             continue
-        else:
-            match += 1
             
         # Create mutated codon
         mutated = list(codon)
@@ -272,7 +287,7 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
             syn_sites_mutated.add(site_key)
             
             # Add to amino acid mutations if it's a synonymous change
-            aa_key = f"{(pos-start)//3}_{ref_aa}>{ref_aa}"
+            aa_key = f"{rel_pos//3}_{ref_aa}>{ref_aa}"
             if aa_key not in aa_mutations:
                 aa_mutations[aa_key] = 0
             aa_mutations[aa_key] += count
@@ -281,7 +296,7 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
             non_syn_sites_mutated.add(site_key)
             
             # Add to amino acid mutations
-            aa_key = f"{(pos-start)//3}_{ref_aa}>{mut_aa}"
+            aa_key = f"{rel_pos//3}_{ref_aa}>{mut_aa}"
             if aa_key not in aa_mutations:
                 aa_mutations[aa_key] = 0
             aa_mutations[aa_key] += count
@@ -318,6 +333,7 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
         print(f"nonsyn: {nonsyn}, syn: {syn}")
         print(f"non_syn_sites: {non_syn_sites}, syn_sites: {syn_sites}")
 
+    
     return aa_mutations, 0, dnds_rates
 
 def count_shared(jsons):

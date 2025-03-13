@@ -39,7 +39,8 @@ def setup_directories(output_dir: str) -> Dict[str, str]:
     """Create output directories."""
     paths = {
         'base': output_dir,
-        'results': f"{output_dir}/results"
+        'results': f"{output_dir}/results",
+        'logs': f"{output_dir}/logs"
     }
     
     for path in paths.values():
@@ -54,28 +55,22 @@ def lookup_aa(codon: str, codon_table: Dict) -> str:
             return aa
     return '@'  # Unknown/invalid codon
 
-def randomize_mutations_preserve_type(
-    mut_dict: Dict, 
+def collect_valid_positions(
     seqobject: SeqContext,
     features: Dict,
     codon_table: Dict
 ) -> Dict:
-    """Generate one randomized mutation dataset preserving mutation types."""
+    """Collect valid positions for EMS mutations."""
     
-    # Count total mutations by type
-    mutations_by_type = {'C>T': 0, 'G>A': 0}
-    for gene in mut_dict:
-        for mut, count in mut_dict[gene]['mutations'].items():
-            mut_type = mut.split('_')[1]
-            if mut_type in mutations_by_type:
-                mutations_by_type[mut_type] += 1
-    
-    # Collect all valid C/G sites
     valid_positions = {'C': [], 'G': []}
+    
+    print("\nCollecting valid positions:")
     
     for gene_id, feature in features.items():
         seq = str(seqobject.genome[feature.start:feature.end])
-        if feature.strand == -1:
+        is_reverse = feature.strand == -1
+        
+        if is_reverse:
             seq = str(Seq(seq).reverse_complement())
         
         # Find start codon
@@ -86,14 +81,20 @@ def randomize_mutations_preserve_type(
                 break
         
         if start == -1:
+            print(f"No start codon found in gene {gene_id}")
             continue
-            
+       
+        codon_count = 0
+        position_count = 0
+        
         # Process each codon
         for codon_pos in range(start, len(seq)-2, 3):
             codon = seq[codon_pos:codon_pos+3]
             if len(codon) != 3:
                 continue
                 
+            codon_count += 1
+            
             # Check each position in codon
             for base_pos in range(3):
                 abs_pos = codon_pos + base_pos
@@ -102,13 +103,15 @@ def randomize_mutations_preserve_type(
                 if ref_base not in ['C', 'G']:
                     continue
                     
-                    genome_pos = feature.start + abs_pos
+                genome_pos = feature.start + abs_pos
                 if not seqobject.overlap_mask[genome_pos]:
                     continue
                 
+                position_count += 1
+                
                 # Classify site as synonymous or non-synonymous
                 mutated = list(codon)
-                mutated[base_pos] = 'T' if ref_base == 'C' else 'A'
+                mutated[base_pos] = 'T' if ref_base == 'C' else 'A'  # Always C>T or G>A
                 mutated = ''.join(mutated)
                 
                 ref_aa = lookup_aa(codon, codon_table)
@@ -127,6 +130,30 @@ def randomize_mutations_preserve_type(
     total_syn = sum(syn_sites.values())
     total_non_syn = sum(non_syn_sites.values())
     
+    return valid_positions, total_syn, total_non_syn
+
+def randomize_mutations_preserve_type(
+    mut_dict: Dict, 
+    seqobject: SeqContext,
+    features: Dict,
+    codon_table: Dict,
+    valid_positions: Dict
+) -> Dict:
+    """Generate one randomized mutation dataset preserving mutation types."""
+    
+    # Make deep copy of valid positions since we'll be modifying it
+    valid_positions = {
+        'C': valid_positions['C'][:],
+        'G': valid_positions['G'][:]
+    }
+    # nt total mutations by type
+    mutations_by_type = {'C>T': 0, 'G>A': 0}
+    for gene in mut_dict:
+        for mut, count in mut_dict[gene]['mutations'].items():
+            mut_type = mut.split('_')[1]
+            if mut_type in mutations_by_type:
+                mutations_by_type[mut_type] += 1
+    
     # Generate randomized dataset
     new_mut_dict = {}
     
@@ -138,14 +165,7 @@ def randomize_mutations_preserve_type(
     for mut_type, count in mutations_by_type.items():
         ref = 'C' if mut_type == 'C>T' else 'G'
         
-        if count > len(valid_positions[ref]):
-            raise ValueError(f"Not enough {ref} positions ({len(valid_positions[ref])}) "
-                           f"for requested mutations ({count})")
-        
         for _ in range(count):
-            if not valid_positions[ref]:
-                break
-                
             idx = random.randrange(len(valid_positions[ref]))
             gene_id, gene_pos, _, is_synonymous = valid_positions[ref].pop(idx)
             
@@ -156,7 +176,7 @@ def randomize_mutations_preserve_type(
                     'gene_len': features[gene_id].end - features[gene_id].start
                 }
             
-            mut_key = f"{gene_pos}_{mut_type}"
+            mut_key = f"{gene_pos + 1}_{mut_type}"
             new_mut_dict[gene_id]['mutations'][mut_key] = \
                 new_mut_dict[gene_id]['mutations'].get(mut_key, 0) + 1
                 
@@ -165,59 +185,8 @@ def randomize_mutations_preserve_type(
                 placed_syn[mut_type] += 1
             else:
                 placed_non_syn[mut_type] += 1
-    
-    # Store mutation classification for later use
-    for gene_id in new_mut_dict:
-        new_mut_dict[gene_id]['_syn_muts'] = {}
-        new_mut_dict[gene_id]['_non_syn_muts'] = {}
-        
-    # Record which mutations are synonymous vs non-synonymous
-    for gene_id in new_mut_dict:
-        for mut_key, count in new_mut_dict[gene_id]['mutations'].items():
-            pos, mut_type = mut_key.split('_')
-            
-            # Get gene sequence
-            seq = str(seqobject.genome[features[gene_id].start:features[gene_id].end])
-            if features[gene_id].strand == -1:
-                seq = str(Seq(seq).reverse_complement())
-            
-            # Find start codon
-            start = -1
-            for i in range(len(seq)-2):
-                if seq[i:i+3] in codon_table['starts']:
-                    start = i
-                    break
-            
-            if start == -1:
-                continue
-            
-            # Get codon position
-            pos = int(pos)
-            codon_pos = (pos - start) // 3 * 3 + start
-            base_pos = (pos - start) % 3
-            
-            if codon_pos + 2 >= len(seq):
-                continue
-            
-            codon = seq[codon_pos:codon_pos+3]
-            
-            # Make mutation
-            mutated = list(codon)
-            ref_base = codon[base_pos]
-            alt_base = 'T' if ref_base == 'C' else 'A'
-            mutated[base_pos] = alt_base
-            mutated = ''.join(mutated)
-            
-            # Check if synonymous
-            ref_aa = lookup_aa(codon, codon_table)
-            mut_aa = lookup_aa(mutated, codon_table)
-            is_synonymous = (ref_aa == mut_aa)
-            
-            if is_synonymous:
-                new_mut_dict[gene_id]['_syn_muts'][mut_key] = count
-            else:
-                new_mut_dict[gene_id]['_non_syn_muts'][mut_key] = count
-    
+    print(f"Placed syn: {placed_syn}")
+    print(f"Placed non-syn: {placed_non_syn}")
     return new_mut_dict
 
 def calculate_dnds_confidence_interval(
@@ -225,7 +194,8 @@ def calculate_dnds_confidence_interval(
     non_syn_muts: int,
     syn_sites: int,
     non_syn_sites: int,
-    confidence: float = 0.95
+    confidence: float = 0.95,
+    bootstrap_iterations: int = 1000
 ) -> Tuple[float, float, float]:
     """
     Calculate confidence interval for dN/dS ratio using bootstrapping.
@@ -236,68 +206,72 @@ def calculate_dnds_confidence_interval(
         syn_sites: Number of potential synonymous sites
         non_syn_sites: Number of potential non-synonymous sites
         confidence: Confidence level (default: 0.95 for 95% CI)
+        bootstrap_iterations: Number of bootstrap iterations
         
     Returns:
         Tuple containing:
-        - dnds: Point estimate of dN/dS
-        - lower_bound: Lower bound of confidence interval
-        - upper_bound: Upper bound of confidence interval
+            - float: dN/dS ratio
+            - float: Lower bound of confidence interval
+            - float: Upper bound of confidence interval
     """
-    # Calculate point estimate
+    # Calculate raw dN/dS
+    if syn_muts == 0 or syn_sites == 0:
+        return 0.0, 0.0, 0.0
+    
     dn = non_syn_muts / non_syn_sites if non_syn_sites > 0 else 0
     ds = syn_muts / syn_sites if syn_sites > 0 else 0
     dnds = dn / ds if ds > 0 else 0
     
-    # For small counts, use analytical approximation
-    if syn_muts < 20 or non_syn_muts < 20:
-        # Calculate standard errors using Poisson approximation
-        se_syn = np.sqrt(syn_muts) / syn_sites if syn_muts > 0 else 0
-        se_non_syn = np.sqrt(non_syn_muts) / non_syn_sites if non_syn_muts > 0 else 0
+    # For small counts, use analytical approach based on Poisson distribution
+    if syn_muts < 10 or non_syn_muts < 10:
+        # Calculate standard errors for dN and dS
+        se_dn = np.sqrt(non_syn_muts) / non_syn_sites if non_syn_muts > 0 and non_syn_sites > 0 else 0
+        se_ds = np.sqrt(syn_muts) / syn_sites if syn_muts > 0 and syn_sites > 0 else 0
         
-        # Calculate standard error of the ratio using delta method
-        if ds > 0:
-            se_ratio = dnds * np.sqrt((se_non_syn/dn)**2 + (se_syn/ds)**2)
+        # Calculate standard error for dN/dS using error propagation
+        if ds > 0 and se_ds > 0 and se_dn > 0:
+            se_dnds = dnds * np.sqrt((se_dn/dn)**2 + (se_ds/ds)**2)
             
             # Calculate confidence interval
-            z_score = stats.norm.ppf((1 + confidence) / 2)
-            lower_bound = max(0, dnds - z_score * se_ratio)
-            upper_bound = dnds + z_score * se_ratio
-        else:
-            # If ds is zero, can't calculate CI analytically
-            lower_bound = 0
-            upper_bound = float('inf')
-    else:
-        # For larger counts, use bootstrap resampling
-        n_bootstrap = 1000
-        bootstrap_dnds = []
-        
-        for _ in range(n_bootstrap):
-            # Resample mutation counts
-            syn_resample = np.random.poisson(syn_muts)
-            non_syn_resample = np.random.poisson(non_syn_muts)
+            z_score = stats.norm.ppf(1 - (1 - confidence) / 2)
+            lower_ci = max(0, dnds - z_score * se_dnds)
+            upper_ci = dnds + z_score * se_dnds
             
-            # Calculate dN/dS for this resample
-            dn_boot = non_syn_resample / non_syn_sites if non_syn_sites > 0 else 0
-            ds_boot = syn_resample / syn_sites if syn_sites > 0 else 0
-            dnds_boot = dn_boot / ds_boot if ds_boot > 0 else 0
-            
-            bootstrap_dnds.append(dnds_boot)
-        
-        # Calculate confidence interval from bootstrap distribution
-        lower_percentile = (1 - confidence) / 2 * 100
-        upper_percentile = (1 + confidence) / 2 * 100
-        lower_bound = max(0, np.percentile(bootstrap_dnds, lower_percentile))
-        upper_bound = np.percentile(bootstrap_dnds, upper_percentile)
+            return dnds, lower_ci, upper_ci
     
-    return dnds, lower_bound, upper_bound
+    # For larger counts, use bootstrapping
+    bootstrap_results = []
+    
+    for _ in range(bootstrap_iterations):
+        # Resample mutation counts from Poisson distribution
+        bootstrap_syn = np.random.poisson(syn_muts)
+        bootstrap_non_syn = np.random.poisson(non_syn_muts)
+        
+        # Calculate dN/dS for this bootstrap sample
+        bootstrap_dn = bootstrap_non_syn / non_syn_sites if non_syn_sites > 0 else 0
+        bootstrap_ds = bootstrap_syn / syn_sites if syn_sites > 0 else 0
+        bootstrap_dnds = bootstrap_dn / bootstrap_ds if bootstrap_ds > 0 else 0
+        
+        bootstrap_results.append(bootstrap_dnds)
+    
+    # Calculate confidence interval from bootstrap distribution
+    lower_percentile = (1 - confidence) / 2 * 100
+    upper_percentile = (1 - (1 - confidence) / 2) * 100
+    
+    lower_ci = max(0, np.percentile(bootstrap_results, lower_percentile))
+    upper_ci = np.percentile(bootstrap_results, upper_percentile)
+    
+    return dnds, lower_ci, upper_ci
 
-def analyze_original_mutations(
+def analyze_mutations(
     mut_dict: Dict,
     wolgenome: SeqContext,
     features: Dict,
     codon_table: Dict,
     syn_sites: int,
-    non_syn_sites: int
+    non_syn_sites: int,
+    filter_value: str,
+    mutkey_is_reverse: bool = False
 ) -> Dict:
     """Analyze original mutations to calculate dN/dS."""
     # Count synonymous and non-synonymous mutations
@@ -315,10 +289,13 @@ def analyze_original_mutations(
     for gene_id, gene_data in mut_dict.items():
         if gene_id not in features:
             continue
-            
+        
+
         seq = str(wolgenome.genome[features[gene_id].start:features[gene_id].end])
         if features[gene_id].strand == -1:
             seq = str(Seq(seq).reverse_complement())
+        
+
         
         # Find start codon
         start = -1
@@ -329,16 +306,30 @@ def analyze_original_mutations(
         
         if start == -1:
             continue
-            
+        
         # Process each mutation
         for mut_key, count in gene_data['mutations'].items():
+            
+            # Skip if count is less than filter value
+            if count < int(filter_value):
+                continue
+            
             # Parse mutation
             pos_str, mut_type = mut_key.split('_')
-            pos = int(pos_str)
-            
+            pos = int(pos_str) - 1
+        
             # Track mutation types
             mutation_types[mut_type] = mutation_types.get(mut_type, 0) + 1
             
+            
+            if features[gene_id].strand == -1 and not mutkey_is_reverse:
+                pos = len(seq) - pos - 1
+                if mut_type == 'C>T':
+                    mut_type = 'G>A'
+                elif mut_type == 'G>A':
+                    mut_type = 'C>T'
+            
+                   
             # Filter for only EMS mutations (C>T and G>A)
             if mut_type not in ['C>T', 'G>A']:
                 continue
@@ -347,6 +338,7 @@ def analyze_original_mutations(
             
             # Skip positions before start codon
             if pos < start:
+                print(f"BEFORE START CODON")
                 continue
                 
             # Get codon position
@@ -354,6 +346,7 @@ def analyze_original_mutations(
             base_pos = (pos - start) % 3
             
             if codon_pos + 2 >= len(seq):
+                print(f"AFTER END OF GENE")
                 continue
                 
             codon = seq[codon_pos:codon_pos+3]
@@ -362,16 +355,20 @@ def analyze_original_mutations(
             mutated = list(codon)
             ref_base = codon[base_pos]
             
+            
             # Extract alt_base from mutation type
             alt_base = mut_type.split('>')[1]
                 
+          
             mutated[base_pos] = alt_base
             mutated = ''.join(mutated)
             
+         
             # Check if synonymous
             ref_aa = lookup_aa(codon, codon_table)
             mut_aa = lookup_aa(mutated, codon_table)
             is_synonymous = (ref_aa == mut_aa)
+            
             
             # Create a unique site key
             site_key = f"{gene_id}_{pos}"
@@ -398,44 +395,9 @@ def analyze_original_mutations(
     dnds = dn / ds if ds > 0 else 0
     
     # Calculate confidence intervals for dN/dS
-    if syn_muts < 20 or non_syn_muts < 20:
-        # Calculate standard errors using Poisson approximation
-        se_syn = np.sqrt(syn_muts) / syn_sites if syn_muts > 0 else 0
-        se_non_syn = np.sqrt(non_syn_muts) / non_syn_sites if non_syn_muts > 0 else 0
-        
-        # Calculate standard error of the ratio using delta method
-        if ds > 0:
-            se_ratio = dnds * np.sqrt((se_non_syn/dn)**2 + (se_syn/ds)**2)
-            
-            # Calculate 95% confidence interval
-            z_score = stats.norm.ppf(0.975)  # 95% CI
-            lower_ci = max(0, dnds - z_score * se_ratio)
-            upper_ci = dnds + z_score * se_ratio
-        else:
-            lower_ci = 0
-            upper_ci = float('inf')
-    else:
-        # For larger counts, use bootstrap resampling
-        n_bootstrap = 1000
-        bootstrap_dnds = []
-        
-        for _ in range(n_bootstrap):
-            # Resample mutation counts
-            syn_resample = np.random.poisson(syn_muts)
-            non_syn_resample = np.random.poisson(non_syn_muts)
-            
-            # Calculate dN/dS for this resample
-            dn_boot = non_syn_resample / non_syn_sites if non_syn_sites > 0 else 0
-            ds_boot = syn_resample / syn_sites if syn_sites > 0 else 0
-            dnds_boot = dn_boot / ds_boot if ds_boot > 0 else 0
-            
-            bootstrap_dnds.append(dnds_boot)
-        
-        # Calculate confidence interval from bootstrap distribution
-        lower_percentile = (1 - 0.95) / 2 * 100
-        upper_percentile = (1 + 0.95) / 2 * 100
-        lower_ci = max(0, np.percentile(bootstrap_dnds, lower_percentile))
-        upper_ci = np.percentile(bootstrap_dnds, upper_percentile)
+    dnds, lower_ci, upper_ci = calculate_dnds_confidence_interval(
+        syn_muts, non_syn_muts, syn_sites, non_syn_sites, confidence=0.95
+    )
     
     return {
         'total_muts': total_muts,
@@ -538,6 +500,20 @@ def calculate_dnds(
         'dnds_raw': dnds
     }
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, bool):  # Add handling for boolean values
+            return str(obj)
+        elif isinstance(obj, np.bool_):  # Add handling for boolean values
+            return str(obj)
+        return super(NumpyEncoder, self).default(obj)
+
 def process_sample(
     sample_name: str,
     mut_file: Path,
@@ -547,7 +523,9 @@ def process_sample(
     codon_table: Dict,
     syn_sites: int,
     non_syn_sites: int,
-    iterations: int
+    iterations: int,
+    filter_value: str,
+    valid_positions: Dict
 ) -> Dict:
     """Process a single sample and return its statistics."""
     # Create sample output directory
@@ -559,13 +537,14 @@ def process_sample(
         original_muts = json.load(f)
     
     # Analyze original mutations
-    original_stats = analyze_original_mutations(
+    original_stats = analyze_mutations(
         original_muts,
         wolgenome,
         features,
         codon_table,
         syn_sites,
-        non_syn_sites
+        non_syn_sites,
+        filter_value
     )
     
     # Generate and analyze randomized datasets
@@ -577,34 +556,57 @@ def process_sample(
             original_muts, 
             wolgenome,
             features,
-            codon_table
+            codon_table,
+            valid_positions
         )
-        
-        # Calculate dN/dS
-        genome_stats = calculate_dnds(random_muts, syn_sites, non_syn_sites)
-        all_genome_stats.append(genome_stats)
+       
+        random_stats = analyze_mutations(
+            random_muts,
+            wolgenome,
+            features,
+            codon_table,
+            syn_sites,
+            non_syn_sites,
+            0,
+            True
+        )
+    
+        all_genome_stats.append(random_stats)
     
     # Calculate random mean and confidence interval
     random_values = [stats['dnds_raw'] for stats in all_genome_stats]
     random_mean = np.mean(random_values)
-    random_std = np.std(random_values)
-    random_lower_ci = max(0, random_mean - 1.96 * random_std)
-    random_upper_ci = random_mean + 1.96 * random_std
+    
+    # Calculate confidence interval using mean mutation counts
+    mean_syn_muts = np.mean([stats['syn_muts'] for stats in all_genome_stats])
+    mean_non_syn_muts = np.mean([stats['non_syn_muts'] for stats in all_genome_stats])
+    _, random_lower_ci, random_upper_ci = calculate_dnds_confidence_interval(
+        mean_syn_muts,
+        mean_non_syn_muts,
+        syn_sites,
+        non_syn_sites,
+        confidence=0.95
+    )
     
     # Calculate ratio and significance
-    ratio = original_stats['dnds_raw'] / random_mean if random_mean > 0 else 0
+    ratio = original_stats['dnds_raw'] / random_mean if random_mean > 0 else 0.0
+    is_significant = original_stats['dnds_raw'] < random_lower_ci or original_stats['dnds_raw'] > random_upper_ci
     
-    # Determine if original dN/dS is significantly different from random
-    is_significant = (original_stats['dnds_raw'] < random_lower_ci or 
-                     original_stats['dnds_raw'] > random_upper_ci)
-    
-    # Save results
+    # Prepare results dictionary
     results = {
         'sample': sample_name,
-        'original': original_stats,
+        'original': {
+            'total_muts': original_stats['total_muts'],
+            'syn_muts': original_stats['syn_muts'],
+            'non_syn_muts': original_stats['non_syn_muts'],
+            'unique_syn_sites': original_stats['unique_syn_sites'],
+            'unique_non_syn_sites': original_stats['unique_non_syn_sites'],
+            'dnds_raw': original_stats['dnds_raw'],
+            'dnds_lower_ci': original_stats['dnds_lower_ci'],
+            'dnds_upper_ci': original_stats['dnds_upper_ci']
+        },
         'random': {
             'mean': random_mean,
-            'std': random_std,
             'lower_ci': random_lower_ci,
             'upper_ci': random_upper_ci,
             'values': random_values
@@ -613,10 +615,52 @@ def process_sample(
         'significant': is_significant
     }
     
+    # Save results
     with open(sample_dir / 'dnds_results.json', 'w') as f:
-        json.dump(results, f, indent=2)
-    
+        json.dump(results, f, indent=2, cls=NumpyEncoder)
+        
     return results
+
+def write_summary_csv(results: List[Dict], output_file: str):
+    """Write summary CSV file with dN/dS results for all samples."""
+    with open(output_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        # Write header
+        writer.writerow([
+            'Sample', 
+            'Total_Mutations', 
+            'Syn_Mutations', 
+            'NonSyn_Mutations',
+            'Original_dNdS',
+            'Original_dNdS_Lower_CI',
+            'Original_dNdS_Upper_CI',
+            'Random_dNdS',
+            'Random_dNdS_Lower_CI',
+            'Random_dNdS_Upper_CI',
+            'Ratio',
+            'Significant'
+        ])
+        
+        # Write data for each sample
+        for result in results:
+            sample = result['sample']
+            original = result['original']
+            random_data = result['random']
+            
+            writer.writerow([
+                sample,
+                original['total_muts'],
+                original['syn_muts'],
+                original['non_syn_muts'],
+                original['dnds_raw'],
+                original['dnds_lower_ci'],
+                original['dnds_upper_ci'],
+                random_data['mean'],
+                random_data['lower_ci'],
+                random_data['upper_ci'],
+                result['ratio'],
+                result['significant']
+            ])
 
 def main():
     args = parse_args()
@@ -636,7 +680,7 @@ def main():
     
     # Count potential sites once
     print("Counting potential mutation sites...")
-    syn_sites, non_syn_sites = count_potential_sites(wolgenome, features, codon_table)
+    valid_positions, syn_sites, non_syn_sites = collect_valid_positions(wolgenome, features, codon_table)
     print(f"Potential sites: Synonymous={syn_sites}, Non-synonymous={non_syn_sites}")
     
     # Find all mutation files
@@ -649,83 +693,58 @@ def main():
     
     print(f"Found {len(mutation_files)} mutation files to process")
     
-    # Process each sample
-    all_results = []
+    # Define output directory
+    output_dir = Path(paths['results'])
     
-    for mut_file in tqdm(mutation_files, desc="Processing samples"):
-        sample_name = mut_file.stem
-        print(f"\nProcessing sample: {sample_name}")
+    # Process all samples
+    for filter_value in [0,1,2,3,4,5]:
+        all_results = []
+        for mut_file in tqdm(mutation_files, desc="Processing samples"):
+            sample_name = mut_file.stem  # Extract sample name from filename
+            try:
+                result = process_sample(
+                    sample_name,
+                    mut_file,
+                    output_dir,
+                    wolgenome,
+                    features,
+                    codon_table,
+                    syn_sites,
+                    non_syn_sites,
+                    args.iterations,
+                    filter_value,
+                    valid_positions
+                )
+                all_results.append(result)
+            except Exception as e:
+                print(f"Error processing {sample_name}: {e}")
+                import traceback
+                print(f"Traceback:\n{traceback.format_exc()}")
         
+        # Write summary CSV
+        csv_path = output_dir / f'dnds_summary_{filter_value}.csv'
+        write_summary_csv(all_results, str(csv_path))
+        
+        print(f"\nSummary table written to {csv_path}")
+        
+        # Also save as JSON for further processing
+        with open(f"{paths['results']}/dnds_summary_{filter_value}.json", 'w') as f:
+            json.dump(all_results, f, indent=2, cls=NumpyEncoder)
+        
+        # Generate plots
         try:
-            result = process_sample(
-                sample_name,
-                mut_file,
-                Path(paths['results']),
-                wolgenome,
-                features,
-                codon_table,
-                syn_sites,
-                non_syn_sites,
-                args.iterations
-            )
-            all_results.append(result)
+            print("Generating plots...")
+            plots_dir = f"{paths['results']}/plots_{filter_value}"
+            Path(plots_dir).mkdir(parents=True, exist_ok=True)
             
+            plot_dnds_analysis(
+                results_csv=csv_path,
+                output_dir=plots_dir,
+                title="dN/dS Analysis of EMS Mutations"
+            )
+            print(f"Plots saved to {plots_dir}")
         except Exception as e:
-            print(f"Error processing {sample_name}: {e}")
-            continue
-    
-    # Generate summary table
-    summary_rows = []
-    
-    for result in all_results:
-        summary_rows.append({
-            'Sample': result['sample'],
-            'Total_Mutations': result['original']['total_muts'],
-            'Syn_Mutations': result['original']['syn_muts'],
-            'NonSyn_Mutations': result['original']['non_syn_muts'],
-            'Original_dNdS': result['original']['dnds_raw'],
-            'Original_dNdS_Lower_CI': result['original']['dnds_lower_ci'],
-            'Original_dNdS_Upper_CI': result['original']['dnds_upper_ci'],
-            'Random_dNdS': result['random']['mean'],
-            'Random_dNdS_Lower_CI': result['random']['lower_ci'],
-            'Random_dNdS_Upper_CI': result['random']['upper_ci'],
-            'Ratio': result['ratio'],
-            'Significant': 'Yes' if result['significant'] else 'No'
-        })
-    
-    # Write summary CSV
-    csv_path = f"{paths['results']}/dnds_summary.csv"
-    with open(csv_path, 'w', newline='') as f:
-        fieldnames = ['Sample', 'Total_Mutations', 'Syn_Mutations', 'NonSyn_Mutations', 
-                     'Original_dNdS', 'Original_dNdS_Lower_CI', 'Original_dNdS_Upper_CI',
-                     'Random_dNdS', 'Random_dNdS_Lower_CI', 'Random_dNdS_Upper_CI',
-                     'Ratio', 'Significant']
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        
-        writer.writeheader()
-        for row in summary_rows:
-            writer.writerow(row)
-    
-    print(f"\nSummary table written to {csv_path}")
-    
-    # Also save as JSON for further processing
-    with open(f"{paths['results']}/dnds_summary.json", 'w') as f:
-        json.dump(all_results, f, indent=2)
-    
-    # Generate plots
-    try:
-        print("Generating plots...")
-        plots_dir = f"{paths['results']}/plots"
-        Path(plots_dir).mkdir(parents=True, exist_ok=True)
-        
-        plot_dnds_analysis(
-            results_csv=csv_path,
-            output_dir=plots_dir,
-            title="dN/dS Analysis of EMS Mutations"
-        )
-        print(f"Plots saved to {plots_dir}")
-    except Exception as e:
-        print(f"Error generating plots: {e}")
+            print(f"Error generating plots: {e}")
 
 if __name__ == '__main__':
     main() 

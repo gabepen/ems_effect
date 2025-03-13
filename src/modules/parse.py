@@ -170,6 +170,7 @@ def check_mutations(
     muts: Dict[str, int] = {}    
     bp = (int(entry[1]) - int(genestart))
     bp = str(bp) + '_'
+    
     ref = entry[2]
     depth = int(entry[3])
     position = int(entry[1])
@@ -251,7 +252,8 @@ def process_mpileup_chunk(args: Tuple[str, List[str], SeqContext, bool, List[Tup
         'unique_sites': 0,  # Count of unique positions mutated
         'gc_sites': 0,  # Total G/C sites
         'total_sites': 0,  # Total sites processed
-        'coverage_depths': []  # For calculating average coverage
+        'coverage_depths': [],  # For calculating average coverage
+        'count_bins': {str(i): 0 for i in range(1, 16)}  # Bins for mutation counts 1-15, with 15+ in bin '15'
     }
     
     current_gene_idx = 0
@@ -291,7 +293,7 @@ def process_mpileup_chunk(args: Tuple[str, List[str], SeqContext, bool, List[Tup
         )
         
         # Add mutations to appropriate collection
-        if current_gene and current_gene[0] <= int(entry[1]) < current_gene[1]:
+        if current_gene and current_gene[0] + 1 <= int(entry[1]) < current_gene[1] + 1:
             # Gene mutation handling remains the same
             gene_id = current_gene[2]
             if gene_id not in mutations:
@@ -314,9 +316,10 @@ def process_mpileup_chunk(args: Tuple[str, List[str], SeqContext, bool, List[Tup
             for mut in muts:
                 mut_type = mut.split('_')[1]  # Get mutation type (e.g., 'C>T')
                 position = int(mut.split('_')[0])  # Get position
+                count = muts[mut]  # Get mutation count
                 
                 if mut_type in ['C>T', 'G>A']:  # Only track EMS mutations
-                    intergenic_counts['mutation_types'][mut_type] += muts[mut]
+                    intergenic_counts['mutation_types'][mut_type] += count
                     
                     # Track unique sites
                     if position not in intergenic_counts.get('_temp_sites', set()):
@@ -324,6 +327,10 @@ def process_mpileup_chunk(args: Tuple[str, List[str], SeqContext, bool, List[Tup
                             intergenic_counts['_temp_sites'] = set()
                         intergenic_counts['_temp_sites'].add(position)
                         intergenic_counts['unique_sites'] += 1
+                    
+                    # Track count bins for mutations (how many times each mutation was observed)
+                    count_bin = str(min(15, count))  # Cap at 15+
+                    intergenic_counts['count_bins'][count_bin] += 1
     
     # Remove temporary set before returning
     if '_temp_sites' in intergenic_counts:
@@ -429,7 +436,8 @@ def parse_mpile(mpile: str, seqobject: SeqContext, ems_only: bool, base_counts: 
         'unique_sites': 0,
         'gc_sites': 0,
         'total_sites': 0,
-        'coverage_depths': []
+        'coverage_depths': [],
+        'count_bins': {str(i): 0 for i in range(1, 16)}  # Bins for mutation counts 1-15, with 15+ in bin '15'
     }
     
     # Process chunks in parallel
@@ -467,6 +475,12 @@ def parse_mpile(mpile: str, seqobject: SeqContext, ems_only: bool, base_counts: 
         intergenic_counts['total_sites'] += chunk_intergenic['total_sites']
         intergenic_counts['unique_sites'] += chunk_intergenic['unique_sites']
         intergenic_counts['coverage_depths'].extend(chunk_intergenic['coverage_depths'])
+        
+        # Combine count bins
+        if 'count_bins' in chunk_intergenic:
+            for count, bin_count in chunk_intergenic['count_bins'].items():
+                intergenic_counts['count_bins'][count] = \
+                    intergenic_counts['count_bins'].get(count, 0) + bin_count
     
     # Calculate final averages
     for gene_id in sample_mutations:
