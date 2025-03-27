@@ -69,7 +69,8 @@ def setup_directories(outdir: str) -> Dict[str, str]:
         f"{outdir}/nuc_muts",
         f"{outdir}/aa_muts",
         f"{outdir}/provean_files",
-        f"{outdir}/results"
+        f"{outdir}/results",
+        f"{outdir}/logs"
     ]
     for directory in directories:
         if not os.path.isdir(directory):
@@ -79,7 +80,8 @@ def setup_directories(outdir: str) -> Dict[str, str]:
         'mutpath': f"{outdir}/nuc_muts",
         'aapath': f"{outdir}/aa_muts",
         'provpath': f"{outdir}/provean_files",
-        'results': f"{outdir}/results"
+        'results': f"{outdir}/results",
+        'logs': f"{outdir}/logs"
     }
 
 def setup_logging(outdir: str) -> None:
@@ -110,7 +112,7 @@ def process_mpileups(pile: str, mutpath: str, outdir: str, wolgenome: Any, ems_o
         wolgenome (SeqContext): Genome context object containing sequence and annotation info
         ems_only (bool): Flag to process only EMS mutations
     '''
-    piles = glob(pile + '/*_variants.txt')
+    piles = glob(pile + '/*.txt')
     base_counts = {}
     context_counts = {}
     all_intergenic = {}  # Store intergenic counts for all samples
@@ -314,12 +316,12 @@ def main() -> None:
     '''
     args = parse_args()
     
+    # Setup paths and directories
+    paths = setup_directories(args.output.rstrip('/'))
+    
     # Setup logging first
     setup_logging(args.output.rstrip('/'))
     logger.info("Starting PROVEAN effect score calculation pipeline")
-    
-    # Setup paths and directories
-    paths = setup_directories(args.output.rstrip('/'))
     
     # Load reference paths from config
     refs, provean_config = load_config(args.config)

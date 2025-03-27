@@ -15,6 +15,7 @@ from itertools import islice
 import multiprocessing as mp
 from glob import glob
 from pathlib import Path
+import numpy as np
 
 class SeqContext:
     '''A class to handle genomic sequence context and annotations.
@@ -215,7 +216,7 @@ def check_mutations(
 
     return muts, depth, local_base_counts
 
-def process_mpileup_chunk(args: Tuple[str, List[str], SeqContext, bool, List[Tuple], int, int, int]) -> Tuple[str, Dict, Dict, Dict]:
+def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[Tuple], int, int, int]) -> Tuple[str, Dict, Dict, Dict]:
     '''Process a chunk of mpileup lines.
     
     Args:
@@ -234,11 +235,7 @@ def process_mpileup_chunk(args: Tuple[str, List[str], SeqContext, bool, List[Tup
             - str: Sample name
             - Dict: Mutations per gene
             - Dict: Base counts
-            - Dict: Intergenic counts with:
-                - mutations: Dict of mutation types and counts
-                - gc_sites: Count of G/C bases in intergenic regions
-                - total_sites: Total bases in intergenic regions
-                - coverage: List of coverage values for averaging
+            - Dict: Intergenic counts
     '''
     sample, lines, seqobject, ems_only, gff_features, context_size, start_idx, chunk_size = args
     
@@ -383,7 +380,7 @@ def get_chunk_boundaries(mpileup_file, chunk_size: int, gff_features: List[Tuple
     
     return boundaries
 
-def parse_mpile(mpile: str, seqobject: SeqContext, ems_only: bool, base_counts: Dict[str, int],
+def parse_mpile(mpile: str, seqobject: 'SeqContext', ems_only: bool, base_counts: Dict[str, int],
                 context_counts: Dict[str, int], context_size: int = 3,
                 chunk_size: int = 100000) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, int]]]:
     '''Parse a single mpileup file to identify mutations.
@@ -432,11 +429,11 @@ def parse_mpile(mpile: str, seqobject: SeqContext, ems_only: bool, base_counts: 
     
     # Initialize intergenic counts BEFORE processing chunks
     intergenic_counts = {
-        'mutation_types': {'C>T': 0, 'G>A': 0},
-        'unique_sites': 0,
-        'gc_sites': 0,
-        'total_sites': 0,
-        'coverage_depths': [],
+        'mutation_types': {'C>T': 0, 'G>A': 0},  # Only track EMS mutation counts
+        'unique_sites': 0,  # Count of unique positions mutated
+        'gc_sites': 0,  # Total G/C sites
+        'total_sites': 0,  # Total sites processed
+        'coverage_depths': [],  # For calculating average coverage
         'count_bins': {str(i): 0 for i in range(1, 16)}  # Bins for mutation counts 1-15, with 15+ in bin '15'
     }
     

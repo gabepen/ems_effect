@@ -26,6 +26,10 @@ def parse_args() -> argparse.Namespace:
                         help='Number of randomized datasets to generate per sample')
     parser.add_argument('-p', '--pattern', default='*.json',
                         help='Pattern to match mutation files (default: *.json)')
+    parser.add_argument('--c-only', action='store_true',
+                        help='Only analyze C>T mutations')
+    parser.add_argument('--g-only', action='store_true',
+                        help='Only analyze G>A mutations')
     return parser.parse_args()
 
 def load_config(config_path: str) -> Dict:
@@ -58,11 +62,17 @@ def lookup_aa(codon: str, codon_table: Dict) -> str:
 def collect_valid_positions(
     seqobject: SeqContext,
     features: Dict,
-    codon_table: Dict
+    codon_table: Dict,
+    c_only: bool = False,
+    g_only: bool = False
 ) -> Dict:
     """Collect valid positions for EMS mutations."""
     
-    valid_positions = {'C': [], 'G': []}
+    # Initialize dictionaries based on mode
+    bases_to_track = ['C'] if c_only else ['G'] if g_only else ['C', 'G']
+    valid_positions = {base: [] for base in bases_to_track}
+    codon_pos_counts = {base: {0: 0, 1: 0, 2: 0} for base in bases_to_track}
+    syn_by_pos = {base: {0: 0, 1: 0, 2: 0} for base in bases_to_track}
     
     print("\nCollecting valid positions:")
     
@@ -81,73 +91,76 @@ def collect_valid_positions(
                 break
         
         if start == -1:
-            print(f"No start codon found in gene {gene_id}")
             continue
        
-        codon_count = 0
-        position_count = 0
-        
         # Process each codon
         for codon_pos in range(start, len(seq)-2, 3):
             codon = seq[codon_pos:codon_pos+3]
             if len(codon) != 3:
                 continue
                 
-            codon_count += 1
-            
             # Check each position in codon
             for base_pos in range(3):
                 abs_pos = codon_pos + base_pos
                 ref_base = codon[base_pos]
                 
-                if ref_base not in ['C', 'G']:
+                # Skip if not tracking this base type
+                if ref_base not in bases_to_track:
                     continue
                     
                 genome_pos = feature.start + abs_pos
                 if not seqobject.overlap_mask[genome_pos]:
                     continue
                 
-                position_count += 1
+                # Count position in codon
+                codon_pos_counts[ref_base][base_pos] += 1
                 
-                # Classify site as synonymous or non-synonymous
+                # Classify site
                 mutated = list(codon)
-                mutated[base_pos] = 'T' if ref_base == 'C' else 'A'  # Always C>T or G>A
+                mutated[base_pos] = 'T' if ref_base == 'C' else 'A'
                 mutated = ''.join(mutated)
                 
                 ref_aa = lookup_aa(codon, codon_table)
                 mut_aa = lookup_aa(mutated, codon_table)
                 is_synonymous = (ref_aa == mut_aa)
                 
-                # Store position with classification
+                if is_synonymous:
+                    syn_by_pos[ref_base][base_pos] += 1
+                
                 valid_positions[ref_base].append((gene_id, abs_pos, genome_pos, is_synonymous))
     
     # Count sites by type
-    syn_sites = {'C': sum(1 for p in valid_positions['C'] if p[3]), 
-                 'G': sum(1 for p in valid_positions['G'] if p[3])}
-    non_syn_sites = {'C': sum(1 for p in valid_positions['C'] if not p[3]), 
-                     'G': sum(1 for p in valid_positions['G'] if not p[3])}
+    syn_sites = sum(sum(1 for p in valid_positions[base] if p[3]) for base in bases_to_track)
+    non_syn_sites = sum(sum(1 for p in valid_positions[base] if not p[3]) for base in bases_to_track)
     
-    total_syn = sum(syn_sites.values())
-    total_non_syn = sum(non_syn_sites.values())
+    # Verify initial site distribution
+    print("\nVerifying initial site distribution:")
+    for base in bases_to_track:
+        total_sites = len(valid_positions[base])
+        syn_count = sum(1 for p in valid_positions[base] if p[3])
+        non_syn_count = sum(1 for p in valid_positions[base] if not p[3])
+        print(f"{base}: {total_sites} total sites ({syn_count} synonymous, {non_syn_count} non-synonymous)")
     
-    return valid_positions, total_syn, total_non_syn
+    return valid_positions, syn_sites, non_syn_sites
 
 def randomize_mutations_preserve_type(
     mut_dict: Dict, 
     seqobject: SeqContext,
     features: Dict,
     codon_table: Dict,
-    valid_positions: Dict
+    valid_positions: Dict,
+    c_only: bool = False,
+    g_only: bool = False
 ) -> Dict:
     """Generate one randomized mutation dataset preserving mutation types."""
     
     # Make deep copy of valid positions since we'll be modifying it
     valid_positions = {
-        'C': valid_positions['C'][:],
-        'G': valid_positions['G'][:]
+        base: valid_positions[base][:] for base in valid_positions.keys()
     }
-    # nt total mutations by type
-    mutations_by_type = {'C>T': 0, 'G>A': 0}
+    
+    # Count total mutations by type
+    mutations_by_type = {'C>T': 0} if c_only else {'G>A': 0} if g_only else {'C>T': 0, 'G>A': 0}
     for gene in mut_dict:
         for mut, count in mut_dict[gene]['mutations'].items():
             mut_type = mut.split('_')[1]
@@ -157,15 +170,15 @@ def randomize_mutations_preserve_type(
     # Generate randomized dataset
     new_mut_dict = {}
     
-    # Track mutations placed
-    placed_syn = {'C>T': 0, 'G>A': 0}
-    placed_non_syn = {'C>T': 0, 'G>A': 0}
-    
     # Place mutations by type, removing used positions
     for mut_type, count in mutations_by_type.items():
         ref = 'C' if mut_type == 'C>T' else 'G'
         
         for _ in range(count):
+            if len(valid_positions[ref]) == 0:
+                logger.warning(f"Ran out of valid positions for {ref}")
+                break
+                
             idx = random.randrange(len(valid_positions[ref]))
             gene_id, gene_pos, _, is_synonymous = valid_positions[ref].pop(idx)
             
@@ -179,14 +192,7 @@ def randomize_mutations_preserve_type(
             mut_key = f"{gene_pos + 1}_{mut_type}"
             new_mut_dict[gene_id]['mutations'][mut_key] = \
                 new_mut_dict[gene_id]['mutations'].get(mut_key, 0) + 1
-                
-            # Track mutation type
-            if is_synonymous:
-                placed_syn[mut_type] += 1
-            else:
-                placed_non_syn[mut_type] += 1
-    print(f"Placed syn: {placed_syn}")
-    print(f"Placed non-syn: {placed_non_syn}")
+    
     return new_mut_dict
 
 def calculate_dnds_confidence_interval(
@@ -271,9 +277,17 @@ def analyze_mutations(
     syn_sites: int,
     non_syn_sites: int,
     filter_value: str,
-    mutkey_is_reverse: bool = False
+    mutkey_is_reverse: bool = False,
+    c_only: bool = False,
+    g_only: bool = False
 ) -> Dict:
     """Analyze original mutations to calculate dN/dS."""
+    # Add strand-specific tracking
+    strand_stats = {
+        '+': {'syn': 0, 'non_syn': 0},
+        '-': {'syn': 0, 'non_syn': 0}
+    }
+    
     # Count synonymous and non-synonymous mutations
     syn_muts = 0  # Total synonymous mutation occurrences
     non_syn_muts = 0  # Total non-synonymous mutation occurrences
@@ -290,12 +304,11 @@ def analyze_mutations(
         if gene_id not in features:
             continue
         
-
+        strand = '+' if features[gene_id].strand == 1 else '-'
+        
         seq = str(wolgenome.genome[features[gene_id].start:features[gene_id].end])
         if features[gene_id].strand == -1:
             seq = str(Seq(seq).reverse_complement())
-        
-
         
         # Find start codon
         start = -1
@@ -318,9 +331,14 @@ def analyze_mutations(
             pos_str, mut_type = mut_key.split('_')
             pos = int(pos_str) - 1
         
+            # Skip mutations based on mode
+            if c_only and mut_type != 'C>T':
+                continue
+            if g_only and mut_type != 'G>A':
+                continue
+            
             # Track mutation types
             mutation_types[mut_type] = mutation_types.get(mut_type, 0) + 1
-            
             
             if features[gene_id].strand == -1 and not mutkey_is_reverse:
                 pos = len(seq) - pos - 1
@@ -329,7 +347,6 @@ def analyze_mutations(
                 elif mut_type == 'G>A':
                     mut_type = 'C>T'
             
-                   
             # Filter for only EMS mutations (C>T and G>A)
             if mut_type not in ['C>T', 'G>A']:
                 continue
@@ -347,6 +364,11 @@ def analyze_mutations(
             
             if codon_pos + 2 >= len(seq):
                 print(f"AFTER END OF GENE")
+                print(f"Gene: {gene_id}")
+                print(f"Position: {pos}")
+                print(f"Codon position: {codon_pos}")
+                print(f"Base position: {base_pos}")
+                print(f"Sequence: {seq}")
                 continue
                 
             codon = seq[codon_pos:codon_pos+3]
@@ -355,20 +377,16 @@ def analyze_mutations(
             mutated = list(codon)
             ref_base = codon[base_pos]
             
-            
             # Extract alt_base from mutation type
             alt_base = mut_type.split('>')[1]
                 
-          
             mutated[base_pos] = alt_base
             mutated = ''.join(mutated)
             
-         
             # Check if synonymous
             ref_aa = lookup_aa(codon, codon_table)
             mut_aa = lookup_aa(mutated, codon_table)
             is_synonymous = (ref_aa == mut_aa)
-            
             
             # Create a unique site key
             site_key = f"{gene_id}_{pos}"
@@ -377,26 +395,28 @@ def analyze_mutations(
             if is_synonymous:
                 syn_muts += count
                 syn_sites_mutated.add(site_key)
+                strand_stats[strand]['syn'] += count
             else:
                 non_syn_muts += count
                 non_syn_sites_mutated.add(site_key)
-    
-    # Print mutation type statistics for debugging
-    print(f"Mutation types found: {mutation_types}")
-    print(f"Total EMS mutations (C>T, G>A): {total_muts}")
+                strand_stats[strand]['non_syn'] += count
     
     # Calculate dN/dS using unique sites
     unique_syn = len(syn_sites_mutated)
     unique_non_syn = len(non_syn_sites_mutated)
     
     # Calculate dN/dS using unique sites
-    dn = unique_non_syn / non_syn_sites if non_syn_sites > 0 else 0
-    ds = unique_syn / syn_sites if syn_sites > 0 else 0
-    dnds = dn / ds if ds > 0 else 0
+    dn = unique_non_syn / non_syn_sites if non_syn_sites > 0 else None
+    ds = unique_syn / syn_sites if syn_sites > 0 else None
+    dnds = dn / ds if ds > 0 else None
     
-    # Calculate confidence intervals for dN/dS
+    # Calculate confidence intervals using unique sites
     dnds, lower_ci, upper_ci = calculate_dnds_confidence_interval(
-        syn_muts, non_syn_muts, syn_sites, non_syn_sites, confidence=0.95
+        len(syn_sites_mutated),      # Using unique sites
+        len(non_syn_sites_mutated),  # Using unique sites
+        syn_sites,
+        non_syn_sites,
+        confidence=0.95
     )
     
     return {
@@ -525,7 +545,9 @@ def process_sample(
     non_syn_sites: int,
     iterations: int,
     filter_value: str,
-    valid_positions: Dict
+    valid_positions: Dict,
+    c_only: bool = False,
+    g_only: bool = False
 ) -> Dict:
     """Process a single sample and return its statistics."""
     # Create sample output directory
@@ -544,7 +566,10 @@ def process_sample(
         codon_table,
         syn_sites,
         non_syn_sites,
-        filter_value
+        filter_value,
+        False,
+        c_only,
+        g_only
     )
     
     # Generate and analyze randomized datasets
@@ -557,9 +582,12 @@ def process_sample(
             wolgenome,
             features,
             codon_table,
-            valid_positions
+            valid_positions,
+            c_only,
+            g_only
         )
        
+        # Analyze random mutations
         random_stats = analyze_mutations(
             random_muts,
             wolgenome,
@@ -568,9 +596,11 @@ def process_sample(
             syn_sites,
             non_syn_sites,
             0,
-            True
+            True,
+            c_only,
+            g_only
         )
-    
+        
         all_genome_stats.append(random_stats)
     
     # Calculate random mean and confidence interval
@@ -589,7 +619,7 @@ def process_sample(
     )
     
     # Calculate ratio and significance
-    ratio = original_stats['dnds_raw'] / random_mean if random_mean > 0 else 0.0
+    ratio = original_stats['dnds_raw'] / random_mean if random_mean > 0 else None
     is_significant = original_stats['dnds_raw'] < random_lower_ci or original_stats['dnds_raw'] > random_upper_ci
     
     # Prepare results dictionary
@@ -621,45 +651,39 @@ def process_sample(
         
     return results
 
-def write_summary_csv(results: List[Dict], output_file: str):
-    """Write summary CSV file with dN/dS results for all samples."""
-    with open(output_file, 'w', newline='') as f:
+def write_summary_csv(results, output_path):
+    """Write summary of dN/dS analysis to CSV file."""
+    with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        # Write header
         writer.writerow([
             'Sample', 
-            'Total_Mutations', 
-            'Syn_Mutations', 
-            'NonSyn_Mutations',
-            'Original_dNdS',
-            'Original_dNdS_Lower_CI',
-            'Original_dNdS_Upper_CI',
-            'Random_dNdS',
-            'Random_dNdS_Lower_CI',
-            'Random_dNdS_Upper_CI',
-            'Ratio',
-            'Significant'
+            'Original_dNdS', 
+            'Original_dNdS_Lower', 
+            'Original_dNdS_Upper',
+            'Random_dNdS', 
+            'Random_dNdS_Lower', 
+            'Random_dNdS_Upper',
+            'Ratio', 
+            'Significant',
+            'Syn_Mutations',  # Changed from total to unique synonymous sites
+            'NonSyn_Mutations',  # Changed from total to unique non-synonymous sites
+            'Total_Mutations'  # Changed to sum of unique sites
         ])
         
-        # Write data for each sample
         for result in results:
-            sample = result['sample']
-            original = result['original']
-            random_data = result['random']
-            
             writer.writerow([
-                sample,
-                original['total_muts'],
-                original['syn_muts'],
-                original['non_syn_muts'],
-                original['dnds_raw'],
-                original['dnds_lower_ci'],
-                original['dnds_upper_ci'],
-                random_data['mean'],
-                random_data['lower_ci'],
-                random_data['upper_ci'],
+                result['sample'],
+                result['original']['dnds_raw'],
+                result['original']['dnds_lower_ci'],
+                result['original']['dnds_upper_ci'],
+                result['random']['mean'],
+                result['random']['lower_ci'],
+                result['random']['upper_ci'],
                 result['ratio'],
-                result['significant']
+                result['significant'],
+                result['original']['unique_syn_sites'],  # Changed from syn_muts to unique_syn_sites
+                result['original']['unique_non_syn_sites'],  # Changed from non_syn_muts to unique_non_syn_sites
+                result['original']['unique_syn_sites'] + result['original']['unique_non_syn_sites']  # Sum of unique sites
             ])
 
 def main():
@@ -680,7 +704,13 @@ def main():
     
     # Count potential sites once
     print("Counting potential mutation sites...")
-    valid_positions, syn_sites, non_syn_sites = collect_valid_positions(wolgenome, features, codon_table)
+    valid_positions, syn_sites, non_syn_sites = collect_valid_positions(
+        wolgenome, 
+        features, 
+        codon_table,
+        args.c_only,
+        args.g_only
+    )
     print(f"Potential sites: Synonymous={syn_sites}, Non-synonymous={non_syn_sites}")
     
     # Find all mutation files
@@ -697,7 +727,7 @@ def main():
     output_dir = Path(paths['results'])
     
     # Process all samples
-    for filter_value in [0,1,2,3,4,5]:
+    for filter_value in [0,2,3,5,7,10]:
         all_results = []
         for mut_file in tqdm(mutation_files, desc="Processing samples"):
             sample_name = mut_file.stem  # Extract sample name from filename
@@ -713,7 +743,9 @@ def main():
                     non_syn_sites,
                     args.iterations,
                     filter_value,
-                    valid_positions
+                    valid_positions,
+                    args.c_only,
+                    args.g_only
                 )
                 all_results.append(result)
             except Exception as e:
@@ -722,13 +754,13 @@ def main():
                 print(f"Traceback:\n{traceback.format_exc()}")
         
         # Write summary CSV
-        csv_path = output_dir / f'dnds_summary_{filter_value}.csv'
+        csv_path = output_dir / f'dnds_summary_{filter_value}_debug.csv'
         write_summary_csv(all_results, str(csv_path))
         
         print(f"\nSummary table written to {csv_path}")
         
         # Also save as JSON for further processing
-        with open(f"{paths['results']}/dnds_summary_{filter_value}.json", 'w') as f:
+        with open(f"{paths['results']}/dnds_summary_{filter_value}_debug.json", 'w') as f:
             json.dump(all_results, f, indent=2, cls=NumpyEncoder)
         
         # Generate plots

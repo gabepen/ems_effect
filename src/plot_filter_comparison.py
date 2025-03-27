@@ -30,8 +30,8 @@ def load_filter_data(input_dir, ems_only=False):
     # Extract filter values and load data
     all_data = []
     for csv_file in csv_files:
-        # Extract filter value from filename
-        match = re.search(r'dnds_summary_(\d+)\.csv', csv_file)
+        # Extract filter value from filename using simpler regex
+        match = re.search(r'summary_(\d+)', csv_file)  # Changed from r'dnds_summary_(\d+)\.csv'
         if match:
             filter_value = int(match.group(1))
             
@@ -658,6 +658,9 @@ def plot_multipanel_rate_comparison(df, output_dir, filter_values=[1, 3, 5]):
     nt_ds_added = False
     intergenic_added = False
     
+    # Initialize global_max before the loop
+    global_max = float('-inf')  # Initialize to negative infinity
+    
     # Process each filter value
     for i, filter_value in enumerate(filter_values):
         ax = axes[i]
@@ -734,11 +737,8 @@ def plot_multipanel_rate_comparison(df, output_dir, filter_values=[1, 3, 5]):
         data_values = data_values[~np.isnan(data_values)]  # Remove NaN values
         
         if len(data_values) > 0:
-            # Store max value for later use in setting global y-axis limits
-            if i == 0:
-                global_max = np.max(data_values)
-            else:
-                global_max = max(global_max, np.max(data_values))
+            # Update global_max with the maximum value from this panel
+            global_max = max(global_max, np.max(data_values))
     
     # Set common y-axis limit
     for ax in axes:
