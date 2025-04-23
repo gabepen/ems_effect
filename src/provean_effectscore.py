@@ -1,7 +1,7 @@
 import sys
 import os
 import argparse
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Set, Optional
 from argparse import Namespace
 from pathlib import Path
 import yaml
@@ -10,6 +10,10 @@ import getopt
 import json
 import random
 import subprocess
+import numpy as np
+from scipy import stats
+from tqdm import tqdm
+from Bio.Seq import Seq
 
 # Add src to path 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -20,7 +24,6 @@ from modules import translate
 from modules.provean_db import ProveanScoreDB
 from mimetypes import guess_type 
 from glob import glob
-from tqdm import tqdm
 
 def parse_args() -> Namespace:
     '''Parse command line arguments.
@@ -92,7 +95,7 @@ def setup_logging(outdir: str) -> None:
     # Remove any existing handlers
     logger.remove()
     
-    # Add console handler with INFO level
+    # Add console handler with DEBUG level
     logger.add(sys.stderr, level="INFO")
     
     # Add file handler with DEBUG level
@@ -112,7 +115,7 @@ def process_mpileups(pile: str, mutpath: str, outdir: str, wolgenome: Any, ems_o
         wolgenome (SeqContext): Genome context object containing sequence and annotation info
         ems_only (bool): Flag to process only EMS mutations
     '''
-    piles = glob(pile + '/*.txt')
+    piles = glob(pile + '/*_filtered.txt')
     base_counts = {}
     context_counts = {}
     all_intergenic = {}  # Store intergenic counts for all samples
@@ -157,20 +160,7 @@ def process_mutations(
     features: Dict[str, Any],
     paths: Dict[str, str]
 ) -> None:
-    '''Convert nucleotide mutations to amino acid format and HGVS format.
-    
-    Args:
-        nuc_mut_files (List[str]): List of paths to nucleotide mutation JSON files
-        wolgenome (SeqContext): Genome context object containing sequence and annotation info
-        codon_table (str): Path to codon table JSON file
-        features (Dict[str, Any]): Dictionary mapping gene IDs to genome feature locations
-        paths (Dict[str, str]): Dictionary containing paths for output files
-            - 'aapath': Path for amino acid mutation files
-            - 'provpath': Path for PROVEAN input files
-            
-    Returns:
-        None: Results are written to JSON files in the specified output paths
-    '''
+    '''Calculate genome-wide mutation statistics.'''
     # Dictionary to collect genome-wide stats for all samples
     all_genome_stats = {}
     
@@ -179,105 +169,320 @@ def process_mutations(
         with open(js) as jf:
             mut_dict = json.load(jf)
 
-            # Convert mutations to aa format and save to json
-            aa_muts, genome_stats = translate.convert_mutations(
+            # Only calculate genome stats
+            _, genome_stats = translate.convert_mutations(
                 mut_dict,
                 wolgenome,
                 codon_table,
                 features
             )
-            with open(f"{paths['aapath']}/{sample}.json", 'w') as of:
-                json.dump(aa_muts, of)
             
             # Store genome stats for this sample
             all_genome_stats[sample] = genome_stats
 
-            # Convert mutations to hgvs format and save to json 
-            hgvs_dict = translate.prep_provean(aa_muts, wolgenome, sample, paths['provpath'], features)
-            with open(f"{paths['provpath']}/{sample}.json", 'w') as of:
-                json.dump(hgvs_dict, of)
-    
-    # Save all genome-wide dN/dS stats in a single file
+    # Save genome-wide dN/dS stats
     with open(f"{paths['results']}/genome_dnds.json", 'w') as of:
         json.dump(all_genome_stats, of, indent=2)
 
-def calculate_provean_scores(
-    provean_jsons: List[str],
-    score_db: ProveanScoreDB,
-    paths: Dict[str, str],
-    provean_config: Dict[str, Any]
-) -> Dict[str, Dict[str, Any]]:
-    '''Calculate PROVEAN scores for mutations and normalize results.
+def load_filtered_positions(sample: str, paths: Dict[str, str], mpileup_dir: str) -> Dict[str, List[int]]:
+    """Load filtered positions for a sample from JSON file.
     
     Args:
-        provean_jsons (List[str]): List of paths to PROVEAN input JSON files
-        score_db (ProveanScoreDB): Initialized PROVEAN score database
+        sample (str): Sample name
         paths (Dict[str, str]): Dictionary containing output paths
-            - provpath: Path for PROVEAN input files
-        provean_config (Dict[str, Any]): Configuration dictionary containing provean settings
-    '''
-    results = {}
+        mpileup_dir (str): Directory containing mpileup files and filtered positions
+        
+    Returns:
+        Dict[str, List[int]]: Dictionary mapping gene IDs to filtered positions
+    """
+    filtered_file = os.path.join(mpileup_dir, f"{sample}_positions.json")
+    if os.path.exists(filtered_file):
+        with open(filtered_file) as f:
+            return json.load(f)
+    return {}
+
+def nuc_to_provean_score(
+    nuc_mutations: Dict[str, Any],
+    gene_id: str,
+    score_db: ProveanScoreDB,
+    provean_config: Dict[str, Any],
+    paths: Dict[str, str],
+    features: Dict[str, Any],
+    wolgenome: SeqContext,
+    codon_table: str,
+    aa_mutations_dict: Optional[Dict] = None
+) -> float:
+    """Convert nucleotide mutations to amino acid mutations and calculate PROVEAN score."""
     
-    # Process each sample
-    for js in provean_jsons:
+    for mut in nuc_mutations['mutations'].keys():
+        pos, change = mut.split('_')
+
+    # Convert nucleotide mutations to amino acid mutations
+    aa_muts, _ = translate.convert_mutations(
+        {gene_id: nuc_mutations},
+        wolgenome,
+        codon_table,
+        features
+    )
+    
+    for mut in aa_muts[gene_id]['mutations'].keys():
+        pos, change = mut.split('_')
+        logger.debug(f"  Codon {pos}: {change}")
+        
+    # Convert to HGVS format
+    hgvs_dict = translate.prep_provean(
+        aa_muts,
+        wolgenome,
+        gene_id,
+        paths['provpath'],
+        features
+    )
+    
+    # Store in aa_mutations_dict if provided
+    if aa_mutations_dict is not None:
+        aa_mutations_dict[gene_id] = hgvs_dict[gene_id]
+    
+    # Calculate PROVEAN scores
+    total_score = 0
+    new_mutations = []
+    
+    for hgvs_mut in hgvs_dict[gene_id]['mutations']:
+        score = score_db.get_score(gene_id, hgvs_mut)
+        if score is not None:
+            total_score += score
+        else:
+            new_mutations.append(hgvs_mut)
+    
+    # Calculate new scores if needed
+    if new_mutations:
+        logger.info(f"Calculating {len(new_mutations)} new scores for {gene_id}")
+        logger.debug("New mutations to score:")
+        for mut in new_mutations[:5]:  # Show first 5
+            logger.debug(f"  {mut}")
+        if len(new_mutations) > 5:
+            logger.debug("  ...")
+            
+        # Write new variants to file
+        var_file = os.path.join(paths['provpath'], f"{gene_id}.new.var")
+        with open(var_file, 'w') as f:
+            for mutation in new_mutations:
+                f.write(f"{mutation}\n")
+                
+        # Get script path for running PROVEAN
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        subp_provean_path = os.path.join(script_dir, "subp_provean.sh")
+        
+        try:
+            # Run PROVEAN
+            cmd = [
+                subp_provean_path,
+                gene_id,
+                paths['provpath'],
+                str(provean_config['num_threads']),
+                provean_config['data_dir'],
+                provean_config['executable']
+            ]
+            subprocess.run(cmd, check=True)
+            
+            # Read and process new scores
+            csv_file = os.path.join(paths['provpath'], f"{gene_id}.csv")
+            new_scores = {}
+            if os.path.exists(csv_file):
+                with open(csv_file, 'r') as scores:
+                    for line in scores:
+                        if line.strip() and ',' in line:
+                            mutation, score = line.strip().split(',')
+                            if score.strip():
+                                score = float(score)
+                                score_db.add_score(gene_id, mutation, score)
+                                new_scores[mutation] = score
+                                total_score += score
+                
+                logger.info(f"Added {len(new_scores)} new scores to database")
+                logger.debug("New scores:")
+                for mut, score in list(new_scores.items())[:5]:  # Show first 5
+                    logger.debug(f"  {mut}: {score}")
+                if len(new_scores) > 5:
+                    logger.debug("  ...")
+                                
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error running PROVEAN for gene {gene_id}: {e}")
+            return 0
+        finally:
+            # Cleanup temporary files
+            if os.path.exists(var_file):
+                os.remove(var_file)
+            if os.path.exists(csv_file):
+                os.remove(csv_file)
+            
+    return total_score
+
+def permute_mutations(
+    nuc_mutations: Dict[str, Any],
+    gene_id: str, 
+    filtered_positions: List[int],
+    score_db: ProveanScoreDB,
+    provean_config: Dict[str, Any],
+    paths: Dict[str, str],
+    features: Dict[str, Any],
+    wolgenome: SeqContext,
+    codon_table: str,
+    n_permutations: int = 1000,
+    pbar: Optional[tqdm] = None
+) -> List[float]:
+    """Randomly place nucleotide mutations and calculate PROVEAN scores."""
+    
+    gene_length = nuc_mutations['gene_len']
+    nuc_muts = list(nuc_mutations['mutations'].keys())
+    n_mutations = len(nuc_muts)
+    
+    # Get gene sequence
+    gene_seq = str(wolgenome.genome[features[gene_id].start:features[gene_id].end])
+    if features[gene_id].strand == -1:
+        gene_seq = str(Seq(gene_seq).reverse_complement())
+    
+    # Store original valid positions for each base type
+    original_valid_positions = {'C': [], 'G': []}
+    for pos in range(gene_length):
+        if pos not in filtered_positions:  # Skip filtered positions
+            base = gene_seq[pos]
+            if base in original_valid_positions:
+                original_valid_positions[base].append(pos)
+    
+    permuted_scores = []
+    for _ in range(n_permutations):
+        # Reset valid positions from original for each permutation
+        valid_positions = {
+            'C': original_valid_positions['C'][:],  # Make copy
+            'G': original_valid_positions['G'][:]
+        }
+        
+        permuted_muts = {
+            'mutations': {},
+            'gene_len': nuc_mutations['gene_len'],
+            'avg_cov': nuc_mutations['avg_cov']
+        }
+        
+        # Place each mutation at a valid position for its type
+        for orig_mut in nuc_muts:
+            ref_base = orig_mut.split('_')[1].split('>')[0]
+            if valid_positions[ref_base]:  # If we have valid positions for this base
+                pos_idx = random.randrange(len(valid_positions[ref_base]))
+                new_pos = valid_positions[ref_base].pop(pos_idx)
+                mut_type = orig_mut.split('_')[1]
+                permuted_muts['mutations'][f"{new_pos + 1}_{mut_type}"] = 1
+        
+        if permuted_muts['mutations']:
+            score = nuc_to_provean_score(
+                permuted_muts,
+                gene_id,
+                score_db,
+                provean_config,
+                paths,
+                features,
+                wolgenome,
+                codon_table,
+                None
+            )
+            permuted_scores.append(score)
+        
+        if pbar is not None:
+            pbar.update(1)
+    
+    return permuted_scores
+
+def calculate_provean_scores(
+    mutation_jsons: List[str],
+    score_db: ProveanScoreDB,
+    paths: Dict[str, str],
+    provean_config: Dict[str, Any],
+    features: Dict[str, Any],
+    wolgenome: SeqContext,
+    codon_table: str,
+    mpileup_dir: str
+) -> Dict[str, Dict[str, Any]]:
+    '''Calculate PROVEAN scores and perform permutation tests.'''
+    results = {}
+    permutation_results = {}
+    
+    # Process each sample with progress bar
+    for js in tqdm(mutation_jsons, desc="Processing samples"):
         sample = js.split('/')[-1].split('.')[0]
         logger.info(f"Processing sample: {sample}")
         results[sample] = {}
+        permutation_results[sample] = {}
         
-        with open(js) as jf:
-            hgvsmut_dict = json.load(jf)
+        # Dictionary to store amino acid mutations for this sample
+        aa_mutations = {}
         
-        # Process each gene
-        for gene in hgvsmut_dict:
+        # Load filtered positions from correct directory
+        filtered_positions = load_filtered_positions(sample, paths, mpileup_dir)
+        logger.info(f"Loaded {len(filtered_positions)} filtered positions for {sample}")
+        
+        # Load original nucleotide mutations
+        nuc_mut_file = os.path.join(paths['mutpath'], f"{sample}.json")
+        with open(nuc_mut_file) as f:
+            nuc_mutations = json.load(f)
+        
+        # Process each gene with progress bar
+        for gene in tqdm(nuc_mutations, desc=f"Processing genes for {sample}", leave=False):
+            # Initialize results
             results[sample][gene] = {
                 'effect': 0,
-                'gene_len': hgvsmut_dict[gene]['gene_len'],
-                'avg_cov': hgvsmut_dict[gene]['avg_cov']
+                'gene_len': nuc_mutations[gene]['gene_len'],
+                'avg_cov': nuc_mutations[gene]['avg_cov'],
+                'filtered_positions': len(filtered_positions.get(gene, []))
             }
             
-            # Get existing scores for this gene
-            gene_scores = score_db.get_gene_scores(gene)
-            new_variants = []
+            # Calculate PROVEAN score for original mutations
+            original_score = nuc_to_provean_score(
+                nuc_mutations[gene],
+                gene,
+                score_db,
+                provean_config,
+                paths,
+                features,
+                wolgenome,
+                codon_table,
+                aa_mutations  # Store amino acid mutations for this gene
+            )
+            results[sample][gene]['effect'] = original_score
             
-            # Check each mutation
-            with open(f"{paths['provpath']}/{sample}_vars/{gene}.var", 'r') as var_file:
-                for hgvs_mut in var_file:
-                    hgvs_mut = hgvs_mut.strip()
-                    if hgvs_mut in gene_scores:
-                        # Use existing score
-                        score = gene_scores[hgvs_mut]
-                        results[sample][gene]['effect'] += score * hgvsmut_dict[gene]['mutations'][hgvs_mut]
-                    else:
-                        new_variants.append(hgvs_mut)
-            
-            # Calculate new scores if needed
-            if new_variants:
-                logger.info(f'Running PROVEAN for {len(new_variants)} new variants in gene {gene}')
-                with open(f"{paths['provpath']}/{sample}_vars/{gene}.new.var", 'w') as f:
-                    for variant in new_variants:
-                        f.write(f"{variant}\n")
-                
-                # Run PROVEAN
-                subprocess.run([
-                    "subp_provean.sh",
+            # Perform permutation test using original nucleotide mutations
+            permuted_scores = []
+            with tqdm(total=1000, desc=f"Permutations for {gene}", leave=False) as pbar:
+                permuted_scores = permute_mutations(
+                    nuc_mutations[gene],  # Pass original nucleotide mutations
                     gene,
-                    f"{paths['provpath']}/{sample}_vars",
-                    str(provean_config['num_threads']),
-                    provean_config['data_dir'],
-                    provean_config['executable']
-                ], check=True)
-                
-                # Process and store new scores
-                with open(f"{paths['provpath']}/{sample}_vars/{gene}.csv", 'r') as scores:
-                    for line in scores:
-                        hgvs_mut, score = line.strip().split(',')
-                        score = float(score)
-                        results[sample][gene]['effect'] += score * hgvsmut_dict[gene]['mutations'][hgvs_mut]
-                        score_db.add_score(gene, hgvs_mut, score)
+                    filtered_positions.get(gene, []),
+                    score_db,
+                    provean_config,
+                    paths,
+                    features,
+                    wolgenome,
+                    codon_table,
+                    n_permutations=1000,
+                    pbar=pbar
+                )
             
-        # Normalize scores
-        normalize_scores(sample, results)
+            # Store permutation results
+            if permuted_scores:
+                permutation_results[sample][gene] = {
+                    'scores': permuted_scores,
+                    'mean': np.mean(permuted_scores),
+                    'std': np.std(permuted_scores),
+                    'percentile': stats.percentileofscore(permuted_scores, original_score)
+                }
+        
+        # Save amino acid mutations for this sample
+        with open(f"{paths['provpath']}/{sample}_aa_mutations.json", 'w') as f:
+            json.dump(aa_mutations, f, indent=2)
     
+    # Save permutation results
+    permutation_file = os.path.join(paths['results'], 'permutation_results.json')
+    with open(permutation_file, 'w') as f:
+        json.dump(permutation_results, f, indent=2)
+        
     return results
 
 def normalize_scores(sample: str, results: Dict[str, Dict[str, Any]]) -> None:
@@ -366,12 +571,21 @@ def main() -> None:
         process_mpileups(args.mpileups, paths['mutpath'], args.output.rstrip('/'), wolgenome, args.exclude)
     
     # Process mutations
-    nuc_mut_files = glob(paths['mutpath'] + '/*.json')
-    process_mutations(nuc_mut_files, wolgenome, refs['codon_table'], features, paths)
+    #nuc_mut_files = glob(paths['mutpath'] + '/*.json')
+    #process_mutations(nuc_mut_files, wolgenome, refs['codon_table'], features, paths)
     
-    # Calculate PROVEAN scores
-    provean_jsons = glob(paths['provpath'] + '/*.json')
-    results = calculate_provean_scores(provean_jsons, score_db, paths, provean_config)
+    # Calculate PROVEAN scores with permutation testing
+    mutation_jsons = glob(paths['mutpath'] + '/*.json')
+    results = calculate_provean_scores(
+        mutation_jsons,
+        score_db,
+        paths,
+        provean_config,
+        features,
+        wolgenome,
+        refs['codon_table'],
+        args.mpileups
+    )
     
     # Save final results
     with open(f"{args.output.rstrip('/')}/results/normalized_scores.json", 'w') as of:
