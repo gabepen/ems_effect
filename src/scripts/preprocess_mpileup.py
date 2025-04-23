@@ -1,6 +1,11 @@
 import numpy as np
 from collections import defaultdict
 from scipy import stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import os
+import glob
 
 def analyze_read_position_bias(reads, alt):
     """
@@ -153,10 +158,10 @@ def get_depth_threshold(mpileup_file: str, percentile: float = 5.0) -> int:
 def count_bases(reads, ref):
     """
     Count occurrences of different bases in reads string
-    Returns tuple of (counts_dict, most_common_alt, alt_count) where:
-    - counts_dict has counts of A,C,G,T,N and total valid bases
+    Returns tuple of (counts_dict, most_common_alt, total_alt_count) where:
+    - counts_dict has counts of A,C,G,T,N
     - most_common_alt is the most frequent non-reference base
-    - alt_count is the count of the most common alt base
+    - total_alt_count is the sum of all non-reference bases
     """
     counts = defaultdict(int)
     i = 0
@@ -184,13 +189,98 @@ def count_bases(reads, ref):
             counts[base] += 1
         i += 1
     
-    counts['total'] = sum(counts[b] for b in 'ACGT')
+    # Calculate total alternate base count
+    total_alt_count = sum(counts[b] for b in 'ACGT' if b != ref.upper())
     
     # Find most common alt allele
     alt_bases = {b: counts[b] for b in 'ACGT' if b != ref.upper()}
     most_common_alt = max(alt_bases.items(), key=lambda x: x[1]) if alt_bases else (None, 0)
     
-    return counts, most_common_alt[0], most_common_alt[1]
+    return counts, most_common_alt[0], total_alt_count
+
+def plot_n_vs_alt_distributions(sample_data, output_dir):
+    """
+    Create individual plots for each sample comparing N and alternate base distributions
+    
+    Args:
+        sample_data (dict): Dictionary with sample names as keys and lists of (depth, n_count, alt_count) as values
+        output_dir (str): Directory to save plots
+    """
+    # Create plots directory
+    plots_dir = os.path.join(output_dir, 'n_alt_plots')
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    for sample, measurements in sample_data.items():
+        # Convert sample data to DataFrame
+        plot_data = pd.DataFrame([{
+            'depth': depth,
+            'N_freq': n_count / depth if depth > 0 else 0,
+            'Alt_freq': alt_count / depth if depth > 0 else 0,
+            'N_to_Alt_ratio': n_count / alt_count if alt_count > 0 else 0
+        } for depth, n_count, alt_count in measurements])
+        
+        # Remove extreme outliers using IQR method
+        def remove_outliers(df, column):
+            Q1 = df[column].quantile(0.25)
+            Q3 = df[column].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            return df[(df[column] >= lower_bound) & (df[column] <= upper_bound)]
+        
+        # Create filtered datasets for each metric
+        freq_data = plot_data[['N_freq', 'Alt_freq']].copy()
+        freq_data = remove_outliers(freq_data, 'N_freq')
+        freq_data = remove_outliers(freq_data, 'Alt_freq')
+        
+        ratio_data = plot_data[['N_to_Alt_ratio']].copy()
+        ratio_data = remove_outliers(ratio_data, 'N_to_Alt_ratio')
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        fig.suptitle(f'N vs Alt Base Analysis - {sample}', fontsize=14)
+        
+        # Panel 1: Normalized frequency distributions
+        melted_data = pd.melt(freq_data, 
+                             value_vars=['N_freq', 'Alt_freq'],
+                             var_name='Base Type',
+                             value_name='Frequency')
+        
+        sns.boxplot(data=melted_data,
+                   x='Base Type',
+                   y='Frequency',
+                   ax=ax1,
+                   showfliers=False)  # Hide outlier points
+        
+        ax1.set_title('Distribution of N and Alt Base Frequencies\n(outliers removed)')
+        ax1.set_ylabel('Frequency (normalized by depth)')
+        
+        # Panel 2: N to Alt ratio distribution
+        sns.histplot(data=ratio_data,
+                    x='N_to_Alt_ratio',
+                    ax=ax2,
+                    bins=50,
+                    stat='density')  # Use density instead of count
+        ax2.set_title('N to Alt Base Ratio Distribution\n(outliers removed)')
+        ax2.set_xlabel('N/Alt Ratio')
+        
+        # Add summary statistics as text (using full dataset)
+        stats_text = (
+            f"Mean N freq: {plot_data['N_freq'].mean():.3f}\n"
+            f"Mean Alt freq: {plot_data['Alt_freq'].mean():.3f}\n"
+            f"Median N/Alt ratio: {plot_data['N_to_Alt_ratio'].median():.3f}\n"
+            f"Sites analyzed: {len(plot_data)}\n"
+            f"Sites after outlier removal: {len(freq_data)}"
+        )
+        fig.text(0.98, 0.02, stats_text,
+                fontsize=10,
+                horizontalalignment='right',
+                verticalalignment='bottom',
+                bbox=dict(facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, f'{sample}_n_alt_distribution.png'))
+        plt.close()
 
 def main(mpileup_dir, output_dir):
     """
@@ -200,11 +290,11 @@ def main(mpileup_dir, output_dir):
         mpileup_dir (str): Path to directory containing mpileup files
         output_dir (str): Path to output directory
     """
-    import os
-    import glob
-    
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Add dictionary to store N vs Alt data for all samples
+    sample_n_alt_data = {}
     
     # Process each mpileup file in directory
     for mpileup_file in glob.glob(os.path.join(mpileup_dir, "*.txt")):
@@ -227,10 +317,12 @@ def main(mpileup_dir, output_dir):
         ct_mutations = 0  # Counter for C>T mutations
         ga_mutations = 0  # Counter for G>A mutations
        
+        # Initialize list to store N vs Alt measurements for this sample
+        sample_n_alt_data[sample_name] = []
+       
         with open(mpileup_file) as f_in, \
              open(output_file, 'w') as f_out, \
              open(mutation_file, 'w') as f_mut:
-            
             
             # Process each line
             for line in f_in:
@@ -251,15 +343,9 @@ def main(mpileup_dir, output_dir):
                 reads = fields[4]
                 
                 # Count bases and get most common alt in one pass
-                base_counts, alt, alt_count = count_bases(reads, ref)
+                base_counts, alt, alt_base_count = count_bases(reads, ref)
                 
-                # Filter if more Ns than alternate bases
-                alt_base_count = sum(base_counts[b] for b in 'ACGT' if b != ref.upper())
-                if base_counts['N'] > alt_base_count:
-                    n_filtered += 1
-                    continue
-                
-                if not alt or alt_count == 0:  # No alternate allele found
+                if not alt or alt_base_count == 0:  # No alternate allele found
                     ref_only_count += 1
                     f_out.write(f"{chrom}\t{pos}\t{ref}\t{fields[3]}\t{reads}\t{fields[5]}\n")
                     continue
@@ -275,6 +361,17 @@ def main(mpileup_dir, output_dir):
                 
                 # Calculate bias score using KS test
                 pvalue, statistic = analyze_read_position_bias(reads, alt)
+                
+                # Only collect data for sites that pass the KS test
+                if (pvalue == -1 and statistic == -1) or (statistic < 0.25 and pvalue > 0.01):
+                    n_count = base_counts['N']
+                    # Store measurements
+                    sample_n_alt_data[sample_name].append((depth, n_count, alt_base_count))
+                
+                # Filter if more Ns than alternate bases
+                if base_counts['N'] > alt_base_count:
+                    n_filtered += 1
+                    continue
                 
                 # Count fixation events
                 if pvalue == -1 and statistic == -1:
@@ -303,6 +400,9 @@ def main(mpileup_dir, output_dir):
         print(f"Sites with no alternate allele: {ref_only_count}")
         print(f"C>T mutations in output: {ct_mutations}")
         print(f"G>A mutations in output: {ga_mutations}")
+    
+    # After processing all samples, create the visualization
+    plot_n_vs_alt_distributions(sample_n_alt_data, output_dir)
 
 if __name__ == "__main__":
     import argparse
