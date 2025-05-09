@@ -2,9 +2,10 @@ references:
   genomic_fna: '/storage1/gabe/ems_effect_code/data/references/GCF_000008025.1_ASM802v1_genomic.fna.gz'
   annotation: '/storage1/gabe/ems_effect_code/data/references/GCF_000008025.1_ASM802v1_genomic.gff'
   codon_table: '/storage1/gabe/ems_effect_code/data/references/11.json'
-  prov_score_db: '/storage1/gabe/ems_effect_code/data/provean_database/provean.db'
-
+  prov_score_sql_db: '/storage1/gabe/ems_effect_code/data/provean_database/provean.db'
+  prov_score_json_db: '/storage1/gabe/ems_effect_code/data/provean_database/provean_db.json'
+  gene_info_cache: '/storage1/gabe/ems_effect_code/data/references/gene_info_cache.json'
 provean:
   data_dir: '/storage1/gabe/ems_effect_code/data/provean_sets'
   executable: '/storage1/gabe/ems_effect_code/provean/provean.sh'
-  num_threads: 75
+  num_threads: 1
