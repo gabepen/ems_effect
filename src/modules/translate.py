@@ -277,7 +277,21 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
         
         # Verify reference base matches
         if ref_base != ref_base_key:
-            print(f"Skipping - reference base mismatch: expected {ref_base_key}, found {ref_base}")
+            print(f"\n=== REFERENCE MISMATCH DETAILS ===")
+            print(f"Gene ID: {seq_id}")
+            print(f"Position: {pos} (0-based)")
+            print(f"Original position: {int(pos_str) - 1} (0-based)")
+            print(f"Mutation: {mut_key} ({mut_type})")
+            print(f"Expected ref base: {ref_base_key}")
+            print(f"Actual ref base: {ref_base}")
+            print(f"Codon: {codon} at position {codon_pos}")
+            print(f"Codon position in gene: {codon_pos//3}")
+            print(f"Base position in codon: {base_pos}")
+            print(f"Reverse complement: {rc}")
+            print(f"Sequence around position: {seq[max(0, pos-5):min(len(seq), pos+6)]}")
+            print(f"Position in sequence: {pos - max(0, pos-5)}")
+            print(f"=== END MISMATCH DETAILS ===\n")
+            input()
             continue
             
         # Create mutated codon
@@ -418,15 +432,28 @@ def prep_provean(mut_dict, seqobject, sample, output, features):
         for mut in mut_dict[gene]['mutations']:
             hgvs_mut = hgvs_notation(mut)
             if '*' not in hgvs_mut[1:]:
+                # Regular mutation, no stop codon
                 provean_json[gene]['mutations'][hgvs_mut] = mut_dict[gene]['mutations'][mut]
+            elif hgvs_mut[0] == '*':
+                # stop codon is being mutated to something else
+                continue
             else:
-                deletion = '_'
-                if aa_seq[-1] != '*':
-                    deletion += aa_seq[-1] + str(aa_len) + 'del'
-                else:
-                    deletion += aa_seq[-2] + str(aa_len-1) + 'del'
-                hgvs_mut = hgvs_mut.replace('*',deletion)
+                # Handle premature stop codon with proper deletion format
+                pos = int(mut.split('_')[0])
+                
+                # Get the amino acid before the stop codon
+                prev_aa = aa_seq[pos-1] if pos > 0 and pos-1 < len(aa_seq) else 'X'
+                
+                # Get the last amino acid in the sequence
+                last_aa = aa_seq[-1] if aa_seq[-1] != '*' else aa_seq[-2]
+                
+                # Format as P4_S100del
+                deletion = f"_{last_aa}{aa_len-1}del"
+                
+                # Replace the stop codon with the proper deletion format
+                hgvs_mut = hgvs_mut.replace('*', deletion)
                 provean_json[gene]['mutations'][hgvs_mut] = mut_dict[gene]['mutations'][mut]
+            
             variants.write(hgvs_mut+'\n')
         variants.close()
 
@@ -443,56 +470,53 @@ def generate_fasta(seq, name, codon_table):
     fasta_str += aa_seq
     return fasta_str
 
-def convert_mutations(mut_dict, seqobject, codon_table, features) -> Tuple[Dict, Dict]:
-    '''Convert nucleotide mutations to amino acid mutations.
+def convert_mutations(
+    nuc_mutations: Dict[str, Dict[str, Any]],
+    seqobject: SeqContext,
+    codon_table: str,
+    features: Dict[str, Any]
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    '''Convert nucleotide mutations to amino acid mutations.'''
     
-    Args:
-        mut_dict: Dictionary of nucleotide mutations per gene
-        seqobject: Genome sequence context
-        codon_table: Path to codon table file
-        features: Dictionary of genome features
-        
-    Returns:
-        Tuple containing:
-            - Dict: New dictionary with amino acid mutations per gene
-            - Dict: Genome-wide dN/dS statistics
-    '''
+    # Load codon table
     global table
     with open(codon_table) as jf:
         table = json.load(jf)
-
-    refseq = seqobject.genome
     
-    # Get immune codons
-    immune_codons = ems_immune_codons(table)
-    
-    # Track genome-wide stats
+    # Initialize dictionaries
+    aa_mutations = {}
     genome_stats = {
         'non_syn_sites': 0,
         'syn_sites': 0,
         'non_syn_muts': 0,
         'syn_muts': 0,
         'syn_sites_mutated': 0,
-        'non_syn_sites_mutated': 0,
-        'total_coverage': 0,
-        'gene_count': 0
+        'non_syn_sites_mutated': 0
     }
     
-    # Create new dictionary for amino acid mutations
-    aa_mutations = {}
-    
-    for key in mut_dict:
-        seq = refseq[features[key].start:features[key].end]
-        if features[key].strand == -1:
+    # Process each gene
+    for key in nuc_mutations.keys():
+        # Skip genes not in features
+        if key not in features:
+            print(f"Gene {key} not found in features")
+            continue
+            
+        # Get gene sequence
+        seq = seqobject.genome[features[key].start:features[key].end]
+        
+        # Check if reverse complement
+        rc = features[key].strand == -1
+        if rc:
             seq = seq.reverse_complement()
-            rc = True
-        else:
-            rc = False
-
+            
+        # Get immune codons
+        immune_codons = []
+        
+        # Convert mutations
         aa_muts, err, dnds_rates = convertor(
             str(seq),
-            key,
-            mut_dict[key]['mutations'], 
+            key,  # Pass the correct gene ID
+            nuc_mutations[key]['mutations'], 
             rc, 
             immune_codons,
             start_pos=features[key].start,
@@ -501,16 +525,18 @@ def convert_mutations(mut_dict, seqobject, codon_table, features) -> Tuple[Dict,
             
         if err != 0:
             if err == 1:
-                print('Conversion Error: No start codon in gene: ' + key)
+                #print('Conversion Error: No start codon in gene: ' + key)
+                pass
             if err == 2: 
-                print('Conversion Error: ref does not match at bp  ' + str(aa_muts) + ' in gene: ' + key)
+                #print('Conversion Error: ref does not match at bp  ' + str(aa_muts) + ' in gene: ' + key)
+                pass
             continue
             
         # Store amino acid mutations in new dictionary
         aa_mutations[key] = {
             'mutations': aa_muts,
-            'gene_len': mut_dict[key]['gene_len'],
-            'avg_cov': mut_dict[key]['avg_cov']
+            'gene_len': nuc_mutations[key]['gene_len'],
+            'avg_cov': nuc_mutations[key]['avg_cov']
         }
         
         # Accumulate genome-wide stats
