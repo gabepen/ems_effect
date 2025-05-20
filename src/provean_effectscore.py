@@ -16,6 +16,7 @@ from tqdm import tqdm
 from Bio.Seq import Seq
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
+from collections import defaultdict
 
 # Add src to path 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -213,22 +214,16 @@ def nuc_to_provean_score(
     wolgenome: SeqContext,
     codon_table: str,
     aa_mutations_dict: Optional[Dict] = None
-) -> Tuple[float, Dict[str, Any]]:
-    """Convert nucleotide mutations to amino acid mutations and calculate PROVEAN score.
-    
-    Returns:
-        Tuple containing:
-            - float: Total effect score
-            - Dict: Additional statistics including:
-                - deleterious_count: Number of deleterious mutations
-                - total_mutations: Total number of mutations
-    """
+) -> Tuple[float, float, Dict[str, Any]]:
+    """Convert nucleotide mutations to amino acid mutations and calculate PROVEAN score."""
     DELETERIOUS_THRESHOLD = -4.1
+    
+   
     
     # Verify gene ID
     if gene_id not in features:
         logger.error(f"Gene ID {gene_id} not found in features")
-        return 0.0, {'deleterious_count': 0, 'total_mutations': 0}
+        return 0.0, 0.0, {'deleterious_count': 0, 'total_mutations': 0}
     
     # Convert nucleotide mutations to amino acid mutations
     aa_muts, _ = translate.convert_mutations(
@@ -238,6 +233,7 @@ def nuc_to_provean_score(
         features
     )
     
+
     # Convert to HGVS format
     hgvs_dict = translate.prep_provean(
         aa_muts,
@@ -253,26 +249,46 @@ def nuc_to_provean_score(
     
     # Calculate PROVEAN scores
     total_score = 0
+    total_score_with_nonsense = 0
     deleterious_count = 0
+    deleterious_count_with_nonsense = 0
     total_mutations = 0
+    nonsense_count = 0
     new_mutations = []
+    failed_mutations = []
     
     for hgvs_mut in hgvs_dict[gene_id]['mutations']:
-        score = score_db.get_score(gene_id, hgvs_mut)
-        if score is not None:
-            total_score += score
+        if gene_id in score_db.db and hgvs_mut in score_db.db[gene_id]:
+            score = score_db.get_score(gene_id, hgvs_mut)
+            
+            if score is None:
+                failed_mutations.append(hgvs_mut)
+                continue
+                
             total_mutations += 1
-            if score < DELETERIOUS_THRESHOLD:
-                deleterious_count += 1
+            is_nonsense = '>*' in hgvs_mut or 'del' in hgvs_mut
+            if is_nonsense:
+                nonsense_count += 1
+                total_score_with_nonsense += score
+                if score < DELETERIOUS_THRESHOLD:
+                    deleterious_count_with_nonsense += 1
+            else:
+                total_score += score
+                total_score_with_nonsense += score
+                if score < DELETERIOUS_THRESHOLD:
+                    deleterious_count += 1
+                    deleterious_count_with_nonsense += 1
         else:
+            # Mutation not in database, need to calculate score
             new_mutations.append(hgvs_mut)
     
     # Calculate new scores if needed
     if new_mutations:
-        logger.debug(f"Calculating {len(new_mutations)} new scores for {gene_id}")
-        
         # Write new variants to file
         var_file = os.path.join(paths['provpath'], f"{gene_id}.new.var")
+        csv_file = os.path.join(paths['provpath'], f"{gene_id}.csv")
+        provean_log = os.path.join(paths['provpath'], f"{gene_id}.provean.log")
+        
         try:
             with open(var_file, 'w') as f:
                 for mutation in new_mutations:
@@ -282,59 +298,102 @@ def nuc_to_provean_score(
             script_dir = os.path.dirname(os.path.abspath(__file__))
             subp_provean_path = os.path.join(script_dir, "subp_provean.sh")
             
-            # Run PROVEAN
-            cmd = [
-                subp_provean_path,
-                gene_id,
-                paths['provpath'],
-                str(provean_config['num_threads']),
-                provean_config['data_dir'],
-                provean_config['executable']
-            ]
-            subprocess.run(cmd, check=True)
+            # Debug: Print nucleotide mutations for this gene
+            logger.debug(f"Processing gene {gene_id} with mutations:")
+            logger.debug(f"  {new_mutations}")
             
-            # Read and process new scores
-            csv_file = os.path.join(paths['provpath'], f"{gene_id}.csv")
-            new_scores = {}
-            if os.path.exists(csv_file):
-                with open(csv_file, 'r') as scores:
-                    for line in scores:
-                        if line.strip() and ',' in line:
-                            mutation, score = line.strip().split(',')
-                            if score.strip():
-                                score = float(score)
-                                new_scores[mutation] = score
-                                total_score += score
-                                total_mutations += 1
-                                if score < DELETERIOUS_THRESHOLD:
-                                    deleterious_count += 1
+            # Run PROVEAN with output redirected to log file
+            with open(provean_log, 'w') as log_file:
+                cmd = [
+                    subp_provean_path,
+                    gene_id,
+                    paths['provpath'],
+                    str(provean_config['num_threads']),
+                    provean_config['data_dir'],
+                    provean_config['executable']
+                ]
+                subprocess.run(cmd, 
+                             check=True,
+                             stdout=log_file,
+                             stderr=subprocess.STDOUT)
             
-            # Batch update the database outside the loop
-            if new_scores:
-                score_db.add_scores_batch(gene_id, new_scores)
+            # Check for AA mismatch errors
+            with open(provean_log, 'r') as log_file:
+                log_content = log_file.read()
+                if "reference AA does not match" in log_content:
+                    for line in log_content.split('\n'):
+                        if "reference AA does not match" in line:
+                            # Parse the problematic mutation (e.g., "Q136_L276del")
+                            problem_mutation = line.split(':')[0].strip()
+                            logger.error(f"Gene {gene_id}: Mutation {problem_mutation} failed - {line.strip()}")
+                            
+                            # Only mark this specific mutation as failed
+                            if problem_mutation in new_mutations:
+                                failed_mutations.append(problem_mutation)
+                                # Add to database as None
+                                score_db.add_scores_batch(gene_id, {problem_mutation: None})
+                                # Remove from new_mutations
+                                new_mutations.remove(problem_mutation)
+            
+            # Only process scores if mutations didn't fail
+            if new_mutations:
+                # Read and process new scores
+                csv_file = os.path.join(paths['provpath'], f"{gene_id}.csv")
+                new_scores = {}
+                if os.path.exists(csv_file):
+                    with open(csv_file, 'r') as scores:
+                        for line in scores:
+                            if line.strip() and ',' in line:
+                                mutation, score = line.strip().split(',')
+                                if score.strip():
+                                    score = float(score)
+                                    new_scores[mutation] = score
+                                    total_mutations += 1
+                                    # Check new mutations for nonsense/deletions
+                                    is_nonsense = '>*' in mutation or 'del' in mutation
+                                    if is_nonsense:
+                                        nonsense_count += 1
+                                        total_score_with_nonsense += score
+                                    else:
+                                        total_score += score
+                                        total_score_with_nonsense += score
+                                    if score < DELETERIOUS_THRESHOLD:
+                                        deleterious_count += 1
+                                        deleterious_count_with_nonsense += 1
+                
+                # Add successful scores to database
+                if new_scores:
+                    score_db.add_scores_batch(gene_id, new_scores)
+                
+                # Any mutations that didn't get scores are failed
+                scored_mutations = set(new_scores.keys())
+                failed_mutations.extend(set(new_mutations) - scored_mutations)
+                
+                # Add failed mutations to database as None
+                failed_scores = {mut: None for mut in failed_mutations}
+                if failed_scores:
+                    score_db.add_scores_batch(gene_id, failed_scores)
             
         except Exception as e:
             logger.error(f"Error running PROVEAN for gene {gene_id}: {e}")
-            return 0, {'deleterious_count': 0, 'total_mutations': 0}
+            return 0, 0, {'deleterious_count': 0, 'total_mutations': 0}
         finally:
             # Cleanup temporary files
-            if os.path.exists(var_file):
-                try:
-                    os.remove(var_file)
-                except:
-                    pass
-            if os.path.exists(csv_file):
-                try:
-                    os.remove(csv_file)
-                except:
-                    pass
+            for file in [var_file, csv_file, provean_log]:
+                if os.path.exists(file):
+                    try:
+                        os.remove(file)
+                    except:
+                        pass
     
     stats = {
         'deleterious_count': deleterious_count,
-        'total_mutations': total_mutations
+        'total_mutations': total_mutations,
+        'failed_mutations': len(failed_mutations),
+        'nonsense_count': nonsense_count
     }
     
-    return total_score, stats
+    return total_score, total_score_with_nonsense, stats
 
 def permute_mutations(
     nuc_mutations: Dict[str, Any],
@@ -418,7 +477,7 @@ def permute_mutations(
                     continue
         
         if permuted_muts['mutations']:
-            score, mutation_stats = nuc_to_provean_score(
+            score, score_with_nonsense, mutation_stats = nuc_to_provean_score(
                 permuted_muts,
                 gene_id,
                 score_db,
@@ -446,8 +505,8 @@ def permute_mutations(
 
 def process_gene_permutations(
     gene_id: str,
-    nuc_mutations: Dict[str, Any],
-    filtered_positions: List[int],
+    sample_mutations: Dict[str, Dict[str, Any]],
+    sample_filtered_positions: Dict[str, List[int]],
     score_db: ProveanScoreDB,
     provean_config: Dict[str, Any],
     paths: Dict[str, str],
@@ -455,91 +514,210 @@ def process_gene_permutations(
     wolgenome: SeqContext,
     codon_table: str,
     n_permutations: int = 1000,
-    min_mutations: int = 3  # Add minimum mutation threshold
+    min_mutations: int = 3
 ) -> Tuple[str, Dict[str, Any]]:
-    """Process permutations for a single gene."""
+    """Process permutations for a single gene across all samples."""
     
     try:
-        # Check if gene has enough mutations to perform permutations
-        mutation_count = len(nuc_mutations['mutations'])
-        if mutation_count < min_mutations:
-            logger.debug(f"Skipping permutations for {gene_id}: only {mutation_count} mutations (minimum {min_mutations} required)")
-            return gene_id, {
-                'effect': 0,
-                'gene_len': nuc_mutations['gene_len'],
-                'avg_cov': nuc_mutations['avg_cov'],
-                'filtered_positions': len(filtered_positions),
-                'mutation_stats': {'deleterious_count': 0, 'total_mutations': mutation_count},
-                'permutation': {
-                    'scores': [],
-                    'deleterious_counts': [],
-                    'mean': 0,
-                    'std': 0,
-                    'mean_deleterious': 0,
-                    'std_deleterious': 0
-                }
-            }
+        # Calculate total mutations across all samples
+        total_mutations = sum(
+            len(mutations['mutations']) 
+            for mutations in sample_mutations.values()
+        )
         
-        # Create a unique temporary directory for this gene process
+        if total_mutations < min_mutations:
+            return gene_id, create_empty_result(sample_mutations, total_mutations)
+        
+        # Create temp directory for this gene
         process_id = os.getpid()
         gene_temp_dir = os.path.join(paths['provpath'], f"{gene_id}_{process_id}")
         os.makedirs(gene_temp_dir, exist_ok=True)
-        
-        # Create gene-specific paths
         gene_paths = paths.copy()
         gene_paths['provpath'] = gene_temp_dir
+
+        # Calculate original scores for each sample and sum
+        original_total_score = 0
+        original_total_score_with_nonsense = 0
+        original_sample_scores = {}
+        original_total_stats = {'deleterious_count': 0, 'total_mutations': 0, 'nonsense_count': 0}
         
-        # Calculate original score
-        original_score, mutation_stats = nuc_to_provean_score(
-            nuc_mutations,
-            gene_id,
-            score_db,
-            provean_config,
-            gene_paths,  # Use process-specific paths
-            features,
-            wolgenome,
-            codon_table
-        )
-        
+        for sample, mutations in sample_mutations.items():
+            score, score_with_nonsense, stats = nuc_to_provean_score(
+                mutations,
+                gene_id,
+                score_db,
+                provean_config,
+                gene_paths,
+                features,
+                wolgenome,
+                codon_table
+            )
+            original_sample_scores[sample] = (score, score_with_nonsense, stats)
+            original_total_score += score
+            original_total_score_with_nonsense += score_with_nonsense
+            original_total_stats['deleterious_count'] += stats['deleterious_count']
+            original_total_stats['total_mutations'] += stats['total_mutations']
+            original_total_stats['nonsense_count'] += stats.get('nonsense_count', 0)
+
         # Perform permutations
-        permuted_scores = permute_mutations(
-            nuc_mutations,
-            gene_id,
-            filtered_positions,
-            score_db,
-            provean_config,
-            gene_paths,  # Use process-specific paths
-            features,
-            wolgenome,
-            codon_table,
-            n_permutations
-        )
+        permuted_total_scores = []
+        permuted_total_scores_with_nonsense = []
+        permuted_total_deleterious = []
         
-        # Calculate statistics
+        for _ in range(n_permutations):
+            # For each permutation, process samples separately and sum their scores
+            perm_total_score = 0
+            perm_total_score_with_nonsense = 0
+            perm_total_deleterious = 0
+            
+            for sample, mutations in sample_mutations.items():
+                # Get sample-specific filtered positions
+                filtered_pos = sample_filtered_positions.get(sample, [])
+                
+                # Permute mutations for this sample using its filtered positions
+                permuted_muts = permute_single_sample(
+                    mutations,
+                    gene_id,
+                    filtered_pos,
+                    features,
+                    wolgenome
+                )
+                
+                # Calculate score for this sample's permutation
+                if permuted_muts['mutations']:
+                    score, score_with_nonsense, stats = nuc_to_provean_score(
+                        permuted_muts,
+                        gene_id,
+                        score_db,
+                        provean_config,
+                        gene_paths,
+                        features,
+                        wolgenome,
+                        codon_table
+                    )
+                    perm_total_score += score
+                    perm_total_score_with_nonsense += score_with_nonsense
+                    perm_total_deleterious += stats['deleterious_count']
+            
+            permuted_total_scores.append(perm_total_score)
+            permuted_total_scores_with_nonsense.append(perm_total_score_with_nonsense)
+            permuted_total_deleterious.append(perm_total_deleterious)
+
+        # Calculate p-value based on summed scores
+        p_value = sum(s <= original_total_score for s in permuted_total_scores) / len(permuted_total_scores)
+        p_value_with_nonsense = sum(s <= original_total_score_with_nonsense for s in permuted_total_scores_with_nonsense) / len(permuted_total_scores_with_nonsense)
+        
+        # Get gene length from first sample (should be same for all)
+        first_sample = next(iter(sample_mutations.values()))
+        gene_len = first_sample['gene_len']
+
         result = {
-            'effect': original_score,
-            'gene_len': nuc_mutations['gene_len'],
-            'avg_cov': nuc_mutations['avg_cov'],
-            'filtered_positions': len(filtered_positions),
-            'mutation_stats': mutation_stats,  # Contains original deleterious count
+            'effect': original_total_score,
+            'effect_with_nonsense': original_total_score_with_nonsense,
+            'total_mutations': total_mutations,
+            'gene_len': gene_len,  # Keep gene length
+            'mutation_stats': {
+                'deleterious_count': original_total_stats['deleterious_count'],
+                'total_mutations': original_total_stats['total_mutations'],
+                'nonsense_count': original_total_stats['nonsense_count']
+            },
             'permutation': {
-                'scores': permuted_scores['scores'],
-                'deleterious_counts': permuted_scores['deleterious_counts'],
-                'mean': permuted_scores['mean'],
-                'std': permuted_scores['std'],
-                'mean_deleterious': permuted_scores['mean_deleterious'],
-                'std_deleterious': permuted_scores['std_deleterious']
+                'scores': permuted_total_scores,
+                'scores_with_nonsense': permuted_total_scores_with_nonsense,
+                'deleterious_counts': permuted_total_deleterious,
+                'mean': np.mean(permuted_total_scores) if permuted_total_scores else 0,
+                'mean_with_nonsense': np.mean(permuted_total_scores_with_nonsense) if permuted_total_scores_with_nonsense else 0,
+                'std': np.std(permuted_total_scores) if permuted_total_scores else 0,
+                'std_with_nonsense': np.std(permuted_total_scores_with_nonsense) if permuted_total_scores_with_nonsense else 0,
+                'mean_deleterious': np.mean(permuted_total_deleterious) if permuted_total_deleterious else 0,
+                'std_deleterious': np.std(permuted_total_deleterious) if permuted_total_deleterious else 0,
+                'pvalue': p_value,
+                'pvalue_with_nonsense': p_value_with_nonsense
             }
         }
         
         return gene_id, result
         
     finally:
-        # Clean up the temporary directory
+        # Clean up
         try:
             shutil.rmtree(gene_temp_dir)
         except:
             pass
+
+def permute_single_sample(
+    nuc_mutations: Dict[str, Any],
+    gene_id: str,
+    filtered_positions: List[int],
+    features: Dict[str, Any],
+    wolgenome: SeqContext
+) -> Dict[str, Any]:
+    """Randomly place mutations for a single sample."""
+    
+    gene_length = nuc_mutations['gene_len']
+    nuc_muts = list(nuc_mutations['mutations'].keys())
+    
+    # Get gene sequence
+    gene_seq = str(wolgenome.genome[features[gene_id].start:features[gene_id].end])
+    is_reverse = features[gene_id].strand == -1
+    if is_reverse:
+        gene_seq = str(Seq(gene_seq).reverse_complement())
+    
+    # Store original valid positions for each base type
+    original_valid_positions = {'C': [], 'G': []}
+    for pos in range(gene_length):
+        if pos not in filtered_positions:
+            if pos < len(gene_seq):
+                base = gene_seq[pos]
+                if base in original_valid_positions:
+                    original_valid_positions[base].append(pos)
+    
+    # Reset valid positions
+    valid_positions = {
+        'C': original_valid_positions['C'][:],
+        'G': original_valid_positions['G'][:]
+    }
+    
+    permuted_muts = {
+        'mutations': {},
+        'gene_len': nuc_mutations['gene_len'],
+        'avg_cov': nuc_mutations['avg_cov']
+    }
+    
+    # Place each mutation
+    for orig_mut in nuc_muts:
+        ref_base = orig_mut.split('_')[1].split('>')[0]
+        if valid_positions[ref_base]:
+            pos_idx = random.randrange(len(valid_positions[ref_base]))
+            new_pos = valid_positions[ref_base].pop(pos_idx)
+            mut_type = orig_mut.split('_')[1]
+            
+            if new_pos < len(gene_seq) and gene_seq[new_pos] == ref_base:
+                if is_reverse:
+                    if mut_type == 'C>T':
+                        mut_type = 'G>A'
+                    elif mut_type == 'G>A':
+                        mut_type = 'C>T'
+                
+                if is_reverse:
+                    genomic_pos = len(gene_seq) - new_pos
+                else:
+                    genomic_pos = new_pos + 1
+                
+                permuted_muts['mutations'][f"{genomic_pos}_{mut_type}"] = 1
+    
+    return permuted_muts
+
+def is_ems_sample(sample_name: str) -> bool:
+    """Determine if a sample is a valid EMS treated sample.
+    
+    Excludes 7d samples and controls.
+    """
+    return 'EMS' in sample_name and '7d' not in sample_name
+
+def is_control_sample(sample_name: str) -> bool:
+    """Determine if a sample is a control sample."""
+    return 'EMS' not in sample_name
 
 def calculate_provean_scores_parallel(
     mutation_jsons: List[str],
@@ -551,59 +729,128 @@ def calculate_provean_scores_parallel(
     codon_table: str,
     mpileup_dir: str,
     max_workers: int = None,
-    min_mutations: int = 3  # Add parameter here
+    min_mutations: int = 3
 ) -> None:
     '''Calculate PROVEAN scores and perform permutation tests in parallel.'''
     
-    # Process each sample
-    for js in tqdm(mutation_jsons, desc="Processing samples"):
+    # Separate EMS and control samples
+    ems_jsons = []
+    control_jsons = []
+    
+    for js in mutation_jsons:
         sample = js.split('/')[-1].split('.')[0]
-        logger.info(f"Processing sample: {sample}")
+        if is_ems_sample(sample):
+            ems_jsons.append(js)
+        elif is_control_sample(sample):
+            control_jsons.append(js)
+    
+    logger.info(f"Found {len(ems_jsons)} EMS samples and {len(control_jsons)} control samples")
+    
+    # Process EMS samples
+    if ems_jsons:
+        logger.info("Processing EMS samples...")
+        process_sample_group(
+            ems_jsons,
+            score_db,
+            paths,
+            provean_config,
+            features,
+            wolgenome,
+            codon_table,
+            mpileup_dir,
+            max_workers,
+            min_mutations,
+            "ems_merged_results.json"
+        )
+    
+    # Process control samples
+    if control_jsons:
+        logger.info("Processing control samples...")
+        process_sample_group(
+            control_jsons,
+            score_db,
+            paths,
+            provean_config,
+            features,
+            wolgenome,
+            codon_table,
+            mpileup_dir,
+            max_workers,
+            min_mutations,
+            "control_merged_results.json"
+        )
+
+def process_sample_group(
+    sample_jsons: List[str],
+    score_db: ProveanScoreDB,
+    paths: Dict[str, str],
+    provean_config: Dict[str, Any],
+    features: Dict[str, Any],
+    wolgenome: SeqContext,
+    codon_table: str,
+    mpileup_dir: str,
+    max_workers: int,
+    min_mutations: int,
+    output_filename: str
+) -> None:
+    """Process a group of samples (either EMS or control) together."""
+    
+    # First, collect all mutations and filtered positions by gene
+    gene_mutations = defaultdict(dict)  # gene -> sample -> mutations
+    gene_filtered = defaultdict(dict)   # gene -> sample -> filtered positions
+    
+    # Process each sample
+    for js in tqdm(sample_jsons, desc="Loading samples"):
+        sample = js.split('/')[-1].split('.')[0]
         
         # Load filtered positions
         filtered_positions = load_filtered_positions(sample, paths, mpileup_dir)
-        logger.info(f"Loaded {len(filtered_positions)} filtered positions for {sample}")
         
-        # Load original nucleotide mutations
-        nuc_mut_file = os.path.join(paths['mutpath'], f"{sample}.json")
-        with open(nuc_mut_file) as f:
+        # Load mutations
+        with open(js) as f:
             nuc_mutations = json.load(f)
-        
-        # Use ThreadPoolExecutor to parallelize across genes
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit jobs for each gene
-            futures = {}
-            for gene in nuc_mutations:
-                future = executor.submit(
-                    process_gene_permutations,
-                    gene,
-                    nuc_mutations[gene],
-                    filtered_positions.get(gene, []),
-                    score_db,
-                    provean_config,
-                    paths,
-                    features,
-                    wolgenome,
-                    codon_table,
-                    1000,  # Number of permutations
-                    min_mutations  # Add minimum mutation parameter
-                )
-                futures[future] = gene
             
-            # Process results as they complete
-            sample_results = {}
-            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Genes for {sample}"):
-                gene = futures[future]
-                try:
-                    gene_id, result = future.result()
-                    sample_results[gene_id] = result
-                except Exception as e:
-                    logger.error(f"Error processing gene {gene}: {e}")
+        # Group by gene
+        for gene, mutations in nuc_mutations.items():
+            gene_mutations[gene][sample] = mutations
+            gene_filtered[gene][sample] = filtered_positions.get(gene, [])
+    
+    logger.info(f"Processing {len(gene_mutations)} genes for {len(sample_jsons)} samples")
+    
+    # Process genes in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for gene in gene_mutations:
+            future = executor.submit(
+                process_gene_permutations,
+                gene,
+                gene_mutations[gene],
+                gene_filtered[gene],
+                score_db,
+                provean_config,
+                paths,
+                features,
+                wolgenome,
+                codon_table,
+                1000,
+                min_mutations
+            )
+            futures[future] = gene
         
-        # Save results for this sample
-        sample_results_file = os.path.join(paths['results'], f"{sample}_results.json")
-        with open(sample_results_file, 'w') as f:
-            json.dump(sample_results, f, indent=2)
+        # Collect results
+        merged_results = {}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing genes"):
+            gene = futures[future]
+            try:
+                gene_id, result = future.result()
+                merged_results[gene_id] = result
+            except Exception as e:
+                logger.error(f"Error processing gene {gene}: {e}")
+        
+        # Save merged results
+        merged_results_file = os.path.join(paths['results'], output_filename)
+        with open(merged_results_file, 'w') as f:
+            json.dump(merged_results, f, indent=2)
 
 def normalize_scores(sample: str, results: Dict[str, Dict[str, Any]]) -> None:
     '''Normalize effect scores for each gene.
@@ -623,6 +870,35 @@ def normalize_scores(sample: str, results: Dict[str, Dict[str, Any]]) -> None:
             results[sample][gene]['effect'] = _score / results[sample][gene]['avg_cov']
         else:
             results[sample][gene]['effect'] = 0
+
+def create_empty_result(sample_mutations: Dict[str, Dict[str, Any]], total_mutations: int) -> Dict[str, Any]:
+    first_sample = next(iter(sample_mutations.values()))
+    gene_len = first_sample['gene_len']
+    
+    return {
+        'effect': 0,
+        'effect_with_nonsense': 0,
+        'total_mutations': total_mutations,
+        'gene_len': gene_len,
+        'mutation_stats': {
+            'deleterious_count': 0,
+            'total_mutations': total_mutations,
+            'nonsense_count': 0
+        },
+        'permutation': {
+            'scores': [],
+            'scores_with_nonsense': [],
+            'deleterious_counts': [],
+            'mean': 0,
+            'mean_with_nonsense': 0,
+            'std': 0,
+            'std_with_nonsense': 0,
+            'mean_deleterious': 0,
+            'std_deleterious': 0,
+            'pvalue': 1.0,
+            'pvalue_with_nonsense': 1.0
+        }
+    }
 
 def main() -> None:
     '''Main function to run the PROVEAN effect score calculation pipeline.
@@ -699,7 +975,7 @@ def main() -> None:
     
     # Limit max_workers to avoid "too many open files" error
     # A reasonable default is 20-30 workers depending on the system
-    max_workers = min(60, os.cpu_count())
+    max_workers = min(70, os.cpu_count())
     min_mutations = 3
     calculate_provean_scores_parallel(
         mutation_jsons,
@@ -713,7 +989,7 @@ def main() -> None:
         max_workers=max_workers,  # Use limited number of workers
         min_mutations=min_mutations  # Add minimum mutation parameter
     )
-    
+
     
 
     logger.success("Pipeline completed successfully")

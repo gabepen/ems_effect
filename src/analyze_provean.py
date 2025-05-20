@@ -13,6 +13,9 @@ import yaml
 from upsetplot import plot as upsetplot
 from upsetplot import from_memberships
 import operator
+from statsmodels.stats.multitest import multipletests
+import pdb
+import matplotlib.gridspec as gridspec
 
 def load_gene_info_cache(cache_file: str) -> Dict[str, Dict]:
     """Load cached gene info from JSON file."""
@@ -77,9 +80,8 @@ def lookup_gene_info(ncbi_id: str, cache_file: str = "gene_info_cache.json") -> 
         print(f"Full URL that failed: {server + ext}")
     
     return None
-    
-    
-def load_sample_results(results_dir: str) -> Dict[str, pd.DataFrame]:
+
+def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[str, pd.DataFrame]:
     """Load all sample results and convert to DataFrames."""
     sample_dfs = {}
     
@@ -91,117 +93,114 @@ def load_sample_results(results_dir: str) -> Dict[str, pd.DataFrame]:
         # Convert to DataFrame
         rows = []
         for gene_id, values in data.items():
-            # Calculate p-value from permutations
+            # Calculate p-value (two-tailed) for effect score
             perm_scores = values['permutation']['scores']
             effect_score = values['effect']
             
-            # Handle case where there are no permutation scores
-            if not perm_scores:
-                pvalue = 1.0  # Set to 1.0 when no permutations available
+            if len(perm_scores) <= 10:
+                pvalue_more = None
+                pvalue_less = None
             else:
-                # Calculate empirical p-value (two-tailed)
-                more_extreme = sum(abs(score) >= abs(effect_score) for score in perm_scores)
-                pvalue = more_extreme / len(perm_scores)
+                pvalue_more, pvalue_less = calculate_summed_effect_pvalue(effect_score, perm_scores)
+
+            # Calculate p-value (two-tailed) for deleterious ratio
+            if values.get('mutation_stats', {}).get('total_mutations', 0) > 0 and len(perm_scores) > 10:
+                deleterious_ratio = values.get('mutation_stats', {}).get('deleterious_count', 0) / values.get('mutation_stats', {}).get('total_mutations', 0)
+                perm_ratios = [r / values['mutation_stats']['total_mutations'] for r in values['permutation']['deleterious_counts']]
+                pvalue_ratio_more, pvalue_ratio_less = calculate_deleterious_ratio_pvalues(deleterious_ratio, perm_ratios)
+            else:
+                deleterious_ratio = 0
+                pvalue_ratio_more = None
+                pvalue_ratio_less = None
             
             row = {
                 'gene_id': gene_id,
                 'effect_score': effect_score,
-                'gene_len': values['gene_len'],
-                'avg_cov': values['avg_cov'],
-                'pvalue': pvalue,
+                'pvalue_more': pvalue_more,
+                'pvalue_less': pvalue_less,
+                'pvalue_ratio_more': pvalue_ratio_more,
+                'pvalue_ratio_less': pvalue_ratio_less,
                 'permutation_mean': values['permutation'].get('mean', 0),
                 'permutation_std': values['permutation'].get('std', 0),
-                'permutation_percentile': values['permutation'].get('percentile', 0),
                 'n_permutations': len(perm_scores),
                 'deleterious_mutations': values.get('mutation_stats', {}).get('deleterious_count', 0),
-                'total_mutations': values.get('mutation_stats', {}).get('total_mutations', 0)
+                'total_mutations': values.get('mutation_stats', {}).get('total_mutations', 0),
+                'deleterious_ratio': deleterious_ratio
             }
             rows.append(row)
             
         df = pd.DataFrame(rows)
         
-        # Calculate normalized scores
-        df['effect_norm_len'] = df['effect_score'] / df['gene_len']
-        df['effect_norm_full'] = df['effect_norm_len'] / df['avg_cov'].replace(0, 1)
+        # Calculate normalized scores using gene lengths
+        df['effect_norm_len'] = df.apply(lambda x: x['effect_score'] / gene_lengths.get(x['gene_id'], 1), axis=1)
         
-        # Calculate -log10(pvalue)
-        df['-log10_pvalue'] = -np.log10(df['pvalue'].clip(1e-10, 1))
+        # Apply FDR corrections
+        valid_pvals_more = df['pvalue_more'].notna()
+        if valid_pvals_more.any():
+            df.loc[valid_pvals_more, 'pvalue_more_fdr'] = multipletests(df.loc[valid_pvals_more, 'pvalue_more'], method='fdr_bh')[1]
         
-        # Add deleterious ratio calculation
-        df['deleterious_ratio'] = df['deleterious_mutations'] / df['total_mutations']
-        df['deleterious_ratio'] = df['deleterious_ratio'].fillna(0)  # Handle div by zero
+        valid_pvals_less = df['pvalue_less'].notna()
+        if valid_pvals_less.any():
+            df.loc[valid_pvals_less, 'pvalue_less_fdr'] = multipletests(df.loc[valid_pvals_less, 'pvalue_less'], method='fdr_bh')[1]
         
-        # Calculate normalized deleterious ratios
-        df['deleterious_ratio_norm_len'] = df['deleterious_ratio'] / df['gene_len']
-        df['deleterious_ratio_norm_full'] = df['deleterious_ratio_norm_len'] / df['avg_cov'].replace(0, 1)
+        valid_ratio_more = df['pvalue_ratio_more'].notna()
+        if valid_ratio_more.any():
+            df.loc[valid_ratio_more, 'pvalue_ratio_more_fdr'] = multipletests(df.loc[valid_ratio_more, 'pvalue_ratio_more'], method='fdr_bh')[1]
+        
+        valid_ratio_less = df['pvalue_ratio_less'].notna()
+        if valid_ratio_less.any():
+            df.loc[valid_ratio_less, 'pvalue_ratio_less_fdr'] = multipletests(df.loc[valid_ratio_less, 'pvalue_ratio_less'], method='fdr_bh')[1]
         
         sample_dfs[sample] = df
         
-        # Log summary of permutation counts
-        print(f"\nSample {sample}:")
-        print(f"Total genes: {len(df)}")
-        print(f"Genes with no permutations: {sum(df['n_permutations'] == 0)}")
-        print(f"Average permutations per gene: {df['n_permutations'].mean():.1f}")
-        
     return sample_dfs
 
-def plot_volcano(df: pd.DataFrame, title: str, score_col: str = 'effect_score', output_dir: str = None, sample: str = None) -> None:
-    """Create volcano plot of effect scores vs -log10(pvalue)."""
-    plt.figure(figsize=(10, 8))
+def calculate_summed_effect_pvalue(observed_value: float, null_distribution: List[float]) -> float:
+    """Calculate proper two-tailed empirical p-value.
     
-    # Calculate significance threshold (e.g., p < 0.05)
-    sig_threshold = -np.log10(0.05)
+    Returns the fraction of the null distribution that is as or more extreme than
+    the observed value in either direction.
+    """
+    if len(null_distribution) <= 10:
+        return None
     
-    # Create scatter plot
-    plt.scatter(df[score_col], df['-log10_pvalue'], 
-               alpha=0.6, s=50)
+    # Count values more extreme in either tail
+    n_more_effect = sum(x < observed_value for x in null_distribution)
+    n_less_effect = sum(x > observed_value for x in null_distribution)
     
-    # Add threshold line
-    plt.axhline(y=sig_threshold, color='r', linestyle='--', alpha=0.5)
+    # Calculate p-value as fraction of distribution more extreme than observed
+    pvalue_more = n_more_effect / len(null_distribution)
+    pvalue_less = n_less_effect / len(null_distribution)
     
-    plt.xlabel('Effect Score')
-    plt.ylabel('-log10(p-value)')
-    plt.title(title)
-    plt.tight_layout()
-    
-    # Export plot data if output directory is provided
-    if output_dir and sample:
-        # Create DataFrame with plot data
-        columns = ['gene_id', score_col, 'pvalue', '-log10_pvalue', 'gene_len', 'avg_cov']
-        
-        # Add optional columns if they exist
-        if 'deleterious_mutations' in df.columns:
-            columns.append('deleterious_mutations')
-        if 'total_mutations' in df.columns:
-            columns.append('total_mutations')
-            
-        plot_data = df[columns].copy()
-        
-        # Sort by significance (p-value)
-        plot_data = plot_data.sort_values('pvalue')
-        
-        # Save to CSV
-        plot_file = os.path.join(output_dir, f"{sample}_{score_col}_volcano_data.csv")
-        plot_data.to_csv(plot_file, index=False)
+    return pvalue_more, pvalue_less
 
-def plot_pvalue_density(df: pd.DataFrame, title: str) -> None:
-    """Create density plot of p-values."""
-    plt.figure(figsize=(10, 6))
+def calculate_deleterious_ratio_pvalues(observed_ratio: float, perm_ratios: List[float] ) -> pd.Series:
+    """Calculate p-values based on deleterious ratio distribution.
     
-    sns.kdeplot(data=df['pvalue'], fill=True)
-    plt.axvline(x=0.05, color='r', linestyle='--', alpha=0.5,
-                label='p=0.05 threshold')
+    For deleterious ratios:
+    - Higher ratios indicate more deleterious mutations
+    - P-value is fraction of background ratios that are more extreme
+    - Low p-values indicate unusually high or low ratios
+    """
+    if len(perm_ratios) <= 10:
+        return None
     
-    plt.xlabel('p-value')
-    plt.ylabel('Density')
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
+    n_more_deleterious = sum(x > observed_ratio for x in perm_ratios)
+    n_less_deleterious = sum(x < observed_ratio for x in perm_ratios)
+    
+    pvalue_more = n_more_deleterious / len(perm_ratios)
+    pvalue_less = n_less_deleterious / len(perm_ratios)
+    return pvalue_more, pvalue_less
 
 def create_significant_genes_summary(df: pd.DataFrame, sample: str, output_dir: str, cache_file: str, pvalue_threshold: float = 0.05) -> None:
     """Create a summary CSV file of significant genes."""
-    # Filter for significant genes
-    sig_genes = df[df['pvalue'] < pvalue_threshold].copy()
+    # Filter out None/NaN p-values
+    df_valid = df.dropna(subset=['pvalue_more_fdr', 'pvalue_less_fdr'])
+    
+    # Filter for significant genes (both deleterious and protective)
+    deleterious = (df_valid['pvalue_more_fdr'] < pvalue_threshold) & (df_valid['effect_score'] < 0)
+    protective = (df_valid['pvalue_less_fdr'] < pvalue_threshold) & (df_valid['effect_score'] > 0)
+    sig_genes = df_valid[deleterious | protective].copy()
     
     # Sort by absolute effect score (strongest effects first)
     sig_genes['abs_effect'] = abs(sig_genes['effect_score'])
@@ -212,36 +211,26 @@ def create_significant_genes_summary(df: pd.DataFrame, sample: str, output_dir: 
         'gene_id',
         'effect_score',
         'effect_norm_len',
-        'effect_norm_full',
-        'pvalue',
-        'gene_len',
-        'avg_cov',
+        'pvalue_more',
+        'pvalue_less',
+        'pvalue_more_fdr',
+        'pvalue_less_fdr',
         'permutation_mean',
         'permutation_std',
         'n_permutations',
         'deleterious_mutations',
         'total_mutations',
-        'deleterious_ratio',
-        'deleterious_ratio_norm_len',
-        'deleterious_ratio_norm_full'
+        'deleterious_ratio'
     ]].copy()
-    
-    # Add fold change from permutation mean
-    summary_df['fold_change'] = summary_df['effect_score'] / summary_df['permutation_mean'].replace(0, np.nan)
     
     # Rename columns for clarity
     summary_df = summary_df.rename(columns={
         'effect_score': 'raw_effect_score',
         'effect_norm_len': 'length_normalized_score',
-        'effect_norm_full': 'fully_normalized_score',
-        'gene_len': 'gene_length',
-        'avg_cov': 'average_coverage',
         'permutation_mean': 'permutation_mean_score',
         'permutation_std': 'permutation_std_dev',
         'n_permutations': 'number_of_permutations',
-        'deleterious_ratio': 'deleterious_mutation_ratio',
-        'deleterious_ratio_norm_len': 'length_normalized_deleterious_ratio',
-        'deleterious_ratio_norm_full': 'fully_normalized_deleterious_ratio'
+        'deleterious_ratio': 'deleterious_mutation_ratio'
     })
     
     # Save to CSV
@@ -261,17 +250,17 @@ def create_significant_genes_summary(df: pd.DataFrame, sample: str, output_dir: 
         'gene_id': sig_genes['gene_id'],
         'gene_name': sig_genes.get('gene_name', ''),
         'gene_description': sig_genes.get('gene_description', ''),
-        'gene_length': sig_genes['gene_len'],
-        'average_coverage': sig_genes['avg_cov'],
-        'total_mutations': sig_genes['total_mutations'],
         'effect_score': sig_genes['effect_score'],
-        'effect_score_norm_len': sig_genes['effect_norm_len'],
+        'effect_norm_len': sig_genes['effect_norm_len'],
         'deleterious_ratio': sig_genes['deleterious_ratio'],
-        'pvalue': sig_genes['pvalue']
+        'pvalue_more': sig_genes['pvalue_more'],
+        'pvalue_less': sig_genes['pvalue_less'],
+        'pvalue_more_fdr': sig_genes['pvalue_more_fdr'],
+        'pvalue_less_fdr': sig_genes['pvalue_less_fdr']
     })
 
     # Sort by effect score (most negative first)
-    gene_summary_df = gene_summary_df.sort_values('effect_score_norm_len')
+    gene_summary_df = gene_summary_df.sort_values('effect_score')
 
     # Save gene info summary
     gene_info_file = os.path.join(output_dir, f"{sample}_gene_info_summary.csv")
@@ -283,154 +272,93 @@ def create_significant_genes_summary(df: pd.DataFrame, sample: str, output_dir: 
     print(f"Strongest effect: {sig_genes['effect_score'].min():.2f}")
     print(f"Summary saved to: {output_file}")
 
-def calculate_deleterious_ratio_pvalues(df: pd.DataFrame) -> pd.Series:
-    """Calculate p-values based on deleterious ratio distribution."""
-    # Get background distribution from all genes
-    background_ratios = df['deleterious_ratio'].values
-    
-    # Calculate p-values for each gene
-    pvalues = []
-    for ratio in df['deleterious_ratio']:
-        # Calculate what fraction of background ratios are more extreme
-        # For deleterious ratio, higher values are more deleterious
-        pvalue = np.mean(background_ratios <= ratio)
-        pvalues.append(pvalue)
-    
-    return pd.Series(pvalues, index=df.index)
-
-def analyze_sample(df: pd.DataFrame, sample: str, output_dir: str, cache_file: str) -> None:
+def analyze_sample(df: pd.DataFrame, sample: str, output_dir: str, cache_file: str, gene_lengths: Dict[str, int]) -> None:
     """Analyze a single sample's results."""
     sample_dir = os.path.join(output_dir, sample)
     os.makedirs(sample_dir, exist_ok=True)
     
-    # Add deleterious ratio based p-values
-    df['ratio_pvalue'] = calculate_deleterious_ratio_pvalues(df)
+    # Create plots
+    plot_effect_relationships(df, gene_lengths, sample, sample_dir)
+    plot_effect_relationships_ratio(df, gene_lengths, sample, sample_dir)
     
-    # Create both versions of plots
-    plot_volcano(df, f'{sample} - Effect Score vs Significance', 
-                score_col='effect_score',
-                output_dir=sample_dir,
-                sample=sample)
-    plot_volcano_ratio(df, sample, sample_dir)  # New ratio-based volcano
-    plot_effect_relationships(df, sample, sample_dir)
-    plot_effect_relationships_ratio(df, sample, sample_dir)  # New ratio-based relationships
+    # Add method comparison
+    compare_scoring_methods(df, gene_lengths, sample, sample_dir)
     
-    # Create significant genes summary with cache file
+    # Create significant genes summary
     create_significant_genes_summary(df, sample, sample_dir, cache_file)
     
-    # Update summary statistics with explicit type conversion
-    stats_dict = {
-        'total_genes': int(len(df)),
-        'significant_genes': int(sum(df['pvalue'] < 0.05)),
-        'mean_effect': float(df['effect_score'].mean()),
-        'median_effect': float(df['effect_score'].median()),
-        'mean_pvalue': float(df['pvalue'].mean()),
-        'median_pvalue': float(df['pvalue'].median()),
-        'mean_deleterious_ratio': float(df['deleterious_ratio'].mean()),
-        'median_deleterious_ratio': float(df['deleterious_ratio'].median()),
-        'genes_with_deleterious_mutations': int(sum(df['deleterious_mutations'] > 0)),
-        'total_deleterious_mutations': int(df['deleterious_mutations'].sum()),
-        'total_mutations': int(df['total_mutations'].sum())
-    }
-    
-    with open(os.path.join(sample_dir, 'summary_stats.json'), 'w') as f:
-        json.dump(stats_dict, f, indent=2)
+    # List significant genes
+    list_significant_genes(df, sample, sample_dir, cache_file)
 
 def plot_combined_pvalue_density(sample_dfs: Dict[str, pd.DataFrame], output_dir: str) -> None:
     """Create combined histogram plots of p-values for all samples."""
-    
-    # First plot - Control vs Treated
     plt.figure(figsize=(12, 8))
-    
+
     # Collect p-values for controls and treated samples
-    control_pvals = []
-    treated_pvals = []
-    
+    control_pvals_more = []
+    treated_pvals_more = []
+    control_pvals_less = []
+    treated_pvals_less = []
+    control_pvals_ratio_more = []
+    treated_pvals_ratio_more = []
+    control_pvals_ratio_less = []
+    treated_pvals_ratio_less = []
+    # FDR
+    control_pvals_more_fdr = []
+    treated_pvals_more_fdr = []
+    control_pvals_less_fdr = []
+    treated_pvals_less_fdr = []
+    control_pvals_ratio_more_fdr = []
+    treated_pvals_ratio_more_fdr = []
+    control_pvals_ratio_less_fdr = []
+    treated_pvals_ratio_less_fdr = []
+
     for sample, df in sample_dfs.items():
         if 'NT' in sample:
-            control_pvals.extend(df['pvalue'].values)
+            control_pvals_more.extend(df['pvalue_more'].dropna().values)
+            control_pvals_less.extend(df['pvalue_less'].dropna().values)
+            control_pvals_ratio_more.extend(df['pvalue_ratio_more'].dropna().values)
+            control_pvals_ratio_less.extend(df['pvalue_ratio_less'].dropna().values)
+            if 'pvalue_more_fdr' in df:
+                control_pvals_more_fdr.extend(df['pvalue_more_fdr'].dropna().values)
+            if 'pvalue_less_fdr' in df:
+                control_pvals_less_fdr.extend(df['pvalue_less_fdr'].dropna().values)
+            if 'pvalue_ratio_more_fdr' in df:
+                control_pvals_ratio_more_fdr.extend(df['pvalue_ratio_more_fdr'].dropna().values)
+            if 'pvalue_ratio_less_fdr' in df:
+                control_pvals_ratio_less_fdr.extend(df['pvalue_ratio_less_fdr'].dropna().values)
         else:
-            treated_pvals.extend(df['pvalue'].values)
-    
-    # Create histogram
-    bins = np.linspace(0, 1, 51)  # 50 bins from 0 to 1
-    plt.hist([control_pvals, treated_pvals], 
+            treated_pvals_more.extend(df['pvalue_more'].dropna().values)
+            treated_pvals_less.extend(df['pvalue_less'].dropna().values)
+            treated_pvals_ratio_more.extend(df['pvalue_ratio_more'].dropna().values)
+            treated_pvals_ratio_less.extend(df['pvalue_ratio_less'].dropna().values)
+            if 'pvalue_more_fdr' in df:
+                treated_pvals_more_fdr.extend(df['pvalue_more_fdr'].dropna().values)
+            if 'pvalue_less_fdr' in df:
+                treated_pvals_less_fdr.extend(df['pvalue_less_fdr'].dropna().values)
+            if 'pvalue_ratio_more_fdr' in df:
+                treated_pvals_ratio_more_fdr.extend(df['pvalue_ratio_more_fdr'].dropna().values)
+            if 'pvalue_ratio_less_fdr' in df:
+                treated_pvals_ratio_less_fdr.extend(df['pvalue_ratio_less_fdr'].dropna().values)
+
+    # Example: plot for effect_more
+    bins = np.linspace(0, 1, 51)
+    plt.hist([control_pvals_more, treated_pvals_more], 
              bins=bins,
              label=['Control', 'EMS Treated'],
              stacked=True,
              alpha=0.7,
              color=['lightgrey', 'darkorange'])
-    
-    # Add significance threshold line
-    plt.axvline(x=0.05, color='r', linestyle='--', alpha=0.5,
-                label='p=0.05 threshold')
-    
-    plt.xlabel('p-value')
+    plt.axvline(x=0.05, color='r', linestyle='--', alpha=0.5, label='p=0.05 threshold')
+    plt.xlabel('p-value (effect_more)')
     plt.ylabel('Count')
-    plt.title('P-value Distribution Across Samples')
+    plt.title('P-value Distribution (effect_more) Across Samples')
     plt.legend()
     plt.tight_layout()
-    
-    # Save first plot
-    plt.savefig(os.path.join(output_dir, 'combined_pvalue_histogram.png'), 
-                bbox_inches='tight', dpi=300)
+    plt.savefig(os.path.join(output_dir, 'combined_pvalue_histogram_effect_more.png'), bbox_inches='tight', dpi=300)
     plt.close()
-    
-    # Second plot - Controls with unique colors
-    plt.figure(figsize=(12, 8))
-    
-    # Define color palette for controls
-    control_colors = sns.color_palette("Set2", n_colors=10)  # Adjust n_colors as needed
-    treated_color = 'darkorange'
-    
-    # Collect p-values for each sample separately
-    sample_pvals = {}
-    for sample, df in sample_dfs.items():
-        sample_pvals[sample] = df['pvalue'].values
-    
-    # Separate control and treated samples
-    control_samples = [s for s in sample_pvals.keys() if 'NT' in s]
-    treated_samples = [s for s in sample_pvals.keys() if 'NT' not in s]
-    
-    # Create lists for stacked histogram
-    all_pvals = []
-    labels = []
-    colors = []
-    
-    # Add control samples first
-    for i, sample in enumerate(control_samples):
-        all_pvals.append(sample_pvals[sample])
-        labels.append(f'Control - {sample}')
-        colors.append(control_colors[i % len(control_colors)])
-    
-    # Combine all treated samples
-    treated_combined = np.concatenate([sample_pvals[s] for s in treated_samples])
-    all_pvals.append(treated_combined)
-    labels.append('EMS Treated')
-    colors.append(treated_color)
-    
-    # Create stacked histogram
-    plt.hist(all_pvals,
-             bins=bins,
-             label=labels,
-             stacked=True,
-             alpha=0.7,
-             color=colors)
-    
-    # Add significance threshold line
-    plt.axvline(x=0.05, color='r', linestyle='--', alpha=0.5,
-                label='p=0.05 threshold')
-    
-    plt.xlabel('p-value')
-    plt.ylabel('Count')
-    plt.title('P-value Distribution Across Samples (Unique Control Colors)')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    
-    # Save second plot
-    plt.savefig(os.path.join(output_dir, 'combined_pvalue_histogram_unique_controls.png'), 
-                bbox_inches='tight', dpi=300)
-    plt.close()
+
+    # Repeat for other pvalue types as needed, or remove this function if you use the new create_pvalue_distribution_plots
 
 def analyze_shared_genes(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, pvalue_threshold: float = 0.05) -> None:
     """Analyze shared significant genes between samples."""
@@ -456,7 +384,7 @@ def analyze_shared_genes(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, p
     for sample in treated_samples:
         df = sample_dfs[sample]
         # Get significant genes
-        sig_genes = set(df[df['pvalue'] < pvalue_threshold]['gene_id'])
+        sig_genes = set(df[df['pvalue_more_fdr'] < pvalue_threshold]['gene_id'])
         print(f"Sample {sample} has {len(sig_genes)} significant genes")
         treated_sig_genes.append(sig_genes)
     
@@ -488,11 +416,11 @@ def analyze_shared_genes(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, p
             total_mutations += gene_row['total_mutations']
             deleterious_mutations += gene_row['deleterious_mutations']  # Use actual count instead of calculating
             effect_scores.append(gene_row['effect_score'])
-            pvalues.append(gene_row['pvalue'])
+            pvalues.append(gene_row['pvalue_more_fdr'])
         
         # Count control samples where this gene is significant
         control_count = sum(1 for control in control_samples 
-                          if gene in set(sample_dfs[control][sample_dfs[control]['pvalue'] < pvalue_threshold]['gene_id']))
+                          if gene in set(sample_dfs[control][sample_dfs[control]['pvalue_more_fdr'] < pvalue_threshold]['gene_id']))
         
         merged_data.append({
             'gene_id': gene,
@@ -516,66 +444,40 @@ def analyze_shared_genes(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, p
     else:
         print("\nNo merged data to save!")
 
-def plot_effect_relationships(df: pd.DataFrame, sample: str, output_dir: str) -> None:
-    """Create multi-panel scatter plot of effect score relationships."""
+def plot_effect_relationships(df: pd.DataFrame, gene_lengths: Dict[str, int], sample: str, output_dir: str) -> None:
+    """Create plots showing relationships between effect score and gene properties."""
+    plt.figure(figsize=(10, 8))
     
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Define significance masks
-    deleterious = df['pvalue'] < 0.05
-    protective = df['pvalue'] > 0.95
+    # Define significance using FDR corrected p-values
+    deleterious = (df['pvalue_more_fdr'] < 0.05) & (df['effect_score'] < 0)
+    protective = (df['pvalue_less_fdr'] < 0.05) & (df['effect_score'] > 0)
     nonsig = ~(deleterious | protective)
     
-    # Plot 1: Effect score vs gene length
-    # Plot non-significant points first
-    ax1.scatter(df[nonsig]['gene_len'], 
-               df[nonsig]['effect_score'],
-               alpha=0.5, color='grey', label='Non-significant')
+    # Get gene lengths for plotting
+    gene_lens = df['gene_id'].map(lambda x: gene_lengths.get(x, 1))
     
-    # Plot deleterious points
-    ax1.scatter(df[deleterious]['gene_len'],
-                df[deleterious]['effect_score'],
-                alpha=0.7, color='red', label='Deleterious (p < 0.05)')
-    
-    # Plot protective points
-    ax1.scatter(df[protective]['gene_len'],
-                df[protective]['effect_score'],
-                alpha=0.7, color='blue', label='Protective (p > 0.95)')
-    
-    ax1.set_xlabel('Gene Length (bp)')
-    ax1.set_ylabel('Effect Score')
-    ax1.set_xscale('log')
-    ax1.legend()
-    
-    # Plot 2: Effect score vs average coverage
-    # Plot non-significant points first
-    ax2.scatter(df[nonsig]['avg_cov'],
+    # Plot: Gene Length vs Effect Score
+    plt.scatter(gene_lens[nonsig], 
                 df[nonsig]['effect_score'],
-                alpha=0.5, color='grey', label='Non-significant')
-    
-    # Plot deleterious points
-    ax2.scatter(df[deleterious]['avg_cov'],
+                alpha=0.3, color='grey', label='Non-significant')
+    plt.scatter(gene_lens[deleterious],
                 df[deleterious]['effect_score'],
-                alpha=0.7, color='red', label='Deleterious (p < 0.05)')
-    
-    # Plot protective points
-    ax2.scatter(df[protective]['avg_cov'],
+                alpha=0.7, color='red', label='Deleterious')
+    plt.scatter(gene_lens[protective],
                 df[protective]['effect_score'],
-                alpha=0.7, color='blue', label='Protective (p > 0.95)')
+                alpha=0.7, color='blue', label='Protective')
     
-    ax2.set_xlabel('Average Coverage')
-    ax2.set_ylabel('Effect Score')
-    ax2.set_xscale('log')
-    ax2.legend()
+    plt.xlabel('Gene Length (bp)')
+    plt.ylabel('Effect Score')
+    plt.legend()
     
-    plt.suptitle(f'Effect Score Relationships - {sample}')
+    plt.title(f'Effect Score vs Gene Length - {sample}')
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'{sample}_effect_relationships.png'), 
                 dpi=300, bbox_inches='tight')
     plt.close()
 
-def create_significance_counts(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, pvalue_threshold: float = 0.05, cache_file: str = None) -> None:
+def create_significance_counts(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, cache_file: str = None) -> None:
     """Create table showing how many treated/control samples each gene is significant in."""
     
     # Load gene info cache
@@ -598,101 +500,58 @@ def create_significance_counts(sample_dfs: Dict[str, pd.DataFrame], output_dir: 
     
     print(f"Found {len(treated_samples)} treated samples and {len(control_samples)} control samples")
     
-    # Add ratio-based p-values to each sample
-    for sample, df in sample_dfs.items():
-        df['ratio_pvalue'] = calculate_deleterious_ratio_pvalues(df)
-    
-    # Get genes significant by either measure
+    # Get genes significant by either measure (using FDR corrected p-values)
     all_genes_low_p = set()
     all_genes_high_p = set()
     all_genes_high_ratio = set()
     all_genes_low_ratio = set()
     
     for df in sample_dfs.values():
-        # Effect score based
-        all_genes_low_p.update(set(df[df['pvalue'] < pvalue_threshold]['gene_id']))
-        all_genes_high_p.update(set(df[df['pvalue'] > (1 - pvalue_threshold)]['gene_id']))
-        # Ratio based
-        all_genes_high_ratio.update(set(df[df['ratio_pvalue'] < pvalue_threshold]['gene_id']))
-        all_genes_low_ratio.update(set(df[df['ratio_pvalue'] > (1 - pvalue_threshold)]['gene_id']))
-    
-    # Process genes for both measures
-    effect_deleterious = process_genes(all_genes_low_p, high_p=False, use_ratio=False, pvalue_threshold=pvalue_threshold)
-    effect_protective = process_genes(all_genes_high_p, high_p=True, use_ratio=False, pvalue_threshold=pvalue_threshold)
-    ratio_high = process_genes(all_genes_high_ratio, high_p=False, use_ratio=True, pvalue_threshold=pvalue_threshold)
-    ratio_low = process_genes(all_genes_low_ratio, high_p=True, use_ratio=True, pvalue_threshold=pvalue_threshold)
-    
-    # Save all results
-    for counts, suffix in [
-        (effect_deleterious, 'effect_deleterious'),
-        (effect_protective, 'effect_protective'),
-        (ratio_high, 'ratio_high'),
-        (ratio_low, 'ratio_low')
-    ]:
-        if counts:
-            df = pd.DataFrame(counts)
-            
-            # Sort differently for deleterious vs protective
-            if suffix == 'effect_deleterious' or suffix == 'effect_protective':
-                df = df.sort_values(['treated_samples_significant', 'mean_pvalue'], 
-                                  ascending=[False, True])  # Lower p-values first for deleterious
-            else:
-                df = df.sort_values(['treated_samples_significant', 'mean_pvalue'], 
-                                  ascending=[False, False])  # Higher p-values first for protective
-            
-            # For protective genes, look up any missing gene info
-            if suffix == 'effect_protective':
-                print("\nLooking up missing gene info for protective genes...")
-                updated_genes = 0
-                for idx, row in df.iterrows():
-                    gene_id = str(row['gene_id'])
-                    if gene_id not in gene_info or not gene_info[gene_id].get('description'):
-                        try:
-                            gene_data = lookup_gene_info(gene_id)
-                            if gene_data and gene_data.get('description'):
-                                gene_info[gene_id] = gene_data
-                                df.at[idx, 'gene_description'] = gene_data['description']
-                                updated_genes += 1
-                                print(f"Updated gene {gene_id}: {gene_data['description'][:100]}...")
-                        except Exception as e:
-                            print(f"Error looking up gene {gene_id}: {e}")
-                
-                if updated_genes > 0:
-                    print(f"Updated information for {updated_genes} protective genes")
-                    # Save updated cache
-                    try:
-                        with open(cache_file, 'w') as f:
-                            json.dump(gene_info, f, indent=2)
-                        print("Updated gene info cache saved")
-                    except Exception as e:
-                        print(f"Error saving updated cache: {e}")
-            
-            # Save to CSV
-            output_file = os.path.join(output_dir, f'gene_significance_counts_{suffix}.csv')
-            df.to_csv(output_file, index=False)
-            print(f"\nSaved {suffix} gene counts to: {output_file}")
-            print(f"Total {suffix} genes found: {len(df)}")
-            
-            # Create merged mutation plot
-            plot_merged_significance(df, output_dir, suffix)
-            
-            # Print summary of distribution
-            print(f"\nDistribution of {suffix} genes by number of treated samples:")
-            treated_dist = df['treated_samples_significant'].value_counts().sort_index()
-            for n_samples, count in treated_dist.items():
-                print(f"Significant in {n_samples} treated samples: {count} genes")
+        # Effect score based (using FDR corrected p-values)
+        all_genes_low_p.update(set(df[df['pvalue_more_fdr'] < 0.05]['gene_id']))
+        all_genes_high_p.update(set(df[df['pvalue_less_fdr'] > (1 - 0.05)]['gene_id']))
+        # Ratio based (already FDR corrected)
+        all_genes_high_ratio.update(set(df[df['pvalue_ratio_more_fdr'] < 0.05]['gene_id']))
+        all_genes_low_ratio.update(set(df[df['pvalue_ratio_less_fdr'] > 0.99]['gene_id']))
 
 def plot_merged_significance(df: pd.DataFrame, output_dir: str, analysis_type: str = 'deleterious') -> None:
-    """Create scatter plot of merged mutation data colored by significance count."""
+    """Create scatter plots of merged mutation data colored by significance count."""
     
+    # Plot 1: Effect Score Analysis
     plt.figure(figsize=(12, 8))
-    
-    # Create colormap for number of treated samples
     max_treated = df['treated_samples_significant'].max()
     norm = plt.Normalize(1, max_treated)
     cmap = plt.cm.viridis
     
-    # Create scatter plot
+    # Create scatter plot for effect scores
+    scatter = plt.scatter(df['total_mutations'], 
+                         df['mean_effect_score'],
+                         c=df['treated_samples_significant'],
+                         cmap=cmap,
+                         norm=norm,
+                         alpha=0.6,
+                         s=50)
+    
+    plt.xlabel('Total Mutations (All Treated Samples)')
+    plt.ylabel('Mean Effect Score')
+    title_prefix = 'Protective' if 'protective' in analysis_type else 'Deleterious'
+    plt.title(f'{title_prefix} Effect Score Analysis Across Treated Samples')
+    plt.xscale('log')  # Log scale for total mutations
+    
+    # Add colorbar
+    cbar = plt.colorbar(scatter)
+    cbar.set_label('Number of Treated Samples Significant In')
+    
+    # Save effect score plot
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'merged_effect_score_{analysis_type}.png'), 
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Plot 2: Deleterious Ratio Analysis
+    plt.figure(figsize=(12, 8))
+    
+    # Create scatter plot for deleterious ratios
     scatter = plt.scatter(df['total_mutations'], 
                          df['deleterious_ratio'],
                          c=df['treated_samples_significant'],
@@ -703,17 +562,152 @@ def plot_merged_significance(df: pd.DataFrame, output_dir: str, analysis_type: s
     
     plt.xlabel('Total Mutations (All Treated Samples)')
     plt.ylabel('Deleterious Mutation Ratio')
-    title_prefix = 'Protective' if analysis_type == 'protective' else 'Deleterious'
-    plt.title(f'{title_prefix} Mutation Analysis Across Treated Samples')
+    plt.title(f'{title_prefix} Mutation Ratio Analysis Across Treated Samples')
     plt.xscale('log')  # Log scale for total mutations
     
     # Add colorbar
     cbar = plt.colorbar(scatter)
     cbar.set_label('Number of Treated Samples Significant In')
     
-    # Save plot
+    # Save deleterious ratio plot
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'merged_mutation_significance_{analysis_type}.png'), 
+    plt.savefig(os.path.join(output_dir, f'merged_mutation_ratio_{analysis_type}.png'), 
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_volcano(df: pd.DataFrame, title: str, score_col: str = 'effect_score', 
+                output_dir: str = None, sample: str = None, output_prefix: str = '') -> None:
+    """Create volcano plot of effect scores vs -log10(pvalue)."""
+    plt.figure(figsize=(10, 8))
+    
+    # Filter out None/NaN p-values
+    df_valid = df.dropna(subset=['pvalue_more_fdr'])
+    
+    # Define significance using FDR corrected p-values
+    deleterious = (df_valid['pvalue_more_fdr'] < 0.05) & (df_valid['effect_score'] < 0)
+    protective = (df_valid['pvalue_less_fdr'] < 0.05) & (df_valid['effect_score'] > 0)
+    nonsig = ~(deleterious | protective)
+    
+    # Plot points
+    plt.scatter(df_valid[nonsig][score_col], 
+               -np.log10(df_valid[nonsig]['pvalue_more_fdr']),
+               alpha=0.5, color='grey', label='Non-significant')
+    
+    plt.scatter(df_valid[deleterious][score_col],
+                -np.log10(df_valid[deleterious]['pvalue_more_fdr']),
+                alpha=0.7, color='red', label='Deleterious (p < 0.05)')
+    
+    plt.scatter(df_valid[protective][score_col],
+                -np.log10(df_valid[protective]['pvalue_less_fdr']),
+                alpha=0.7, color='blue', label='Protective (p > 0.95)')
+    
+    plt.axhline(y=-np.log10(0.05), color='r', linestyle='--', alpha=0.5)
+    plt.xlabel(f'{score_col}')
+    plt.ylabel('-log10(p-value)')
+    plt.title(f'{title}')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{output_prefix}volcano.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_effect_relationships_ratio(df: pd.DataFrame, gene_lengths: Dict[str, int], sample: str, output_dir: str) -> None:
+    """Create plots showing relationships between ratio and gene length."""
+    plt.figure(figsize=(10, 8))
+    
+    # Get gene lengths for plotting
+    gene_lens = df['gene_id'].map(lambda x: gene_lengths.get(x, 1))
+    
+    # Plot: Gene Length vs Deleterious Ratio
+    plt.scatter(gene_lens[df['pvalue_ratio_more_fdr'] < 0.05], 
+                df[df['pvalue_ratio_more_fdr'] < 0.05]['deleterious_ratio'],
+                alpha=0.7, color='red', label='High ratio (p < 0.05)')
+    plt.scatter(gene_lens[df['pvalue_ratio_less_fdr'] < 0.05],
+                df[df['pvalue_ratio_less_fdr'] < 0.05]['deleterious_ratio'],
+                alpha=0.7, color='blue', label='Low ratio (p < 0.05)')
+    
+    plt.xlabel('Gene Length (bp)')
+    plt.ylabel('Deleterious Ratio')
+    plt.xscale('log')
+    plt.legend()
+    
+    plt.title(f'Deleterious Ratio vs Gene Length - {sample}')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{sample}_ratio_relationships.png'), 
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+def compare_scoring_methods(df: pd.DataFrame, gene_lengths: Dict[str, int], sample: str, output_dir: str) -> None:
+    """Compare different scoring methods and create visualization."""
+    # Create figure with GridSpec
+    fig = plt.figure(figsize=(15, 10))
+    gs = gridspec.GridSpec(2, 1, height_ratios=[3, 1])
+    
+    # Filter out None/NaN p-values
+    df_valid = df.dropna(subset=['pvalue_more_fdr', 'pvalue_less_fdr'])
+    
+    # Define significance for effect scores
+    deleterious = (df_valid['pvalue_more_fdr'] < 0.05) & (df_valid['effect_score'] < 0)
+    protective = (df_valid['pvalue_less_fdr'] < 0.05) & (df_valid['effect_score'] > 0)
+    
+    # Define significance for ratios
+    high_ratio = df_valid['pvalue_ratio_more_fdr'] < 0.05
+    low_ratio = df_valid['pvalue_ratio_less_fdr'] < 0.05
+    
+    # Create masks for different categories
+    both_del = deleterious & high_ratio
+    both_prot = protective & low_ratio
+    effect_only_del = deleterious & ~high_ratio
+    effect_only_prot = protective & ~low_ratio
+    ratio_only_del = high_ratio & ~deleterious
+    ratio_only_prot = low_ratio & ~protective
+    nonsig = ~(deleterious | protective | high_ratio | low_ratio)
+    
+    # Plot: Effect Score vs Deleterious Ratio
+    ax1 = plt.subplot(gs[0])
+    
+    # Plot non-significant points first
+    ax1.scatter(df_valid[nonsig]['effect_score'], df_valid[nonsig]['deleterious_ratio'],
+                alpha=0.3, color='grey', label='Non-significant', s=30)
+    
+    # Plot significant points
+    ax1.scatter(df_valid[both_del]['effect_score'], df_valid[both_del]['deleterious_ratio'],
+                alpha=0.7, color='red', label='Deleterious in both', s=50)
+    ax1.scatter(df_valid[effect_only_del]['effect_score'], df_valid[effect_only_del]['deleterious_ratio'],
+                alpha=0.7, color='orange', label='Effect score only', s=50)
+    ax1.scatter(df_valid[ratio_only_del]['effect_score'], df_valid[ratio_only_del]['deleterious_ratio'],
+                alpha=0.7, color='purple', label='Ratio only', s=50)
+    
+    # Plot protective points
+    ax1.scatter(df_valid[both_prot]['effect_score'], df_valid[both_prot]['deleterious_ratio'],
+                alpha=0.7, color='blue', label='Protective in both', s=50)
+    ax1.scatter(df_valid[effect_only_prot]['effect_score'], df_valid[effect_only_prot]['deleterious_ratio'],
+                alpha=0.7, color='cyan', label='Effect score protective only', s=50)
+    ax1.scatter(df_valid[ratio_only_prot]['effect_score'], df_valid[ratio_only_prot]['deleterious_ratio'],
+                alpha=0.7, color='magenta', label='Ratio protective only', s=50)
+    
+    ax1.set_xlabel('Effect Score')
+    ax1.set_ylabel('Deleterious Mutation Ratio')
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    # Calculate correlations
+    score_ratio_corr = df_valid['effect_score'].corr(df_valid['deleterious_ratio'])
+    norm_score_ratio_corr = df_valid['effect_norm_len'].corr(df_valid['deleterious_ratio'])
+    pval_corr = df_valid['pvalue_more_fdr'].corr(df_valid['pvalue_ratio_more_fdr'])
+    
+    # Add correlation text
+    ax2 = plt.subplot(gs[1])
+    ax2.axis('off')
+    correlation_text = (
+        f'Correlations:\n'
+        f'Effect Score vs Ratio: {score_ratio_corr:.3f}\n'
+        f'Normalized Score vs Ratio: {norm_score_ratio_corr:.3f}\n'
+        f'Effect p-value vs Ratio p-value: {pval_corr:.3f}'
+    )
+    ax2.text(0.5, 0.5, correlation_text, ha='center', va='center')
+    
+    plt.suptitle(f'Scoring Method Comparison - {sample}')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{sample}_method_comparison.png'), 
                 dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -721,146 +715,354 @@ def plot_volcano_ratio(df: pd.DataFrame, sample: str, output_dir: str) -> None:
     """Create volcano plot using deleterious ratio p-values."""
     plt.figure(figsize=(10, 8))
     
-    # Define significance masks
-    deleterious = df['ratio_pvalue'] < 0.05
-    protective = df['ratio_pvalue'] > 0.95
-    nonsig = ~(deleterious | protective)
+    # Filter out None/NaN p-values
+    df_valid = df.dropna(subset=['pvalue_ratio_more_fdr'])
+    
+    # Define significance using FDR corrected p-values
+    median_ratio = np.median(df_valid['deleterious_ratio'])
+    high_ratio = (df_valid['pvalue_ratio_more_fdr'] < 0.05) & (df_valid['deleterious_ratio'] > median_ratio)
+    low_ratio = (df_valid['pvalue_ratio_more_fdr'] < 0.05) & (df_valid['deleterious_ratio'] < median_ratio)
+    nonsig = ~(high_ratio | low_ratio)
     
     # Plot points
-    plt.scatter(df[nonsig]['deleterious_ratio'], 
-               -np.log10(df[nonsig]['ratio_pvalue']),
+    plt.scatter(df_valid[nonsig]['gene_len'], 
+               df_valid[nonsig]['deleterious_ratio'],
                alpha=0.5, color='grey', label='Non-significant')
     
-    plt.scatter(df[deleterious]['deleterious_ratio'],
-                -np.log10(df[deleterious]['ratio_pvalue']),
+    plt.scatter(df_valid[high_ratio]['gene_len'],
+                df_valid[high_ratio]['deleterious_ratio'],
                 alpha=0.7, color='red', label='High ratio (p < 0.05)')
     
-    plt.scatter(df[protective]['deleterious_ratio'],
-                -np.log10(df[protective]['ratio_pvalue']),
-                alpha=0.7, color='blue', label='Low ratio (p > 0.95)')
+    plt.scatter(df_valid[low_ratio]['gene_len'],
+                df_valid[low_ratio]['deleterious_ratio'],
+                alpha=0.7, color='blue', label='Low ratio (p > 0.99)')
     
-    plt.axhline(y=-np.log10(0.05), color='r', linestyle='--', alpha=0.5)
-    plt.xlabel('Deleterious Mutation Ratio')
-    plt.ylabel('-log10(p-value)')
-    plt.title(f'Volcano Plot (Ratio-based) - {sample}')
+    plt.xlabel('Gene Length (bp)')
+    plt.ylabel('Deleterious Mutation Ratio')
+    plt.title(f'Deleterious Ratio Relationships - {sample}')
     plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'volcano_ratio.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-def plot_effect_relationships_ratio(df: pd.DataFrame, sample: str, output_dir: str) -> None:
-    """Create relationship plots using deleterious ratio p-values."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Define significance masks
-    deleterious = df['ratio_pvalue'] < 0.05
-    protective = df['ratio_pvalue'] > 0.95
-    nonsig = ~(deleterious | protective)
-    
-    # Plot 1: Deleterious ratio vs gene length
-    ax1.scatter(df[nonsig]['gene_len'], 
-               df[nonsig]['deleterious_ratio'],
-               alpha=0.5, color='grey', label='Non-significant')
-    
-    ax1.scatter(df[deleterious]['gene_len'],
-                df[deleterious]['deleterious_ratio'],
-                alpha=0.7, color='red', label='High ratio (p < 0.05)')
-    
-    ax1.scatter(df[protective]['gene_len'],
-                df[protective]['deleterious_ratio'],
-                alpha=0.7, color='blue', label='Low ratio (p > 0.95)')
-    
-    ax1.set_xlabel('Gene Length (bp)')
-    ax1.set_ylabel('Deleterious Mutation Ratio')
-    ax1.set_xscale('log')
-    ax1.legend()
-    
-    # Plot 2: Deleterious ratio vs average coverage
-    ax2.scatter(df[nonsig]['avg_cov'],
-                df[nonsig]['deleterious_ratio'],
-                alpha=0.5, color='grey', label='Non-significant')
-    
-    ax2.scatter(df[deleterious]['avg_cov'],
-                df[deleterious]['deleterious_ratio'],
-                alpha=0.7, color='red', label='High ratio (p < 0.05)')
-    
-    ax2.scatter(df[protective]['avg_cov'],
-                df[protective]['deleterious_ratio'],
-                alpha=0.7, color='blue', label='Low ratio (p > 0.95)')
-    
-    ax2.set_xlabel('Average Coverage')
-    ax2.set_ylabel('Deleterious Mutation Ratio')
-    ax2.set_xscale('log')
-    ax2.legend()
-    
-    plt.suptitle(f'Deleterious Ratio Relationships - {sample}')
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'{sample}_ratio_relationships.png'), 
                 dpi=300, bbox_inches='tight')
     plt.close()
 
-def process_genes(gene_set: set, high_p: bool = False, use_ratio: bool = False, pvalue_threshold: float = 0.05) -> List[Dict]:
-    """Process a set of genes to get their statistics across samples."""
-    gene_counts = []
-    comparison = operator.gt if high_p else operator.lt
-    p_threshold = 1 - pvalue_threshold if high_p else pvalue_threshold
+def list_significant_genes(df: pd.DataFrame, sample: str, output_dir: str, cache_file: str = None) -> None:
+    """List genes with significant protective and deleterious FDR-corrected p-values."""
+    # Filter out None/NaN p-values
+    df_valid = df.dropna(subset=['pvalue_more_fdr', 'pvalue_less_fdr'])
     
-    for gene in gene_set:
-        treated_count = 0
-        control_count = 0
-        total_mutations = 0
-        deleterious_mutations = 0
-        effect_scores = []
-        pvalues = []
-        ratio_pvalues = []
+    # Filter for significant deleterious and protective genes
+    significant_deleterious = df_valid[(df_valid['pvalue_more_fdr'] < 0.05) & (df_valid['effect_score'] < 0)]
+    significant_protective = df_valid[(df_valid['pvalue_less_fdr'] < 0.05) & (df_valid['effect_score'] > 0)]
+    
+    # Also get ratio-based significant genes
+    ratio_high = df_valid[df_valid['pvalue_ratio_more_fdr'] < 0.05]
+    ratio_low = df_valid[df_valid['pvalue_ratio_less_fdr'] < 0.05]
+    
+    # Add gene descriptions
+    gene_info_cache = load_gene_info_cache(cache_file) if cache_file else {}
+    
+    # Function to add gene descriptions to a dataframe
+    def add_gene_info(df_subset):
+        result_df = df_subset.copy()
+        result_df['gene_description'] = ''
         
-        # Check treated samples
-        for sample in treated_samples:
+        for i, row in result_df.iterrows():
+            gene_id = row['gene_id']
+            if str(gene_id) in gene_info_cache:
+                result_df.at[i, 'gene_description'] = gene_info_cache[str(gene_id)].get('description', '')
+            else:
+                # Try to look up if not in cache
+                gene_info = lookup_gene_info(gene_id, cache_file) if cache_file else None
+                if gene_info:
+                    result_df.at[i, 'gene_description'] = gene_info.get('description', '')
+        
+        # Select and reorder columns
+        columns = [
+            'gene_id', 
+            'gene_description', 
+            'effect_score',
+            'pvalue_more_fdr', 
+            'pvalue_less_fdr',
+            'deleterious_mutations',
+            'total_mutations',
+            'deleterious_ratio'
+        ]
+        
+        return result_df[columns]
+    
+    # Process each dataframe
+    del_df = add_gene_info(significant_deleterious)
+    prot_df = add_gene_info(significant_protective)
+    high_ratio_df = add_gene_info(ratio_high)
+    low_ratio_df = add_gene_info(ratio_low)
+    
+    # Save to CSV
+    deleterious_file = os.path.join(output_dir, f"{sample}_significant_deleterious_genes.csv")
+    protective_file = os.path.join(output_dir, f"{sample}_significant_protective_genes.csv")
+    ratio_high_file = os.path.join(output_dir, f"{sample}_significant_high_ratio_genes.csv")
+    ratio_low_file = os.path.join(output_dir, f"{sample}_significant_low_ratio_genes.csv")
+    
+    del_df.to_csv(deleterious_file, index=False)
+    prot_df.to_csv(protective_file, index=False)
+    high_ratio_df.to_csv(ratio_high_file, index=False)
+    low_ratio_df.to_csv(ratio_low_file, index=False)
+    
+    print(f"\nSignificant genes for {sample}:")
+    print(f"Deleterious genes: {len(significant_deleterious)}")
+    print(f"Protective genes: {len(significant_protective)}")
+    print(f"High ratio genes: {len(ratio_high)}")
+    print(f"Low ratio genes: {len(ratio_low)}")
+
+def generate_summary_tables(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, cache_file: str = None) -> None:
+    """Generate comprehensive summary tables of significant genes."""
+    os.makedirs(os.path.join(output_dir, "summary_tables"), exist_ok=True)
+    summary_dir = os.path.join(output_dir, "summary_tables")
+    
+    # Load gene info cache
+    gene_info_cache = load_gene_info_cache(cache_file) if cache_file else {}
+    
+    # Only consider treated samples (exclude controls, e.g., those with 'NT' in the name)
+    treated_sample_dfs = {sample: df for sample, df in sample_dfs.items() if 'NT' not in sample}
+
+    multi_sample_deleterious = {}
+    multi_sample_neutral = {}
+    multi_sample_ratio_high = {}
+    multi_sample_ratio_low = {}
+
+    for sample, df in treated_sample_dfs.items():
+        for gene_id in df[(df['pvalue_more_fdr'] < 0.05)]['gene_id']:
+            multi_sample_deleterious.setdefault(gene_id, []).append(sample)
+        for gene_id in df[(df['pvalue_less_fdr'] < 0.05)]['gene_id']:
+            multi_sample_neutral.setdefault(gene_id, []).append(sample)
+        for gene_id in df[df['pvalue_ratio_more_fdr'] < 0.05]['gene_id']:
+            multi_sample_ratio_high.setdefault(gene_id, []).append(sample)
+        for gene_id in df[df['pvalue_ratio_less_fdr'] < 0.05]['gene_id']:
+            multi_sample_ratio_low.setdefault(gene_id, []).append(sample)
+
+    def get_gene_metrics(gene_id, samples, sample_dfs, value_fields):
+        """Helper to get average metrics for a gene across samples."""
+        values = {field: [] for field in value_fields}
+        total_mutations = []
+        for sample in samples:
             df = sample_dfs[sample]
-            gene_rows = df[df['gene_id'] == gene]
-            if len(gene_rows) > 0:
-                gene_row = gene_rows.iloc[0]
-                # Use either ratio p-value or effect score p-value
-                p_val = gene_row['ratio_pvalue'] if use_ratio else gene_row['pvalue']
-                if comparison(p_val, p_threshold):
-                    treated_count += 1
-                total_mutations += gene_row['total_mutations']
-                deleterious_mutations += gene_row['deleterious_mutations']
-                effect_scores.append(gene_row['effect_score'])
-                pvalues.append(gene_row['pvalue'])
-                ratio_pvalues.append(gene_row['ratio_pvalue'])
+            row = df[df['gene_id'] == gene_id]
+            if not row.empty:
+                for field in value_fields:
+                    val = row.iloc[0][field]
+                    if pd.notnull(val):
+                        values[field].append(val)
+                # Collect total_mutations for this gene/sample
+                tm = row.iloc[0].get('total_mutations', None)
+                if pd.notnull(tm):
+                    total_mutations.append(tm)
+        # Compute averages
+        avg = {f'avg_{field}': np.mean(values[field]) if values[field] else np.nan for field in value_fields}
+        avg['avg_total_mutations'] = np.mean(total_mutations) if total_mutations else np.nan
+        return avg
+
+    def write_multi_sample_table(gene_dict, filename, gene_info_cache, sample_dfs, value_fields):
+        rows = []
+        for gene_id, samples in gene_dict.items():
+            row = {
+                'gene_id': gene_id,
+                'num_samples': len(samples),
+            }
+            if gene_info_cache and gene_id in gene_info_cache:
+                row['gene_name'] = gene_info_cache[gene_id].get('name', '')
+                row['gene_description'] = gene_info_cache[gene_id].get('description', '')
+            avg_metrics = get_gene_metrics(gene_id, samples, sample_dfs, value_fields)
+            row.update(avg_metrics)
+            rows.append(row)
+        if rows:
+            df = pd.DataFrame(rows)
+            df = df.sort_values('num_samples', ascending=False)
+            df.to_csv(os.path.join(summary_dir, filename), index=False)
+            print(f"Multi-sample summary table written: {filename} ({len(df)} genes)")
+
+    # Write tables with appropriate value fields, using only treated_sample_dfs
+    write_multi_sample_table(
+        multi_sample_deleterious, "multi_sample_deleterious_effect.csv", gene_info_cache, treated_sample_dfs,
+        value_fields=['effect_score', 'pvalue_more_fdr']
+    )
+    write_multi_sample_table(
+        multi_sample_neutral, "multi_sample_neutral_effect.csv", gene_info_cache, treated_sample_dfs,
+        value_fields=['effect_score', 'pvalue_less_fdr']
+    )
+    write_multi_sample_table(
+        multi_sample_ratio_high, "multi_sample_high_ratio.csv", gene_info_cache, treated_sample_dfs,
+        value_fields=['deleterious_ratio', 'pvalue_ratio_more_fdr']
+    )
+    write_multi_sample_table(
+        multi_sample_ratio_low, "multi_sample_low_ratio.csv", gene_info_cache, treated_sample_dfs,
+        value_fields=['deleterious_ratio', 'pvalue_ratio_less_fdr']
+    )
+
+def create_pvalue_distribution_plots(sample_dfs: Dict[str, pd.DataFrame], output_dir: str) -> None:
+    """Create multi-panel distribution plots for p-values."""
+    # Create output directory
+    dist_plot_dir = os.path.join(output_dir, "distribution_plots")
+    os.makedirs(dist_plot_dir, exist_ok=True)
+    
+    # Collect p-values from all samples
+    control_pvals = {
+        'effect_more': [],
+        'effect_less': [],
+        'effect_more_fdr': [],
+        'effect_less_fdr': [],
+        'ratio_more': [],
+        'ratio_less': [],
+        'ratio_more_fdr': [],
+        'ratio_less_fdr': []
+    }
+    
+    treated_pvals = {
+        'effect_more': [],
+        'effect_less': [],
+        'effect_more_fdr': [],
+        'effect_less_fdr': [],
+        'ratio_more': [],
+        'ratio_less': [],
+        'ratio_more_fdr': [],
+        'ratio_less_fdr': []
+    }
+    
+    # Collect p-values from all samples
+    for sample, df in sample_dfs.items():
+        target_dict = control_pvals if 'NT' in sample else treated_pvals
         
-        # Check control samples
-        for sample in control_samples:
-            df = sample_dfs[sample]
-            gene_rows = df[df['gene_id'] == gene]
-            if len(gene_rows) > 0:
-                gene_row = gene_rows.iloc[0]
-                p_val = gene_row['ratio_pvalue'] if use_ratio else gene_row['pvalue']
-                if comparison(p_val, p_threshold):
-                    control_count += 1
+        # Filter out NaN values
+        df_valid = df.dropna(subset=['pvalue_more', 'pvalue_less', 'pvalue_ratio_more', 'pvalue_ratio_less'])
         
-        # Calculate averages
-        mean_effect = np.mean(effect_scores) if effect_scores else 0
-        mean_pvalue = np.mean(ratio_pvalues if use_ratio else pvalues) if pvalues else 1.0
-        deleterious_ratio = deleterious_mutations / total_mutations if total_mutations > 0 else 0
+        # Add p-values to the appropriate lists
+        target_dict['effect_more'].extend(df_valid['pvalue_more'].values)
+        target_dict['effect_less'].extend(df_valid['pvalue_less'].values)
+        target_dict['ratio_more'].extend(df_valid['pvalue_ratio_more'].values)
+        target_dict['ratio_less'].extend(df_valid['pvalue_ratio_less'].values)
         
-        # Get gene description
-        gene_description = gene_info.get(str(gene), {}).get('description', '')
+        # Add FDR corrected p-values
+        if 'pvalue_more_fdr' in df_valid.columns:
+            target_dict['effect_more_fdr'].extend(df_valid['pvalue_more_fdr'].values)
+        if 'pvalue_less_fdr' in df_valid.columns:
+            target_dict['effect_less_fdr'].extend(df_valid['pvalue_less_fdr'].values)
+        if 'pvalue_ratio_more_fdr' in df_valid.columns:
+            target_dict['ratio_more_fdr'].extend(df_valid['pvalue_ratio_more_fdr'].values)
+        if 'pvalue_ratio_less_fdr' in df_valid.columns:
+            target_dict['ratio_less_fdr'].extend(df_valid['pvalue_ratio_less_fdr'].values)
+    
+    # Create multi-panel figure
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    bins = np.linspace(0, 1, 51)  # 50 bins from 0 to 1
+    
+    # Plot titles and data
+    plot_configs = [
+        # Row 1: Raw p-values
+        {'ax': axes[0, 0], 'data': [control_pvals['effect_more'], treated_pvals['effect_more']], 
+         'title': 'Effect Score (More Deleterious)'},
+        {'ax': axes[0, 1], 'data': [control_pvals['effect_less'], treated_pvals['effect_less']], 
+         'title': 'Effect Score (Less Deleterious)'},
+        {'ax': axes[0, 2], 'data': [control_pvals['ratio_more'], treated_pvals['ratio_more']], 
+         'title': 'Deleterious Ratio (More)'},
+        {'ax': axes[0, 3], 'data': [control_pvals['ratio_less'], treated_pvals['ratio_less']], 
+         'title': 'Deleterious Ratio (Less)'},
         
-        gene_counts.append({
-            'gene_id': gene,
-            'gene_description': gene_description,
-            'treated_samples_significant': treated_count,
-            'control_samples_significant': control_count,
-            'total_samples_significant': treated_count + control_count,
-            'total_mutations': total_mutations,
-            'deleterious_mutations': deleterious_mutations,
-            'deleterious_ratio': deleterious_ratio,
-            'mean_effect_score': mean_effect,
-            'mean_pvalue': mean_pvalue
-        })
-    return gene_counts
+        # Row 2: FDR corrected p-values
+        {'ax': axes[1, 0], 'data': [control_pvals['effect_more_fdr'], treated_pvals['effect_more_fdr']], 
+         'title': 'Effect Score (More) - FDR Corrected'},
+        {'ax': axes[1, 1], 'data': [control_pvals['effect_less_fdr'], treated_pvals['effect_less_fdr']], 
+         'title': 'Effect Score (Less) - FDR Corrected'},
+        {'ax': axes[1, 2], 'data': [control_pvals['ratio_more_fdr'], treated_pvals['ratio_more_fdr']], 
+         'title': 'Deleterious Ratio (More) - FDR Corrected'},
+        {'ax': axes[1, 3], 'data': [control_pvals['ratio_less_fdr'], treated_pvals['ratio_less_fdr']], 
+         'title': 'Deleterious Ratio (Less) - FDR Corrected'}
+    ]
+    
+    # Create each subplot
+    for config in plot_configs:
+        ax = config['ax']
+        ax.hist(config['data'], bins=bins, 
+                label=['Control', 'EMS Treated'],
+                stacked=True, alpha=0.7,
+                color=['lightgrey', 'darkorange'])
+        
+        # Add significance threshold line
+        ax.axvline(x=0.05, color='r', linestyle='--', alpha=0.5)
+        
+        ax.set_title(config['title'])
+        ax.set_xlabel('p-value')
+        ax.set_ylabel('Count')
+    
+    # Add a single legend for the entire figure
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=2)
+    
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    plt.suptitle('P-value Distributions Across Samples', fontsize=16)
+    
+    # Save the figure
+    plt.savefig(os.path.join(dist_plot_dir, 'pvalue_distributions.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Also create individual plots for each p-value type
+    for pval_type in ['effect_more', 'effect_less', 'ratio_more', 'ratio_less']:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        
+        # Raw p-values
+        ax1.hist([control_pvals[pval_type], treated_pvals[pval_type]], 
+                bins=bins, label=['Control', 'EMS Treated'],
+                stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+        ax1.axvline(x=0.05, color='r', linestyle='--', alpha=0.5)
+        ax1.set_title(f'{pval_type.replace("_", " ").title()} - Raw')
+        ax1.set_xlabel('p-value')
+        ax1.set_ylabel('Count')
+        
+        # FDR corrected p-values
+        ax2.hist([control_pvals[f'{pval_type}_fdr'], treated_pvals[f'{pval_type}_fdr']], 
+                bins=bins, label=['Control', 'EMS Treated'],
+                stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+        ax2.axvline(x=0.05, color='r', linestyle='--', alpha=0.5)
+        ax2.set_title(f'{pval_type.replace("_", " ").title()} - FDR Corrected')
+        ax2.set_xlabel('p-value')
+        ax2.set_ylabel('Count')
+        
+        # Add legend
+        handles, labels = ax1.get_legend_handles_labels()
+        fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0), ncol=2)
+        
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+        plt.savefig(os.path.join(dist_plot_dir, f'{pval_type}_distribution.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    print(f"P-value distribution plots saved to: {dist_plot_dir}")
+
+def load_gene_lengths(gff_path: str) -> Dict[str, int]:
+    """Load gene lengths from GFF file into a lookup dictionary."""
+    gene_lengths = {}
+    try:
+        with open(gff_path) as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                parts = line.strip().split('\t')
+                if len(parts) < 9 or parts[2] != 'gene':
+                    continue
+                    
+                # Calculate gene length
+                start = int(parts[3])
+                end = int(parts[4])
+                length = end - start + 1
+                
+                # Extract gene ID from attributes
+                attrs = dict(attr.split('=') for attr in parts[8].split(';') if '=' in attr)
+                dbxref = attrs.get('Dbxref', '')
+                if 'GeneID:' in dbxref:
+                    gene_id = dbxref.split('GeneID:')[1]
+                    gene_lengths[gene_id] = length
+                    
+        return gene_lengths
+    except Exception as e:
+        print(f"Error loading GFF file: {e}")
+        return {}
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze PROVEAN score results')
@@ -873,17 +1075,17 @@ def main():
     with open(args.config) as f:
         config = yaml.safe_load(f)
     
+    # Load gene lengths from GFF
+    gene_lengths = load_gene_lengths(config['references']['annotation'])
+    
     # Get cache path from config
     cache_file = config['references']['gene_info_cache']
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Load all sample results
-    sample_dfs = load_sample_results(args.results_dir)
-    
-    # Create combined p-value distribution plot
-    plot_combined_pvalue_density(sample_dfs, args.output_dir)
+    # Load all sample results with gene lengths
+    sample_dfs = load_sample_results(args.results_dir, gene_lengths)
     
     # First analyze each sample to get gene descriptions
     samples_with_info = {}
@@ -891,8 +1093,8 @@ def main():
         print(f"Analyzing sample: {sample}")
         sample_dir = os.path.join(args.output_dir, sample)
         os.makedirs(sample_dir, exist_ok=True)
-        analyze_sample(df, sample, sample_dir, cache_file)
-        samples_with_info[sample] = df  # Store the original DataFrame
+        analyze_sample(df, sample, sample_dir, cache_file, gene_lengths)
+        samples_with_info[sample] = df
     
     # Now do shared gene analysis
     if samples_with_info:
@@ -903,6 +1105,20 @@ def main():
     
     # Create significance counts
     create_significance_counts(samples_with_info, args.output_dir, cache_file=cache_file)
+    
+    # Compare scoring methods
+    for sample, df in samples_with_info.items():
+        compare_scoring_methods(df, gene_lengths, sample, args.output_dir)
+    
+    # List significant genes
+    for sample, df in samples_with_info.items():
+        list_significant_genes(df, sample, args.output_dir, cache_file)
+    
+    # Generate comprehensive summary tables
+    generate_summary_tables(samples_with_info, args.output_dir, cache_file)
+    
+    # Create p-value distribution plots
+    create_pvalue_distribution_plots(samples_with_info, args.output_dir)
     
     print("Analysis complete!")
 

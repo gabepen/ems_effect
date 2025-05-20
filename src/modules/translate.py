@@ -525,9 +525,11 @@ def convert_mutations(
             
         if err != 0:
             if err == 1:
-                print('Conversion Error: No start codon in gene: ' + key)
+                #print('Conversion Error: No start codon in gene: ' + key)
+                pass
             if err == 2: 
-                print('Conversion Error: ref does not match at bp  ' + str(aa_muts) + ' in gene: ' + key)
+                #print('Conversion Error: ref does not match at bp  ' + str(aa_muts) + ' in gene: ' + key)
+                pass
             continue
             
         # Store amino acid mutations in new dictionary
