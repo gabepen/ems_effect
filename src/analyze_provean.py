@@ -16,6 +16,14 @@ import operator
 from statsmodels.stats.multitest import multipletests
 import pdb
 import matplotlib.gridspec as gridspec
+from scipy.stats import percentileofscore
+import ast
+
+GENES_TO_PLOT = [
+    "41335124", "29555075", "31757195", "29554674", "29554693", "31757218", "29555114", "31757237",
+    "31757232", "29555619", "29554888", "29554610", "29554932", "34927831", "29555250", "29555648",
+    "29554868", "29555727", "29554605", "31757314", "29555479", "31757306", "29555464"
+]
 
 def load_gene_info_cache(cache_file: str) -> Dict[str, Dict]:
     """Load cached gene info from JSON file."""
@@ -81,7 +89,7 @@ def lookup_gene_info(ncbi_id: str, cache_file: str = "gene_info_cache.json") -> 
     
     return None
 
-def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[str, pd.DataFrame]:
+def load_sample_results(results_dir: str, gene_lengths: Dict[str, int], output_dir: str) -> Dict[str, pd.DataFrame]:
     """Load all sample results and convert to DataFrames."""
     sample_dfs = {}
     
@@ -93,10 +101,10 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[
         # Convert to DataFrame
         rows = []
         for gene_id, values in data.items():
+            
             # Calculate p-value (two-tailed) for effect score
             perm_scores = values['permutation']['scores']
             effect_score = values['effect']
-            
             if len(perm_scores) <= 10:
                 pvalue_more = None
                 pvalue_less = None
@@ -108,6 +116,7 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[
                 deleterious_ratio = values.get('mutation_stats', {}).get('deleterious_count', 0) / values.get('mutation_stats', {}).get('total_mutations', 0)
                 perm_ratios = [r / values['mutation_stats']['total_mutations'] for r in values['permutation']['deleterious_counts']]
                 pvalue_ratio_more, pvalue_ratio_less = calculate_deleterious_ratio_pvalues(deleterious_ratio, perm_ratios)
+
             else:
                 deleterious_ratio = 0
                 pvalue_ratio_more = None
@@ -149,12 +158,23 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[
         
         valid_ratio_less = df['pvalue_ratio_less'].notna()
         if valid_ratio_less.any():
-            df.loc[valid_ratio_less, 'pvalue_ratio_less_fdr'] = multipletests(df.loc[valid_ratio_less, 'pvalue_ratio_less'], method='fdr_bh')[1]
+            df.loc[valid_ratio_less, 'pvalue_ratio_less_fdr'] = multipletests(df.loc[valid_ratio_less, 'pvalue_ratio_less'], method='fdr_bh')[1] 
         
         sample_dfs[sample] = df
         
     return sample_dfs
 
+def plot_deleterious_ratio_distribution(gene: str, observed_ratio: float, permuted_ratios: List[float], output_dir: str) -> None:
+    """Plot the distribution of deleterious ratios for a given gene."""
+    plt.hist(permuted_ratios, bins=30, alpha=0.7, label='Permuted')
+    plt.axvline(observed_ratio, color='red', linestyle='--', label='Observed')
+    plt.title(f'Deleterious Ratio Distribution for {gene}')
+    plt.xlabel('Deleterious Ratio')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, f'deleterious_ratio_dist_{gene}.png'))
+    plt.close()
+    
 def calculate_summed_effect_pvalue(observed_value: float, null_distribution: List[float]) -> float:
     """Calculate proper two-tailed empirical p-value.
     
@@ -1085,7 +1105,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load all sample results with gene lengths
-    sample_dfs = load_sample_results(args.results_dir, gene_lengths)
+    sample_dfs = load_sample_results(args.results_dir, gene_lengths, args.output_dir)
     
     # First analyze each sample to get gene descriptions
     samples_with_info = {}
@@ -1094,6 +1114,7 @@ def main():
         sample_dir = os.path.join(args.output_dir, sample)
         os.makedirs(sample_dir, exist_ok=True)
         analyze_sample(df, sample, sample_dir, cache_file, gene_lengths)
+        df.to_csv(os.path.join(sample_dir, "results_with_percentiles.csv"), index=False)
         samples_with_info[sample] = df
     
     # Now do shared gene analysis

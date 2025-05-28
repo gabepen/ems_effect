@@ -63,7 +63,8 @@ def plot_kmer_context(data_dict: dict, genome_kmer_counts: dict, output_dir: str
     '''Plot the kmer context barplot.
     
     Args:
-        data_dict (dict): Dictionary of kmer context data
+        data_dict (dict): Dictionary of kmer context data per sample
+        genome_kmer_counts (dict): Dictionary of genome-wide kmer counts
         output_dir (str): Directory to save output plot
     '''
     
@@ -76,19 +77,32 @@ def plot_kmer_context(data_dict: dict, genome_kmer_counts: dict, output_dir: str
     
     # normalize and average the observed kmer rate across all treated samples
     for sample in data_dict:
-        if 'EMS' in sample:
+        if 'EMS' in sample and 'normalized_analysis' not in sample:
             ems_samples.append(sample)
-            for kmer in data_dict[sample]:
-                if kmer not in observed_kmers:
-                    observed_kmers[kmer] = data_dict[sample][kmer] / genome_kmer_counts[kmer]
+            # Use the normalized analysis if available
+            sample_data = data_dict[sample].get('normalized_analysis', data_dict[sample])
+            
+            for kmer in sample_data:
+                if isinstance(sample_data[kmer], dict) and 'normalized_frequency' in sample_data[kmer]:
+                    # Use pre-calculated normalized frequency
+                    freq = sample_data[kmer]['normalized_frequency']
                 else:
-                    observed_kmers[kmer] += data_dict[sample][kmer] / genome_kmer_counts[kmer] 
+                    # Fall back to manual calculation
+                    if kmer in genome_kmer_counts:
+                        freq = sample_data[kmer] / genome_kmer_counts[kmer]
+                    else:
+                        continue
+                
+                if kmer not in observed_kmers:
+                    observed_kmers[kmer] = freq
+                else:
+                    observed_kmers[kmer] += freq
                      
     for kmer in observed_kmers:
         observed_kmers[kmer] = observed_kmers[kmer] / len(ems_samples)
             
     # plot the kmer context barplot 
-    # Sort kmers by count and get top 10
+    # Sort kmers by count and get top 30
     top_kmers = dict(sorted(observed_kmers.items(), key=lambda x: x[1], reverse=True)[:30])
     
     # Create figure and axis
@@ -99,15 +113,15 @@ def plot_kmer_context(data_dict: dict, genome_kmer_counts: dict, output_dir: str
     
     # Customize plot
     plt.xlabel('Kmer Context')
-    plt.ylabel('Frequency')
-    plt.title('Top 30 Most Frequent Kmer Contexts')
+    plt.ylabel('Normalized Frequency')
+    plt.title('Top 30 Most Frequent Kmer Contexts (EMS Samples)')
     plt.xticks(rotation=45, ha='right')
     
     # Adjust layout and save
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
 def extract_sample_id(sample):
     '''Extract abbreviated sample ID from full sample name.
     
@@ -301,35 +315,47 @@ def plot_ems_mutation_frequencies_seaborn(data_path: str, output_dir: str) -> No
     # Save the plot to a file
     plt.savefig(output_path, dpi=300, pad_inches=0.1)
 
-def normalize_mutation_counts(total_freqs: dict, base_counts: dict, output_file_dir: str) -> str:
-    '''Normalize mutation counts by total reference base counts and write to CSV.
+def normalize_mutation_counts(total_freqs: dict, base_counts: dict, output_dir: str) -> str:
+    '''Normalize mutation counts by base counts and save to CSV.
     
     Args:
         total_freqs (dict): Dictionary of mutation frequencies per sample
-        base_counts (dict): Dictionary of total base counts per sample from basecounts.json
-        output_file_dir (str): Directory to write output CSV
+        base_counts (dict): Dictionary of genome-wide base counts {'A': count, 'T': count, ...}
+        output_dir (str): Directory to save output CSV
         
     Returns:
-        str: Path to output CSV file
+        str: Path to the saved CSV file
     '''
-    output_file = os.path.join(output_file_dir, 'normalized_ems_mutations_freqs.csv')
-    header = ['sample','ems','norm_count','mutation']
     
-    with open(output_file, 'w') as csvf:
-        writer = csv.writer(csvf)
-        writer.writerow(header)
-        for sample in total_freqs:
-            if 'NT' in sample or 'Minus' in sample or 'Pre' in sample:
-                ems = '-'
-            else:
-                ems = '+'
-            for mut_type in total_freqs[sample]:
-                ref = mut_type[0]  # Get reference base from mutation type
-                # Normalize by total count of reference base from basecounts
-                norm_freq = total_freqs[sample][mut_type] / base_counts[sample][ref]
-                writer.writerow([sample, ems, norm_freq, mut_type])
+    output_path = os.path.join(output_dir, 'mutation_frequencies.csv')
     
-    return output_file
+    # Prepare data for CSV
+    csv_data = []
+    
+    for sample in total_freqs:
+        # Determine if sample is EMS treated
+        ems_status = '+' if 'EMS' in sample else '-'
+        
+        for mut_type in total_freqs[sample]:
+            if '>' in mut_type:
+                ref = mut_type.split('>')[0]
+                if ref in base_counts:
+                    # Normalize by genome-wide base count
+                    norm_freq = total_freqs[sample][mut_type] / base_counts[ref]
+                    
+                    csv_data.append({
+                        'sample': sample,
+                        'mutation': mut_type,
+                        'count': total_freqs[sample][mut_type],
+                        'norm_count': norm_freq,
+                        'ems': ems_status
+                    })
+    
+    # Save to CSV
+    df = pd.DataFrame(csv_data)
+    df.to_csv(output_path, index=False)
+    
+    return output_path
 
 def plot_dnds_ratio(amino_acid_mutations, output_dir, sample_name):
     '''Plot dN/dS ratio relationships.
@@ -382,23 +408,24 @@ def plot_dnds_ratio(amino_acid_mutations, output_dir, sample_name):
     plt.savefig(os.path.join(output_dir, f'dnds_relationships_{sample_name}.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
-def mutation_type_barplot(json_file_dir: list, base_counts: dict, output_file_dir: str):
-    '''Generate mutation type frequency barplot using basecounts for normalization.
+def mutation_type_barplot(json_files: list, base_counts: dict, output_dir: str) -> None:
+    '''Generate mutation type frequency barplot.
     
     Args:
-        json_file_dir (list): List of paths to mutation JSON files
-        base_counts (dict): Dictionary of total base counts per sample
-        output_file_dir (str): Directory to write output files
+        json_files (list): List of paths to mutation JSON files
+        base_counts (dict): Dictionary of genome-wide base counts {'A': count, 'T': count, ...}
+        output_dir (str): Directory to save output plot
     '''
-    # Count mutation frequencies
-    total_frequencies = count_mutations(json_file_dir)
     
-    # Normalize using provided base counts
-    mutation_frequence_csv = normalize_mutation_counts(total_frequencies, base_counts, output_file_dir)
+    # Count mutations across all samples
+    total_freqs = count_mutations(json_files)
     
-    # Generate plot
-    plot_ems_mutation_frequencies(mutation_frequence_csv, output_file_dir)
-    plot_ems_mutation_frequencies_per_sample(mutation_frequence_csv, output_file_dir)   
+    # Normalize using provided base counts and generate CSV
+    mutation_frequency_csv = normalize_mutation_counts(total_freqs, base_counts, output_dir)
+    
+    # Generate plots using the CSV
+    plot_ems_mutation_frequencies(mutation_frequency_csv, output_dir)
+    plot_ems_mutation_frequencies_per_sample(mutation_frequency_csv, output_dir)
 
 def plot_combined_dnds_ratios(aa_mutations_files: list, output_dir: str) -> None:
     """Plot combined dN/dS ratio analysis."""
@@ -758,6 +785,386 @@ def plot_per_gene_dnds(results_dir: str, output_dir: str) -> None:
                 plt.savefig(f"{output_dir}/per_gene_dnds_{sample_name}.png", dpi=300, bbox_inches='tight')
                 plt.close()
 
+def plot_normalized_kmer_context_per_sample(context_counts: dict, output_dir: str) -> None:
+    '''Plot normalized kmer context for each sample.
+    
+    Args:
+        context_counts (dict): Dictionary containing context counts and normalized analysis
+        output_dir (str): Directory to save output plot
+    '''
+    output_path = os.path.join(output_dir, 'normalized_kmer_context_per_sample.png')
+    
+    # Extract normalized data for each sample
+    sample_data = {}
+    all_kmers = set()
+    
+    for sample, data in context_counts.items():
+        if 'normalized_analysis' in data:
+            sample_data[sample] = {}
+            for kmer, kmer_data in data['normalized_analysis'].items():
+                normalized_freq = kmer_data['normalized_frequency']
+                sample_data[sample][kmer] = normalized_freq
+                all_kmers.add(kmer)
+    
+    if not sample_data:
+        print("No normalized kmer data found")
+        return
+    
+    # Get top 20 most variable kmers across all samples
+    kmer_variances = {}
+    for kmer in all_kmers:
+        values = [sample_data[sample].get(kmer, 0) for sample in sample_data]
+        if len(values) > 1:
+            kmer_variances[kmer] = np.var(values)
+    
+    top_kmers = sorted(kmer_variances.items(), key=lambda x: x[1], reverse=True)[:20]
+    top_kmer_names = [kmer for kmer, _ in top_kmers]
+    
+    # Separate EMS and control samples
+    ems_samples = [s for s in sample_data.keys() if 'EMS' in s]
+    control_samples = [s for s in sample_data.keys() if 'EMS' not in s]
+    
+    # Create figure with subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+    
+    # Plot 1: Heatmap of top variable kmers
+    # Prepare data matrix
+    plot_data = []
+    sample_labels = []
+    
+    # Add control samples first
+    for sample in control_samples:
+        row = [sample_data[sample].get(kmer, 0) for kmer in top_kmer_names]
+        plot_data.append(row)
+        sample_labels.append(extract_sample_id(sample))
+    
+    # Add EMS samples
+    for sample in ems_samples:
+        row = [sample_data[sample].get(kmer, 0) for kmer in top_kmer_names]
+        plot_data.append(row)
+        sample_labels.append(extract_sample_id(sample))
+    
+    # Create heatmap
+    im = ax1.imshow(plot_data, cmap='RdYlBu_r', aspect='auto')
+    ax1.set_xticks(range(len(top_kmer_names)))
+    ax1.set_xticklabels(top_kmer_names, rotation=45, ha='right')
+    ax1.set_yticks(range(len(sample_labels)))
+    ax1.set_yticklabels(sample_labels)
+    ax1.set_title('Normalized Kmer Context Frequencies (Top 20 Most Variable)')
+    ax1.set_xlabel('Kmer Context')
+    ax1.set_ylabel('Sample')
+    
+    # Add colorbar
+    plt.colorbar(im, ax=ax1, label='Normalized Frequency')
+    
+    # Add separator line between controls and EMS samples
+    if control_samples:
+        ax1.axhline(y=len(control_samples)-0.5, color='black', linewidth=2)
+    
+    # Plot 2: Average normalized frequencies for EMS vs Control
+    if control_samples and ems_samples:
+        control_means = {}
+        ems_means = {}
+        
+        for kmer in top_kmer_names:
+            control_values = [sample_data[sample].get(kmer, 0) for sample in control_samples]
+            ems_values = [sample_data[sample].get(kmer, 0) for sample in ems_samples]
+            
+            control_means[kmer] = np.mean(control_values)
+            ems_means[kmer] = np.mean(ems_values)
+        
+        x = np.arange(len(top_kmer_names))
+        width = 0.35
+        
+        ax2.bar(x - width/2, [control_means[k] for k in top_kmer_names], 
+                width, label='Control', color='lightgray', alpha=0.7)
+        ax2.bar(x + width/2, [ems_means[k] for k in top_kmer_names], 
+                width, label='EMS Treated', color='darkorange', alpha=0.7)
+        
+        ax2.set_xlabel('Kmer Context')
+        ax2.set_ylabel('Mean Normalized Frequency')
+        ax2.set_title('Average Normalized Kmer Frequencies: Control vs EMS')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(top_kmer_names, rotation=45, ha='right')
+        ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_kmer_enrichment_analysis(context_counts: dict, output_dir: str) -> None:
+    '''Plot kmer enrichment analysis comparing EMS vs control samples.
+    
+    Args:
+        context_counts (dict): Dictionary containing context counts and normalized analysis
+        output_dir (str): Directory to save output plot
+    '''
+    output_path = os.path.join(output_dir, 'kmer_enrichment_analysis.png')
+    
+    # Extract normalized data
+    ems_data = {}
+    control_data = {}
+    
+    for sample, data in context_counts.items():
+        if 'normalized_analysis' in data:
+            sample_kmers = {}
+            for kmer, kmer_data in data['normalized_analysis'].items():
+                sample_kmers[kmer] = kmer_data['normalized_frequency']
+            
+            if 'EMS' in sample:
+                ems_data[sample] = sample_kmers
+            else:
+                control_data[sample] = sample_kmers
+    
+    if not ems_data or not control_data:
+        print("Insufficient data for enrichment analysis")
+        return
+    
+    # Calculate fold changes and significance
+    all_kmers = set()
+    for sample_data in list(ems_data.values()) + list(control_data.values()):
+        all_kmers.update(sample_data.keys())
+    
+    enrichment_data = []
+    
+    for kmer in all_kmers:
+        # Get values for each group
+        ems_values = [ems_data[sample].get(kmer, 0) for sample in ems_data]
+        control_values = [control_data[sample].get(kmer, 0) for sample in control_data]
+        
+        # Calculate means
+        ems_mean = np.mean(ems_values)
+        control_mean = np.mean(control_values)
+        
+        # Calculate fold change (with pseudocount to avoid division by zero)
+        pseudocount = 0.001
+        fold_change = (ems_mean + pseudocount) / (control_mean + pseudocount)
+        log2_fold_change = np.log2(fold_change)
+        
+        # Perform t-test if we have enough samples
+        if len(ems_values) > 1 and len(control_values) > 1:
+            from scipy import stats
+            _, p_value = stats.ttest_ind(ems_values, control_values)
+        else:
+            p_value = 1.0
+        
+        enrichment_data.append({
+            'kmer': kmer,
+            'ems_mean': ems_mean,
+            'control_mean': control_mean,
+            'fold_change': fold_change,
+            'log2_fold_change': log2_fold_change,
+            'p_value': p_value
+        })
+    
+    # Sort by absolute fold change
+    enrichment_data.sort(key=lambda x: abs(x['log2_fold_change']), reverse=True)
+    
+    # Create volcano plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Volcano plot
+    log2_fc = [d['log2_fold_change'] for d in enrichment_data]
+    neg_log10_p = [-np.log10(max(d['p_value'], 1e-10)) for d in enrichment_data]
+    
+    # Color points based on significance and fold change
+    colors = []
+    for d in enrichment_data:
+        if d['p_value'] < 0.05 and abs(d['log2_fold_change']) > 0.5:
+            if d['log2_fold_change'] > 0:
+                colors.append('red')  # Enriched in EMS
+            else:
+                colors.append('blue')  # Depleted in EMS
+        else:
+            colors.append('gray')  # Not significant
+    
+    ax1.scatter(log2_fc, neg_log10_p, c=colors, alpha=0.6)
+    ax1.axvline(x=0, color='black', linestyle='--', alpha=0.5)
+    ax1.axhline(y=-np.log10(0.05), color='black', linestyle='--', alpha=0.5)
+    ax1.set_xlabel('Log2 Fold Change (EMS/Control)')
+    ax1.set_ylabel('-Log10 P-value')
+    ax1.set_title('Kmer Enrichment Volcano Plot')
+    
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='red', label='Enriched in EMS'),
+        Patch(facecolor='blue', label='Depleted in EMS'),
+        Patch(facecolor='gray', label='Not significant')
+    ]
+    ax1.legend(handles=legend_elements)
+    
+    # Bar plot of top enriched/depleted kmers
+    top_n = 15
+    top_enriched = [d for d in enrichment_data if d['log2_fold_change'] > 0][:top_n//2]
+    top_depleted = [d for d in enrichment_data if d['log2_fold_change'] < 0][:top_n//2]
+    top_kmers = top_enriched + top_depleted
+    
+    if top_kmers:
+        kmer_names = [d['kmer'] for d in top_kmers]
+        fold_changes = [d['log2_fold_change'] for d in top_kmers]
+        bar_colors = ['red' if fc > 0 else 'blue' for fc in fold_changes]
+        
+        y_pos = np.arange(len(kmer_names))
+        ax2.barh(y_pos, fold_changes, color=bar_colors, alpha=0.7)
+        ax2.set_yticks(y_pos)
+        ax2.set_yticklabels(kmer_names)
+        ax2.set_xlabel('Log2 Fold Change (EMS/Control)')
+        ax2.set_title('Top Enriched/Depleted Kmers')
+        ax2.axvline(x=0, color='black', linestyle='-', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_aggregate_mutation_frequencies(normalized_rates: dict, output_dir: str) -> None:
+    '''Plot aggregate mutation frequencies across treatment groups.'''
+    
+    output_path = os.path.join(output_dir, 'mutation_frequency_aggregate.png')
+    
+    # Create DataFrame for plotting
+    plot_data = []
+    for sample in normalized_rates:
+        sample_id = extract_sample_id(sample)
+        for mutation_type in normalized_rates[sample]:
+            plot_data.append({
+                'sample': sample_id,
+                'mutation_type': mutation_type,
+                'rate': normalized_rates[sample][mutation_type],
+                'treatment': 'EMS' if 'EMS' in sample else 'Control'
+            })
+    
+    if not plot_data:
+        print("No mutation data found for plotting")
+        return
+        
+    df = pd.DataFrame(plot_data)
+    
+    # Create the plot
+    plt.figure(figsize=(12, 8))
+    
+    # Filter for main mutation types
+    main_mutations = ['C>T', 'G>A', 'A>G', 'T>C', 'A>T', 'T>A', 'C>G', 'G>C']
+    df_filtered = df[df['mutation_type'].isin(main_mutations)]
+    
+    if df_filtered.empty:
+        print("No main mutation types found for plotting")
+        return
+    
+    # Create grouped bar plot
+    sns.barplot(data=df_filtered, x='mutation_type', y='rate', hue='treatment', 
+                palette=['orange', 'blue'], alpha=0.8)
+    
+    plt.title('Mutation Rates by Type and Treatment (Aggregate)')
+    plt.xlabel('Mutation Type')
+    plt.ylabel('Normalized Mutation Rate')
+    plt.xticks(rotation=45)
+    plt.legend(title='Treatment')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Aggregate mutation frequency plot saved to {output_path}")
+
+def plot_per_sample_mutation_frequencies(normalized_rates: dict, output_dir: str) -> None:
+    '''Plot mutation frequencies for each individual sample.'''
+    
+    output_path = os.path.join(output_dir, 'mutation_frequency_per_sample.png')
+    
+    # Create DataFrame for plotting
+    plot_data = []
+    for sample in normalized_rates:
+        sample_id = extract_sample_id(sample)
+        for mutation_type in normalized_rates[sample]:
+            plot_data.append({
+                'sample': sample_id,
+                'mutation_type': mutation_type,
+                'rate': normalized_rates[sample][mutation_type],
+                'treatment': 'EMS' if 'EMS' in sample else 'Control'
+            })
+    
+    if not plot_data:
+        print("No mutation data found for plotting")
+        return
+        
+    df = pd.DataFrame(plot_data)
+    
+    # Filter for main mutation types
+    main_mutations = ['C>T', 'G>A', 'A>G', 'T>C', 'A>T', 'T>A', 'C>G', 'G>C']
+    df_filtered = df[df['mutation_type'].isin(main_mutations)]
+    
+    if df_filtered.empty:
+        print("No main mutation types found for plotting")
+        return
+    
+    # Create a single plot with samples on x-axis and mutation types as different colors
+    plt.figure(figsize=(16, 8))
+    
+    # Create grouped bar plot with samples on x-axis and mutation types as hue
+    sns.barplot(data=df_filtered, x='sample', y='rate', hue='mutation_type', 
+                palette='Set2', alpha=0.8)
+    
+    plt.title('Mutation Rates by Sample and Type')
+    plt.xlabel('Sample')
+    plt.ylabel('Normalized Mutation Rate')
+    plt.xticks(rotation=45, ha='right')
+    plt.legend(title='Mutation Type', bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    # Add treatment group annotations
+    ax = plt.gca()
+    sample_names = df_filtered['sample'].unique()
+    for i, sample in enumerate(sample_names):
+        treatment = 'EMS' if any('EMS' in s for s in normalized_rates.keys() if extract_sample_id(s) == sample) else 'Control'
+        color = 'orange' if treatment == 'EMS' else 'blue'
+        ax.text(i, -0.05 * ax.get_ylim()[1], treatment, ha='center', va='top', 
+                color=color, fontweight='bold', transform=ax.get_xaxis_transform())
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Per-sample mutation frequency plot saved to {output_path}")
+
+def plot_ems_mutation_frequencies_heatmap(normalized_rates: dict, output_dir: str) -> None:
+    '''Create a heatmap of mutation frequencies across samples.'''
+    
+    output_path = os.path.join(output_dir, 'mutation_frequency_heatmap.png')
+    
+    # Prepare data for heatmap
+    samples = list(normalized_rates.keys())
+    mutation_types = ['C>T', 'G>A', 'A>G', 'T>C', 'A>T', 'T>A', 'C>G', 'G>C']
+    
+    # Create matrix
+    matrix_data = []
+    sample_labels = []
+    
+    for sample in samples:
+        sample_id = extract_sample_id(sample)
+        sample_labels.append(sample_id)
+        row = []
+        for mut_type in mutation_types:
+            rate = normalized_rates[sample].get(mut_type, 0)
+            row.append(rate)
+        matrix_data.append(row)
+    
+    # Convert to DataFrame
+    df_heatmap = pd.DataFrame(matrix_data, index=sample_labels, columns=mutation_types)
+    
+    # Create heatmap
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(df_heatmap, annot=True, fmt='.2e', cmap='YlOrRd', 
+                cbar_kws={'label': 'Normalized Mutation Rate'})
+    
+    plt.title('Mutation Rate Heatmap Across Samples')
+    plt.xlabel('Mutation Type')
+    plt.ylabel('Sample')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Mutation frequency heatmap saved to {output_path}")
+
 def main():
     parser = argparse.ArgumentParser(description='Generate plots from analysis results')
     parser.add_argument('-r', '--results_dir', type=str, required=True,
@@ -782,11 +1189,29 @@ def main():
         if basecounts_file.exists():
             print("Generating mutation frequency plots...")
             with open(basecounts_file) as f:
-                base_counts = json.load(f)
+                base_counts = json.load(f)  # Now this is genome-wide base counts
             # Remove basecounts.json from jsons list
             jsons = [j for j in jsons if j.stem != 'basecounts']
             if jsons:  # Check if there are mutation JSONs after filtering
                 mutation_type_barplot(jsons, base_counts, args.output_dir)
+    
+    # Kmer context plots
+    contextcounts_file = results_dir / 'results' / 'contextcounts.json'
+    if contextcounts_file.exists():
+        print("Generating kmer context plots...")
+        with open(contextcounts_file) as f:
+            context_counts = json.load(f)
+        
+        # Extract genome kmer counts
+        genome_kmer_counts = context_counts.get('genome_kmer_counts', {})
+        
+        # Generate kmer plots
+        if genome_kmer_counts:
+            plot_kmer_context(context_counts, genome_kmer_counts, args.output_dir)
+            plot_normalized_kmer_context_per_sample(context_counts, args.output_dir)
+            plot_kmer_enrichment_analysis(context_counts, args.output_dir)
+        else:
+            print("Warning: No genome kmer counts found in context data")
     
     # dN/dS ratio plots - only use plot_dnds_analysis
     if args.dnds_csv and os.path.exists(args.dnds_csv):

@@ -14,9 +14,10 @@ import numpy as np
 from scipy import stats
 from tqdm import tqdm
 from Bio.Seq import Seq
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import shutil
 from collections import defaultdict
+import time
 
 # Add src to path 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -119,42 +120,72 @@ def process_mpileups(pile: str, mutpath: str, outdir: str, wolgenome: Any, ems_o
         ems_only (bool): Flag to process only EMS mutations
     '''
     piles = glob(pile + '/*_filtered.txt')
-    base_counts = {}
     context_counts = {}
-    all_intergenic = {}  # Store intergenic counts for all samples
+    all_intergenic = {}
+    
+    # Calculate genome-wide base counts once
+    genome_base_counts = calculate_genome_base_counts(wolgenome)
+    
+    # New: Statistics tracking
+    all_sample_stats = {}
+    all_gene_stats = {}
     
     for mpileup in piles: 
         sample = Path(mpileup).stem
-        base_counts[sample] = {'A':0, 'T':0, 'G':0, 'C':0}
+        # Initialize empty dict for this sample's context counts
         context_counts[sample] = {}
         
         logger.info(f"Processing {sample} mpileup")
 
-        # Process mutations and count bases/contexts
+        # Process mutations and count contexts (no longer tracking base counts per sample)
         nuc_muts, contexts, intergenic_counts = parse.parse_mpile(
             mpileup, 
             wolgenome, 
             ems_only, 
-            base_counts[sample],
+            {},  # Empty dict since we don't need per-sample base counts
             context_counts[sample]
         )
         
         # Store this sample's intergenic counts
         all_intergenic[sample] = intergenic_counts
         
+        # NEW: Calculate sample and gene statistics
+        sample_stats, gene_stats = calculate_sample_statistics(nuc_muts, sample)
+        all_sample_stats[sample] = sample_stats
+        all_gene_stats[sample] = gene_stats
+        
         # Save mutation data
         with open(f"{mutpath}/{sample}.json", 'w') as of:
             json.dump(nuc_muts, of)
     
+    # After processing all samples, normalize context counts
+    normalized_contexts = normalize_context_counts(context_counts, wolgenome)
+    
+    # Add normalized analysis to context_counts
+    for sample in normalized_contexts:
+        if sample == 'genome_kmer_counts':
+            # Add genome-wide counts directly to context_counts
+            context_counts[sample] = normalized_contexts[sample]
+        else:
+            context_counts[sample]['normalized_analysis'] = normalized_contexts[sample]
+    
     # Save summary files to main results directory
+    # Use genome-wide base counts for all samples
     with open(f"{outdir}/results/basecounts.json", 'w') as of:
-        json.dump(base_counts, of)
+        json.dump(genome_base_counts, of)
         
     with open(f"{outdir}/results/contextcounts.json", 'w') as of:
         json.dump(context_counts, of)
         
     with open(f"{outdir}/results/intergeniccounts.json", 'w') as of:
-        json.dump(all_intergenic, of)  # Save all samples' intergenic counts
+        json.dump(all_intergenic, of)
+    
+    # NEW: Save statistics tables
+    with open(f"{outdir}/results/sample_statistics.json", 'w') as of:
+        json.dump(all_sample_stats, of, indent=2)
+        
+    with open(f"{outdir}/results/gene_statistics.json", 'w') as of:
+        json.dump(all_gene_stats, of, indent=2)
 
 def process_mutations(
     nuc_mut_files: List[str],
@@ -196,12 +227,17 @@ def load_filtered_positions(sample: str, paths: Dict[str, str], mpileup_dir: str
         mpileup_dir (str): Directory containing mpileup files and filtered positions
         
     Returns:
-        Dict[str, List[int]]: Dictionary mapping gene IDs to filtered positions
+        Dict[str, List[int]]: Dictionary mapping gene IDs to 0-based relative filtered positions
     """
-    filtered_file = os.path.join(mpileup_dir, f"{sample}_positions.json")
+    filtered_file = os.path.join(mpileup_dir, f"{sample}_filtered_positions.json")
     if os.path.exists(filtered_file):
         with open(filtered_file) as f:
-            return json.load(f)
+            raw_positions = json.load(f)
+            # Convert from 1-based relative to 0-based relative positions
+            corrected_positions = {}
+            for gene_id, positions in raw_positions.items():
+                corrected_positions[gene_id] = [pos - 1 for pos in positions]
+            return corrected_positions
     return {}
 
 def nuc_to_provean_score(
@@ -216,7 +252,7 @@ def nuc_to_provean_score(
     aa_mutations_dict: Optional[Dict] = None
 ) -> Tuple[float, float, Dict[str, Any]]:
     """Convert nucleotide mutations to amino acid mutations and calculate PROVEAN score."""
-    DELETERIOUS_THRESHOLD = -4.1
+    DELETERIOUS_THRESHOLD = -2.5
     
    
     
@@ -301,6 +337,9 @@ def nuc_to_provean_score(
             # Debug: Print nucleotide mutations for this gene
             logger.debug(f"Processing gene {gene_id} with mutations:")
             logger.debug(f"  {new_mutations}")
+            
+            # Add this:
+            logger.info(f"Calling PROVEAN for gene {gene_id} with {len(new_mutations)} new mutations")
             
             # Run PROVEAN with output redirected to log file
             with open(provean_log, 'w') as log_file:
@@ -507,7 +546,7 @@ def process_gene_permutations(
     gene_id: str,
     sample_mutations: Dict[str, Dict[str, Any]],
     sample_filtered_positions: Dict[str, List[int]],
-    score_db: ProveanScoreDB,
+    score_db_path: str,
     provean_config: Dict[str, Any],
     paths: Dict[str, str],
     features: Dict[str, Any],
@@ -517,9 +556,9 @@ def process_gene_permutations(
     min_mutations: int = 3
 ) -> Tuple[str, Dict[str, Any]]:
     """Process permutations for a single gene across all samples."""
-    
+    # Re-initialize DB in each process
+    score_db = ProveanScoreDB(score_db_path)
     try:
-        # Calculate total mutations across all samples
         total_mutations = sum(
             len(mutations['mutations']) 
             for mutations in sample_mutations.values()
@@ -528,14 +567,14 @@ def process_gene_permutations(
         if total_mutations < min_mutations:
             return gene_id, create_empty_result(sample_mutations, total_mutations)
         
-        # Create temp directory for this gene
         process_id = os.getpid()
         gene_temp_dir = os.path.join(paths['provpath'], f"{gene_id}_{process_id}")
         os.makedirs(gene_temp_dir, exist_ok=True)
         gene_paths = paths.copy()
         gene_paths['provpath'] = gene_temp_dir
 
-        # Calculate original scores for each sample and sum
+        # --- Timing: Original score calculation ---
+        t0 = time.time()
         original_total_score = 0
         original_total_score_with_nonsense = 0
         original_sample_scores = {}
@@ -558,23 +597,22 @@ def process_gene_permutations(
             original_total_stats['deleterious_count'] += stats['deleterious_count']
             original_total_stats['total_mutations'] += stats['total_mutations']
             original_total_stats['nonsense_count'] += stats.get('nonsense_count', 0)
+        t1 = time.time()
+        logger.info(f"[{gene_id}] Original score calculation took {t1-t0:.2f} seconds.")
 
-        # Perform permutations
+        # --- Timing: Permutation loop ---
         permuted_total_scores = []
         permuted_total_scores_with_nonsense = []
         permuted_total_deleterious = []
-        
-        for _ in range(n_permutations):
-            # For each permutation, process samples separately and sum their scores
+        t2 = time.time()
+        for perm_idx in range(n_permutations):
+            perm_start = time.time()
             perm_total_score = 0
             perm_total_score_with_nonsense = 0
             perm_total_deleterious = 0
             
             for sample, mutations in sample_mutations.items():
-                # Get sample-specific filtered positions
                 filtered_pos = sample_filtered_positions.get(sample, [])
-                
-                # Permute mutations for this sample using its filtered positions
                 permuted_muts = permute_single_sample(
                     mutations,
                     gene_id,
@@ -582,8 +620,8 @@ def process_gene_permutations(
                     features,
                     wolgenome
                 )
-                
-                # Calculate score for this sample's permutation
+                # --- Timing: Score calculation for permutation ---
+                score_start = time.time()
                 if permuted_muts['mutations']:
                     score, score_with_nonsense, stats = nuc_to_provean_score(
                         permuted_muts,
@@ -598,10 +636,17 @@ def process_gene_permutations(
                     perm_total_score += score
                     perm_total_score_with_nonsense += score_with_nonsense
                     perm_total_deleterious += stats['deleterious_count']
-            
+                score_end = time.time()
+                # Optional: log per-sample score time
+                # logger.debug(f"[{gene_id}] Perm {perm_idx} sample {sample} score: {score_end-score_start:.4f}s")
             permuted_total_scores.append(perm_total_score)
             permuted_total_scores_with_nonsense.append(perm_total_score_with_nonsense)
             permuted_total_deleterious.append(perm_total_deleterious)
+            perm_end = time.time()
+            if perm_idx % 100 == 0:
+                logger.info(f"[{gene_id}] Permutation {perm_idx} took {perm_end-perm_start:.3f}s")
+        t3 = time.time()
+        logger.info(f"[{gene_id}] All {n_permutations} permutations took {t3-t2:.2f} seconds.")
 
         # Calculate p-value based on summed scores
         p_value = sum(s <= original_total_score for s in permuted_total_scores) / len(permuted_total_scores)
@@ -818,7 +863,7 @@ def process_sample_group(
     logger.info(f"Processing {len(gene_mutations)} genes for {len(sample_jsons)} samples")
     
     # Process genes in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for gene in gene_mutations:
             future = executor.submit(
@@ -826,7 +871,7 @@ def process_sample_group(
                 gene,
                 gene_mutations[gene],
                 gene_filtered[gene],
-                score_db,
+                score_db.db_path,
                 provean_config,
                 paths,
                 features,
@@ -899,6 +944,101 @@ def create_empty_result(sample_mutations: Dict[str, Dict[str, Any]], total_mutat
             'pvalue_with_nonsense': 1.0
         }
     }
+
+def calculate_sample_statistics(
+    nuc_mutations: Dict[str, Dict[str, Any]], 
+    sample_name: str
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """Calculate mutation statistics for a sample."""
+    
+    # Sample-level statistics
+    sample_stats = {
+        'sample_name': sample_name,
+        'total_mutations': 0,
+        'total_genes_with_mutations': 0,
+        'mutation_types': {},
+        'genes_processed': []
+    }
+    
+    # Gene-level statistics
+    gene_stats = {}
+    
+    for gene_id, gene_data in nuc_mutations.items():
+        mutations = gene_data['mutations']
+        gene_mutation_count = sum(mutations.values())
+        
+        if gene_mutation_count > 0:
+            sample_stats['total_genes_with_mutations'] += 1
+            sample_stats['genes_processed'].append(gene_id)
+        
+        sample_stats['total_mutations'] += gene_mutation_count
+        
+        # Count mutation types
+        gene_mutation_types = {}
+        for mut_key, count in mutations.items():
+            mut_type = mut_key.split('_')[1]
+            gene_mutation_types[mut_type] = gene_mutation_types.get(mut_type, 0) + count
+            sample_stats['mutation_types'][mut_type] = sample_stats['mutation_types'].get(mut_type, 0) + count
+        
+        # Store gene-level stats
+        gene_stats[gene_id] = {
+            'gene_id': gene_id,
+            'total_mutations': gene_mutation_count,
+            'gene_length': gene_data['gene_len'],
+            'average_coverage': gene_data['avg_cov'],
+            'mutation_types': gene_mutation_types,
+            'mutations_per_kb': (gene_mutation_count / gene_data['gene_len']) * 1000 if gene_data['gene_len'] > 0 else 0
+        }
+    
+    return sample_stats, gene_stats
+
+def normalize_context_counts(
+    context_counts: Dict[str, Dict[str, int]], 
+    wolgenome: SeqContext
+) -> Dict[str, Dict[str, Any]]:
+    """Normalize existing context counts against genome background."""
+    
+    # Count genome 3-mers once
+    genome_kmers = {}
+    for i in range(len(wolgenome.genome) - 2):  # 3-mer = k-1
+        kmer = str(wolgenome.genome[i:i+3]).upper()
+        genome_kmers[kmer] = genome_kmers.get(kmer, 0) + 1
+    
+    total_genome_kmers = sum(genome_kmers.values())
+    
+    normalized_contexts = {}
+    
+    for sample, contexts in context_counts.items():
+        if sample == 'kmer_3mer_analysis':  # Skip if already processed
+            continue
+            
+        total_mutations = sum(contexts.values())
+        normalized_contexts[sample] = {}
+        
+        for context, mut_count in contexts.items():
+            genome_count = genome_kmers.get(context, 0)
+            if genome_count > 0 and total_mutations > 0:
+                normalized_freq = (mut_count / total_mutations) / (genome_count / total_genome_kmers)
+                normalized_contexts[sample][context] = {
+                    'mutation_count': mut_count,
+                    'genome_count': genome_count,
+                    'normalized_frequency': normalized_freq
+                }
+    
+    # Add genome-wide kmer counts to the output
+    normalized_contexts['genome_kmer_counts'] = genome_kmers
+    
+    return normalized_contexts
+
+def calculate_genome_base_counts(wolgenome: SeqContext) -> Dict[str, int]:
+    """Calculate total counts of each base in the genome."""
+    base_counts = {'A': 0, 'T': 0, 'G': 0, 'C': 0}
+    
+    for base in str(wolgenome.genome).upper():
+        if base in base_counts:
+            base_counts[base] += 1
+    
+    return base_counts
 
 def main() -> None:
     '''Main function to run the PROVEAN effect score calculation pipeline.
@@ -975,7 +1115,7 @@ def main() -> None:
     
     # Limit max_workers to avoid "too many open files" error
     # A reasonable default is 20-30 workers depending on the system
-    max_workers = min(70, os.cpu_count())
+    max_workers = min(1, os.cpu_count())
     min_mutations = 3
     calculate_provean_scores_parallel(
         mutation_jsons,
