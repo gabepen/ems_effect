@@ -767,17 +767,7 @@ def plot_volcano_ratio(df: pd.DataFrame, sample: str, output_dir: str) -> None:
     plt.close()
 
 def list_significant_genes(df: pd.DataFrame, sample: str, output_dir: str, cache_file: str = None) -> None:
-    """List genes with significant protective and deleterious FDR-corrected p-values."""
-    # Filter out None/NaN p-values
-    df_valid = df.dropna(subset=['pvalue_more_fdr', 'pvalue_less_fdr'])
-    
-    # Filter for significant deleterious and protective genes
-    significant_deleterious = df_valid[(df_valid['pvalue_more_fdr'] < 0.05) & (df_valid['effect_score'] < 0)]
-    significant_protective = df_valid[(df_valid['pvalue_less_fdr'] < 0.05) & (df_valid['effect_score'] > 0)]
-    
-    # Also get ratio-based significant genes
-    ratio_high = df_valid[df_valid['pvalue_ratio_more_fdr'] < 0.05]
-    ratio_low = df_valid[df_valid['pvalue_ratio_less_fdr'] < 0.05]
+    """List genes with significant FDR-corrected p-values in 4 separate categories."""
     
     # Add gene descriptions
     gene_info_cache = load_gene_info_cache(cache_file) if cache_file else {}
@@ -797,42 +787,83 @@ def list_significant_genes(df: pd.DataFrame, sample: str, output_dir: str, cache
                 if gene_info:
                     result_df.at[i, 'gene_description'] = gene_info.get('description', '')
         
-        # Select and reorder columns
-        columns = [
+        # Select and reorder columns based on what's available
+        base_columns = [
             'gene_id', 
             'gene_description', 
             'effect_score',
-            'pvalue_more_fdr', 
-            'pvalue_less_fdr',
             'deleterious_mutations',
             'total_mutations',
             'deleterious_ratio'
         ]
         
+        # Add p-value columns that exist
+        available_pval_cols = [col for col in ['pvalue_more_fdr', 'pvalue_less_fdr', 'pvalue_ratio_more_fdr', 'pvalue_ratio_less_fdr'] 
+                              if col in result_df.columns]
+        
+        columns = base_columns + available_pval_cols
+        
         return result_df[columns]
     
-    # Process each dataframe
-    del_df = add_gene_info(significant_deleterious)
-    prot_df = add_gene_info(significant_protective)
-    high_ratio_df = add_gene_info(ratio_high)
-    low_ratio_df = add_gene_info(ratio_low)
+    # Check which FDR columns exist
+    has_effect_fdr = 'pvalue_more_fdr' in df.columns and 'pvalue_less_fdr' in df.columns
+    has_ratio_fdr = 'pvalue_ratio_more_fdr' in df.columns and 'pvalue_ratio_less_fdr' in df.columns
     
-    # Save to CSV
-    deleterious_file = os.path.join(output_dir, f"{sample}_significant_deleterious_genes.csv")
-    protective_file = os.path.join(output_dir, f"{sample}_significant_protective_genes.csv")
-    ratio_high_file = os.path.join(output_dir, f"{sample}_significant_high_ratio_genes.csv")
-    ratio_low_file = os.path.join(output_dir, f"{sample}_significant_low_ratio_genes.csv")
+    # Initialize empty DataFrames
+    effect_more_df = pd.DataFrame()
+    effect_less_df = pd.DataFrame()
+    ratio_more_df = pd.DataFrame()
+    ratio_less_df = pd.DataFrame()
     
-    del_df.to_csv(deleterious_file, index=False)
-    prot_df.to_csv(protective_file, index=False)
-    high_ratio_df.to_csv(ratio_high_file, index=False)
-    low_ratio_df.to_csv(ratio_low_file, index=False)
+    # 1. Genes with significant pvalue_more_fdr < 0.05 (deleterious effect)
+    if has_effect_fdr:
+        significant_effect_more = df[df['pvalue_more_fdr'] < 0.05].dropna(subset=['pvalue_more_fdr'])
+        effect_more_df = add_gene_info(significant_effect_more)
+        if not effect_more_df.empty:
+            effect_more_df = effect_more_df.sort_values('pvalue_more_fdr')
+    
+    # 2. Genes with significant pvalue_less_fdr < 0.05 (protective effect)  
+    if has_effect_fdr:
+        significant_effect_less = df[df['pvalue_less_fdr'] < 0.05].dropna(subset=['pvalue_less_fdr'])
+        effect_less_df = add_gene_info(significant_effect_less)
+        if not effect_less_df.empty:
+            effect_less_df = effect_less_df.sort_values('pvalue_less_fdr')
+    
+    # 3. Genes with significant pvalue_ratio_more_fdr < 0.05 (high deleterious ratio)
+    if has_ratio_fdr:
+        significant_ratio_more = df[df['pvalue_ratio_more_fdr'] < 0.05].dropna(subset=['pvalue_ratio_more_fdr'])
+        ratio_more_df = add_gene_info(significant_ratio_more)
+        if not ratio_more_df.empty:
+            ratio_more_df = ratio_more_df.sort_values('pvalue_ratio_more_fdr')
+    
+    # 4. Genes with significant pvalue_ratio_less_fdr < 0.05 (low deleterious ratio)
+    if has_ratio_fdr:
+        significant_ratio_less = df[df['pvalue_ratio_less_fdr'] < 0.05].dropna(subset=['pvalue_ratio_less_fdr'])
+        ratio_less_df = add_gene_info(significant_ratio_less)
+        if not ratio_less_df.empty:
+            ratio_less_df = ratio_less_df.sort_values('pvalue_ratio_less_fdr')
+    
+    # Save to CSV files
+    effect_more_file = os.path.join(output_dir, f"{sample}_significant_effect_more_genes.csv")
+    effect_less_file = os.path.join(output_dir, f"{sample}_significant_effect_less_genes.csv")
+    ratio_more_file = os.path.join(output_dir, f"{sample}_significant_ratio_more_genes.csv")
+    ratio_less_file = os.path.join(output_dir, f"{sample}_significant_ratio_less_genes.csv")
+    
+    effect_more_df.to_csv(effect_more_file, index=False)
+    effect_less_df.to_csv(effect_less_file, index=False)
+    ratio_more_df.to_csv(ratio_more_file, index=False)
+    ratio_less_df.to_csv(ratio_less_file, index=False)
     
     print(f"\nSignificant genes for {sample}:")
-    print(f"Deleterious genes: {len(significant_deleterious)}")
-    print(f"Protective genes: {len(significant_protective)}")
-    print(f"High ratio genes: {len(ratio_high)}")
-    print(f"Low ratio genes: {len(ratio_low)}")
+    print(f"Effect more significant (pvalue_more_fdr < 0.05): {len(effect_more_df)}")
+    print(f"Effect less significant (pvalue_less_fdr < 0.05): {len(effect_less_df)}")
+    print(f"Ratio more significant (pvalue_ratio_more_fdr < 0.05): {len(ratio_more_df)}")
+    print(f"Ratio less significant (pvalue_ratio_less_fdr < 0.05): {len(ratio_less_df)}")
+    
+    if not has_effect_fdr:
+        print("Warning: Effect FDR columns not found in DataFrame")
+    if not has_ratio_fdr:
+        print("Warning: Ratio FDR columns not found in DataFrame")
 
 def generate_summary_tables(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, cache_file: str = None) -> None:
     """Generate comprehensive summary tables of significant genes."""

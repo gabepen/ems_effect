@@ -39,6 +39,7 @@ def parse_args() -> Namespace:
             - config (str): Path to config file with reference paths
             - exclude (bool): Flag for EMS mutations only
             - skip_parse (bool): Flag to skip parsing step
+            - only_parse (bool): Flag to only parse mpileup files
     '''
     parser = argparse.ArgumentParser(description='Process mpileup files and calculate PROVEAN effect scores')
     parser.add_argument('-m', '--mpileups', required=True,
@@ -51,6 +52,8 @@ def parse_args() -> Namespace:
                         help='EMS mutations only')
     parser.add_argument('-s', '--skip_parse', action='store_true',
                         help='Skip parsing step')
+    parser.add_argument('-p', '--only_parse', action='store_true',
+                        help='Only parse mpileup files')
     return parser.parse_args()
 
 def load_config(config_path: str) -> Dict[str, str]:
@@ -158,16 +161,12 @@ def process_mpileups(pile: str, mutpath: str, outdir: str, wolgenome: Any, ems_o
         with open(f"{mutpath}/{sample}.json", 'w') as of:
             json.dump(nuc_muts, of)
     
-    # After processing all samples, normalize context counts
-    normalized_contexts = normalize_context_counts(context_counts, wolgenome)
-    
-    # Add normalized analysis to context_counts
-    for sample in normalized_contexts:
-        if sample == 'genome_kmer_counts':
-            # Add genome-wide counts directly to context_counts
-            context_counts[sample] = normalized_contexts[sample]
-        else:
-            context_counts[sample]['normalized_analysis'] = normalized_contexts[sample]
+    # After processing all samples, collect genome-wide k-mer counts
+    genome_kmer_counts = normalize_context_counts(context_counts, wolgenome)
+
+    # Save genome-wide k-mer counts to file
+    with open(f"{outdir}/results/genome_kmer_counts.json", 'w') as of:
+        json.dump(genome_kmer_counts, of)
     
     # Save summary files to main results directory
     # Use genome-wide base counts for all samples
@@ -994,41 +993,15 @@ def calculate_sample_statistics(
 
 def normalize_context_counts(
     context_counts: Dict[str, Dict[str, int]], 
-    wolgenome: SeqContext
-) -> Dict[str, Dict[str, Any]]:
-    """Normalize existing context counts against genome background."""
-    
-    # Count genome 3-mers once
+    wolgenome: SeqContext,
+    context_size: int = 5
+) -> Dict[str, int]:
+    """Collect genome-wide k-mer counts for the specified context size."""
     genome_kmers = {}
-    for i in range(len(wolgenome.genome) - 2):  # 3-mer = k-1
-        kmer = str(wolgenome.genome[i:i+3]).upper()
+    for i in range(len(wolgenome.genome) - context_size + 1):
+        kmer = str(wolgenome.genome[i:i+context_size]).upper()
         genome_kmers[kmer] = genome_kmers.get(kmer, 0) + 1
-    
-    total_genome_kmers = sum(genome_kmers.values())
-    
-    normalized_contexts = {}
-    
-    for sample, contexts in context_counts.items():
-        if sample == 'kmer_3mer_analysis':  # Skip if already processed
-            continue
-            
-        total_mutations = sum(contexts.values())
-        normalized_contexts[sample] = {}
-        
-        for context, mut_count in contexts.items():
-            genome_count = genome_kmers.get(context, 0)
-            if genome_count > 0 and total_mutations > 0:
-                normalized_freq = (mut_count / total_mutations) / (genome_count / total_genome_kmers)
-                normalized_contexts[sample][context] = {
-                    'mutation_count': mut_count,
-                    'genome_count': genome_count,
-                    'normalized_frequency': normalized_freq
-                }
-    
-    # Add genome-wide kmer counts to the output
-    normalized_contexts['genome_kmer_counts'] = genome_kmers
-    
-    return normalized_contexts
+    return genome_kmers
 
 def calculate_genome_base_counts(wolgenome: SeqContext) -> Dict[str, int]:
     """Calculate total counts of each base in the genome."""
@@ -1087,6 +1060,7 @@ def main() -> None:
     logger.info(f"  Output directory: {args.output}")
     logger.info(f"  EMS mutations only: {args.exclude}")
     logger.info(f"  Skip parsing: {args.skip_parse}")
+    logger.info(f"  Only parse: {args.only_parse}")
     
     # Initialize genome context
     wolgenome = parse.SeqContext(refs['genomic_fna'], refs['annotation'])
@@ -1105,6 +1079,9 @@ def main() -> None:
     # Process mpileups if not skipped
     if not args.skip_parse:
         process_mpileups(args.mpileups, paths['mutpath'], args.output.rstrip('/'), wolgenome, args.exclude)
+    if args.only_parse:
+        logger.info("Only parsing mpileup files")
+        return
     
     # Process mutations
     #nuc_mut_files = glob(paths['mutpath'] + '/*.json')
@@ -1129,8 +1106,6 @@ def main() -> None:
         max_workers=max_workers,  # Use limited number of workers
         min_mutations=min_mutations  # Add minimum mutation parameter
     )
-
-    
 
     logger.success("Pipeline completed successfully")
 
