@@ -146,7 +146,8 @@ def process_mpileups(pile: str, mutpath: str, outdir: str, wolgenome: Any, ems_o
             wolgenome, 
             ems_only, 
             {},  # Empty dict since we don't need per-sample base counts
-            context_counts[sample]
+            context_counts[sample],
+            7  # context_size changed to 7
         )
         
         # Store this sample's intergenic counts
@@ -162,7 +163,7 @@ def process_mpileups(pile: str, mutpath: str, outdir: str, wolgenome: Any, ems_o
             json.dump(nuc_muts, of)
     
     # After processing all samples, collect genome-wide k-mer counts
-    genome_kmer_counts = normalize_context_counts(context_counts, wolgenome)
+    genome_kmer_counts = normalize_context_counts(context_counts, wolgenome, context_size=7)
 
     # Save genome-wide k-mer counts to file
     with open(f"{outdir}/results/genome_kmer_counts.json", 'w') as of:
@@ -964,29 +965,31 @@ def calculate_sample_statistics(
     
     for gene_id, gene_data in nuc_mutations.items():
         mutations = gene_data['mutations']
-        gene_mutation_count = sum(mutations.values())
         
-        if gene_mutation_count > 0:
+        # Count unique mutated sites
+        unique_mutated_sites = len(mutations)
+        
+        if unique_mutated_sites > 0:
             sample_stats['total_genes_with_mutations'] += 1
             sample_stats['genes_processed'].append(gene_id)
         
-        sample_stats['total_mutations'] += gene_mutation_count
+        sample_stats['total_mutations'] += unique_mutated_sites
         
         # Count mutation types
         gene_mutation_types = {}
         for mut_key, count in mutations.items():
             mut_type = mut_key.split('_')[1]
-            gene_mutation_types[mut_type] = gene_mutation_types.get(mut_type, 0) + count
-            sample_stats['mutation_types'][mut_type] = sample_stats['mutation_types'].get(mut_type, 0) + count
+            gene_mutation_types[mut_type] = gene_mutation_types.get(mut_type, 0) + 1  # Count each site once
+            sample_stats['mutation_types'][mut_type] = sample_stats['mutation_types'].get(mut_type, 0) + 1
         
         # Store gene-level stats
         gene_stats[gene_id] = {
             'gene_id': gene_id,
-            'total_mutations': gene_mutation_count,
+            'total_mutations': unique_mutated_sites,
             'gene_length': gene_data['gene_len'],
             'average_coverage': gene_data['avg_cov'],
             'mutation_types': gene_mutation_types,
-            'mutations_per_kb': (gene_mutation_count / gene_data['gene_len']) * 1000 if gene_data['gene_len'] > 0 else 0
+            'mutations_per_kb': (unique_mutated_sites / gene_data['gene_len']) * 1000 if gene_data['gene_len'] > 0 else 0
         }
     
     return sample_stats, gene_stats
@@ -994,7 +997,7 @@ def calculate_sample_statistics(
 def normalize_context_counts(
     context_counts: Dict[str, Dict[str, int]], 
     wolgenome: SeqContext,
-    context_size: int = 5
+    context_size: int = 7
 ) -> Dict[str, int]:
     """Collect genome-wide k-mer counts for the specified context size."""
     genome_kmers = {}

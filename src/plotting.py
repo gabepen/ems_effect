@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 from scipy.stats import fisher_exact
+from collections import defaultdict
 
 def load_json(file_path):
     with open(file_path, 'r') as file:
@@ -1269,8 +1270,6 @@ def plot_consistently_enriched_kmers_heatmap(context_counts: dict, genome_kmer_c
     """
     Plot a heatmap of raw enrichment ratios for kmers that are consistently enriched across all EMS samples.
     """
-    import seaborn as sns
-    import pandas as pd
 
     # Collect all EMS samples (excluding 7d/3d)
     ems_samples = [sample for sample in context_counts if 'EMS' in sample and '7d' not in sample and '3d' not in sample]
@@ -1331,8 +1330,6 @@ def plot_consistently_depleted_kmers_heatmap(
     """
     Plot a heatmap of raw enrichment ratios for kmers that are consistently depleted across all EMS samples.
     """
-    import seaborn as sns
-    import pandas as pd
 
     # Collect all EMS samples (excluding 7d/3d)
     ems_samples = [sample for sample in context_counts if 'EMS' in sample and '7d' not in sample and '3d' not in sample]
@@ -1390,10 +1387,6 @@ def plot_gene_mutation_statistics(gene_stats_path: str, output_dir: str, top_n: 
     2. Scatter: total mutations per gene vs gene length (across all samples, skipping 7d)
     3. Heatmap: top mutated genes (normalized by gene length) across samples (skipping 7d)
     """
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    import os
 
     # Load gene statistics
     with open(gene_stats_path) as f:
@@ -1456,9 +1449,12 @@ def plot_gene_mutation_statistics(gene_stats_path: str, output_dir: str, top_n: 
     # Compute normalized mutations
     df["mut_per_kb"] = df["total_mutations"] / df["gene_length"] * 1000
 
+    # Filter out 3d and 7d samples
+    df_filtered = df[~df['sample'].str.contains('3d|7d')]
+
     # Find top N genes by median mut_per_kb across samples
     top_genes = (
-        df.groupby("gene")["mut_per_kb"]
+        df_filtered.groupby("gene")["mut_per_kb"]
         .median()
         .sort_values(ascending=False)
         .head(top_n)
@@ -1466,7 +1462,7 @@ def plot_gene_mutation_statistics(gene_stats_path: str, output_dir: str, top_n: 
     )
 
     heatmap_df = (
-        df[df["gene"].isin(top_genes)]
+        df_filtered[df_filtered["gene"].isin(top_genes)]
         .pivot(index="sample", columns="gene", values="mut_per_kb")
         .fillna(0)
     )
@@ -1476,11 +1472,480 @@ def plot_gene_mutation_statistics(gene_stats_path: str, output_dir: str, top_n: 
 
     plt.figure(figsize=(1.2*top_n, 0.5*len(heatmap_df)+4))
     sns.heatmap(heatmap_df, cmap="YlOrRd", annot=True, fmt=".2f", cbar_kws={"label": "Mutations per kb"})
-    plt.title(f"Top {top_n} Most Mutated Genes (Normalized by Length)\nAcross Samples (Excluding 7d)")
+    plt.title(f"Top {top_n} Most Mutated Genes (Normalized by Length)\nAcross EMS Samples (Excluding 3d/7d)")
     plt.xlabel("Gene")
     plt.ylabel("Sample")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"top_mutated_genes_heatmap.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts):
+    """Aggregate 5-mer counts into 3-mer counts (centered on C/G)."""
+    # Count all 3-mers from the genome sequence
+    genome_3mer_counts = {}
+    for kmer5, gcount in genome_kmer_counts.items():
+        if len(kmer5) == 5:
+            # Extract all possible 3-mers from the 5-mer
+            for i in range(3):
+                kmer3 = kmer5[i:i+3]
+                if kmer3[1] in "CG":  # Only count 3-mers with C/G in the center
+                    genome_3mer_counts[kmer3] = genome_3mer_counts.get(kmer3, 0) + gcount
+
+    # Aggregate sample 3-mer counts from 5-mers
+    sample_3mer_counts = {}
+    for sample, sample_counts in context_counts.items():
+        sample_3mer_counts[sample] = {}
+        for kmer5, scount in sample_counts.items():
+            if len(kmer5) == 5:
+                # Extract all possible 3-mers from the 5-mer
+                for i in range(3):
+                    kmer3 = kmer5[i:i+3]
+                    if kmer3[1] in "CG":  # Only count 3-mers with C/G in the center
+                        sample_3mer_counts[sample][kmer3] = sample_3mer_counts[sample].get(kmer3, 0) + scount
+
+    return sample_3mer_counts, genome_3mer_counts
+
+def plot_consistently_enriched_3mer_kmers_heatmap(context_counts, genome_kmer_counts, output_dir, min_enrichment=1.5, top_n=30):
+   
+
+    sample_3mer_counts, genome_3mer_counts = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+    ems_samples = [s for s in sample_3mer_counts if 'EMS' in s and '7d' not in s and '3d' not in s]
+    if not ems_samples:
+        print("No EMS samples found for consistently enriched 3-mer kmer heatmap.")
+        return
+
+    total_genome_3mers = sum(genome_3mer_counts.values())
+    enrichment_data = {}
+    for sample in ems_samples:
+        sample_kmers = sample_3mer_counts[sample]
+        total_mutations = sum(sample_kmers.values())
+        enrichment_data[sample] = {}
+        for kmer, observed_count in sample_kmers.items():
+            genome_count = genome_3mer_counts.get(kmer, 0)
+            if genome_count == 0 or total_mutations == 0:
+                continue
+            expected_freq = genome_count / total_genome_3mers
+            expected_count = expected_freq * total_mutations
+            enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else float('nan')
+            enrichment_data[sample][kmer] = enrichment_ratio
+
+    df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    consistently_enriched_kmers = df.columns[(df.min(axis=0) > min_enrichment)]
+    if len(consistently_enriched_kmers) == 0:
+        print(f"No 3-mers found with minimum enrichment > {min_enrichment} across all samples.")
+        return
+
+    top_kmers = df[consistently_enriched_kmers].median(axis=0).sort_values(ascending=False).head(top_n).index
+    df_top = df[top_kmers]
+
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(1.2*len(top_kmers), 0.5*len(df_top)+4))
+    sns.heatmap(df_top, cmap='YlOrRd', annot=True, fmt=".2f", cbar_kws={'label': 'Enrichment Ratio (Obs/Exp)'})
+    plt.title(f'Consistently Enriched 3-mers (min enrichment > {min_enrichment})\nTop {top_n} by median enrichment')
+    plt.xlabel('3-mer')
+    plt.ylabel('Sample')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'consistently_enriched_3mer_heatmap_top{top_n}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_consistently_depleted_3mer_kmers_heatmap(context_counts, genome_kmer_counts, output_dir, max_enrichment=0.67, top_n=30):
+   
+
+    sample_3mer_counts, genome_3mer_counts = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+    ems_samples = [s for s in sample_3mer_counts if 'EMS' in s and '7d' not in s and '3d' not in s]
+    if not ems_samples:
+        print("No EMS samples found for consistently depleted 3-mer kmer heatmap.")
+        return
+
+    total_genome_3mers = sum(genome_3mer_counts.values())
+    enrichment_data = {}
+    for sample in ems_samples:
+        sample_kmers = sample_3mer_counts[sample]
+        total_mutations = sum(sample_kmers.values())
+        enrichment_data[sample] = {}
+        for kmer, observed_count in sample_kmers.items():
+            genome_count = genome_3mer_counts.get(kmer, 0)
+            if genome_count == 0 or total_mutations == 0:
+                continue
+            expected_freq = genome_count / total_genome_3mers
+            expected_count = expected_freq * total_mutations
+            enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else float('nan')
+            enrichment_data[sample][kmer] = enrichment_ratio
+
+    df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    consistently_depleted_kmers = df.columns[(df.max(axis=0) < max_enrichment)]
+    if len(consistently_depleted_kmers) == 0:
+        print(f"No 3-mers found with maximum enrichment < {max_enrichment} across all samples.")
+        return
+
+    top_kmers = df[consistently_depleted_kmers].median(axis=0).sort_values(ascending=True).head(top_n).index
+    df_top = df[top_kmers]
+
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(1.2*len(top_kmers), 0.5*len(df_top)+4))
+    sns.heatmap(df_top, cmap='Blues', annot=True, fmt=".2f", cbar_kws={'label': 'Enrichment Ratio (Obs/Exp)'})
+    plt.title(f'Consistently Depleted 3-mers (max enrichment < {max_enrichment})\nTop {top_n} by lowest median enrichment')
+    plt.xlabel('3-mer')
+    plt.ylabel('Sample')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'consistently_depleted_3mer_heatmap_top{top_n}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_ems_5mer_signature_per_sample(context_counts: dict, output_dir: str):
+    """
+    Plot normalized 5-mer context mutation signature for EMS canonical mutations (C>T and G>A) for each sample.
+    context_counts: dict mapping sample -> dict of 5-mer -> count
+    output_dir: directory to save plots
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    for sample, kmer_counts in context_counts.items():
+        # Skip 7d/3d samples if desired (but per user, do all samples here)
+        c2t_counts = {}
+        g2a_counts = {}
+        total_c2t = 0
+        total_g2a = 0
+        for kmer, count in kmer_counts.items():
+            if len(kmer) != 5:
+                continue
+            center = kmer[2]
+            if center == 'C':
+                c2t_counts[kmer] = count
+                total_c2t += count
+            elif center == 'G':
+                g2a_counts[kmer] = count
+                total_g2a += count
+        # Normalize
+        c2t_norm = {k: v / total_c2t for k, v in c2t_counts.items()} if total_c2t > 0 else {}
+        g2a_norm = {k: v / total_g2a for k, v in g2a_counts.items()} if total_g2a > 0 else {}
+        # Sort kmers alphabetically for consistent x-axis
+        c2t_kmers = sorted(c2t_norm.keys())
+        g2a_kmers = sorted(g2a_norm.keys())
+        # Plot
+        plt.figure(figsize=(max(12, 0.15*max(len(c2t_kmers), len(g2a_kmers))), 6))
+        x_c2t = np.arange(len(c2t_kmers))
+        x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
+        # Bar plots
+        plt.bar(x_c2t, [c2t_norm[k] for k in c2t_kmers], color='orange', label='C>T', width=0.8)
+        plt.bar(x_g2a, [g2a_norm[k] for k in g2a_kmers], color='blue', label='G>A', width=0.8)
+        # X-ticks
+        xticks = list(c2t_kmers) + list(g2a_kmers)
+        plt.xticks(np.concatenate([x_c2t, x_g2a]), xticks, rotation=90, fontsize=7)
+        plt.xlabel('5-mer Context')
+        plt.ylabel('Normalized Frequency')
+        plt.title(f'EMS 5-mer Mutation Signature ({sample})')
+        plt.legend()
+        plt.tight_layout()
+        outpath = os.path.join(output_dir, f'ems_5mer_signature_{sample}.png')
+        plt.savefig(outpath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+def plot_ems_5mer_signature_all_samples(context_counts: dict, output_dir: str):
+    """
+    Plot normalized 5-mer context mutation signature for EMS canonical mutations (C>T and G>A), aggregated across all samples (excluding 7d/3d).
+    context_counts: dict mapping sample -> dict of 5-mer -> count
+    output_dir: directory to save plot
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    c2t_counts = defaultdict(int)
+    g2a_counts = defaultdict(int)
+    total_c2t = 0
+    total_g2a = 0
+    for sample, kmer_counts in context_counts.items():
+        if '7d' in sample or '3d' in sample:
+            continue
+        for kmer, count in kmer_counts.items():
+            if len(kmer) != 5:
+                continue
+            center = kmer[2]
+            if center == 'C':
+                c2t_counts[kmer] += count
+                total_c2t += count
+            elif center == 'G':
+                g2a_counts[kmer] += count
+                total_g2a += count
+    # Normalize
+    c2t_norm = {k: v / total_c2t for k, v in c2t_counts.items()} if total_c2t > 0 else {}
+    g2a_norm = {k: v / total_g2a for k, v in g2a_counts.items()} if total_g2a > 0 else {}
+    # Sort kmers alphabetically for consistent x-axis
+    c2t_kmers = sorted(c2t_norm.keys())
+    g2a_kmers = sorted(g2a_norm.keys())
+    # Plot
+    plt.figure(figsize=(max(12, 0.15*max(len(c2t_kmers), len(g2a_kmers))), 6))
+    x_c2t = np.arange(len(c2t_kmers))
+    x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
+    # Bar plots
+    plt.bar(x_c2t, [c2t_norm[k] for k in c2t_kmers], color='orange', label='C>T', width=0.8)
+    plt.bar(x_g2a, [g2a_norm[k] for k in g2a_kmers], color='blue', label='G>A', width=0.8)
+    # X-ticks
+    xticks = list(c2t_kmers) + list(g2a_kmers)
+    plt.xticks(np.concatenate([x_c2t, x_g2a]), xticks, rotation=90, fontsize=7)
+    plt.xlabel('5-mer Context')
+    plt.ylabel('Normalized Frequency')
+    plt.title('EMS 5-mer Mutation Signature (All Samples, Excl. 7d/3d)')
+    plt.legend()
+    plt.tight_layout()
+    outpath = os.path.join(output_dir, 'ems_5mer_signature_all_samples.png')
+    plt.savefig(outpath, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_ems_3mer_signature_per_sample(context_counts: dict, genome_kmer_counts: dict, output_dir: str):
+    """
+    Plot normalized 3-mer context mutation signature for EMS canonical mutations (C>T and G>A) for each sample.
+    context_counts: dict mapping sample -> dict of 5-mer -> count
+    genome_kmer_counts: dict mapping 5-mer -> count
+    output_dir: directory to save plots
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    sample_3mer_counts, _ = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+
+    for sample, kmer_counts in sample_3mer_counts.items():
+        c2t_counts = {}
+        g2a_counts = {}
+        total_c2t = 0
+        total_g2a = 0
+        for kmer, count in kmer_counts.items():
+            if len(kmer) != 3:
+                continue
+            center = kmer[1]
+            if center == 'C':
+                c2t_counts[kmer] = count
+                total_c2t += count
+            elif center == 'G':
+                g2a_counts[kmer] = count
+                total_g2a += count
+        # Normalize
+        c2t_norm = {k: v / total_c2t for k, v in c2t_counts.items()} if total_c2t > 0 else {}
+        g2a_norm = {k: v / total_g2a for k, v in g2a_counts.items()} if total_g2a > 0 else {}
+        # Sort kmers alphabetically for consistent x-axis
+        c2t_kmers = sorted(c2t_norm.keys())
+        g2a_kmers = sorted(g2a_norm.keys())
+        # Plot
+        plt.figure(figsize=(max(12, 0.15*max(len(c2t_kmers), len(g2a_kmers))), 6))
+        x_c2t = np.arange(len(c2t_kmers))
+        x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
+        # Bar plots
+        plt.bar(x_c2t, [c2t_norm[k] for k in c2t_kmers], color='orange', label='C>T', width=0.8)
+        plt.bar(x_g2a, [g2a_norm[k] for k in g2a_kmers], color='blue', label='G>A', width=0.8)
+        # X-ticks
+        xticks = list(c2t_kmers) + list(g2a_kmers)
+        plt.xticks(np.concatenate([x_c2t, x_g2a]), xticks, rotation=90, fontsize=7)
+        plt.xlabel('3-mer Context')
+        plt.ylabel('Normalized Frequency')
+        plt.title(f'EMS 3-mer Mutation Signature ({sample})')
+        plt.legend()
+        plt.tight_layout()
+        outpath = os.path.join(output_dir, f'ems_3mer_signature_{sample}.png')
+        plt.savefig(outpath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+def plot_ems_3mer_signature_all_samples(context_counts: dict, genome_kmer_counts: dict, output_dir: str):
+    """
+    Plot normalized 3-mer context mutation signature for EMS canonical mutations (C>T and G>A), aggregated across all samples (excluding 7d/3d).
+    context_counts: dict mapping sample -> dict of 5-mer -> count
+    genome_kmer_counts: dict mapping 5-mer -> count
+    output_dir: directory to save plot
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    sample_3mer_counts, _ = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+
+    c2t_counts = defaultdict(int)
+    g2a_counts = defaultdict(int)
+    total_c2t = 0
+    total_g2a = 0
+    for sample, kmer_counts in sample_3mer_counts.items():
+        if '7d' in sample or '3d' in sample:
+            continue
+        for kmer, count in kmer_counts.items():
+            if len(kmer) != 3:
+                continue
+            center = kmer[1]
+            if center == 'C':
+                c2t_counts[kmer] += count
+                total_c2t += count
+            elif center == 'G':
+                g2a_counts[kmer] += count
+                total_g2a += count
+    # Normalize
+    c2t_norm = {k: v / total_c2t for k, v in c2t_counts.items()} if total_c2t > 0 else {}
+    g2a_norm = {k: v / total_g2a for k, v in g2a_counts.items()} if total_g2a > 0 else {}
+    # Sort kmers alphabetically for consistent x-axis
+    c2t_kmers = sorted(c2t_norm.keys())
+    g2a_kmers = sorted(g2a_norm.keys())
+    # Plot
+    plt.figure(figsize=(max(12, 0.15*max(len(c2t_kmers), len(g2a_kmers))), 6))
+    x_c2t = np.arange(len(c2t_kmers))
+    x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
+    # Bar plots
+    plt.bar(x_c2t, [c2t_norm[k] for k in c2t_kmers], color='orange', label='C>T', width=0.8)
+    plt.bar(x_g2a, [g2a_norm[k] for k in g2a_kmers], color='blue', label='G>A', width=0.8)
+    # X-ticks
+    xticks = list(c2t_kmers) + list(g2a_kmers)
+    plt.xticks(np.concatenate([x_c2t, x_g2a]), xticks, rotation=90, fontsize=7)
+    plt.xlabel('3-mer Context')
+    plt.ylabel('Normalized Frequency')
+    plt.title('EMS 3-mer Mutation Signature (All Samples, Excl. 7d/3d)')
+    plt.legend()
+    plt.tight_layout()
+    outpath = os.path.join(output_dir, 'ems_3mer_signature_all_samples.png')
+    plt.savefig(outpath, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_ems_3mer_signature_multiplot(context_counts: dict, genome_kmer_counts: dict, output_dir: str):
+    """
+    Create a multi-panel plot of normalized 3-mer signatures for all EMS samples (excluding 3d/7d).
+    Each subplot shows the normalized 3-mer signature for one sample, with C>T and G>A colored differently.
+    X-axis is consistent across all subplots.
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    sample_3mer_counts, _ = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+    # Select EMS samples without 3d/7d
+    ems_samples = [s for s in sample_3mer_counts if 'EMS' in s and '3d' not in s and '7d' not in s]
+    if not ems_samples:
+        print("No EMS samples found for 3-mer multiplot.")
+        return
+
+    # Collect all 3-mers observed in any sample (for consistent x-axis)
+    all_c2t_kmers = set()
+    all_g2a_kmers = set()
+    for sample in ems_samples:
+        for kmer in sample_3mer_counts[sample]:
+            if len(kmer) == 3:
+                center = kmer[1]
+                if center == 'C':
+                    all_c2t_kmers.add(kmer)
+                elif center == 'G':
+                    all_g2a_kmers.add(kmer)
+    all_c2t_kmers = sorted(all_c2t_kmers)
+    all_g2a_kmers = sorted(all_g2a_kmers)
+    all_xticks = all_c2t_kmers + all_g2a_kmers
+    x_c2t = np.arange(len(all_c2t_kmers))
+    x_g2a = np.arange(len(all_g2a_kmers)) + len(all_c2t_kmers)
+    x_all = np.concatenate([x_c2t, x_g2a])
+
+    n_samples = len(ems_samples)
+    n_cols = 3
+    n_rows = int(np.ceil(n_samples / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(max(12, 4*n_cols), 3*n_rows), sharex=True, sharey=True)
+    axes = axes.flatten()
+
+    for idx, sample in enumerate(ems_samples):
+        ax = axes[idx]
+        kmer_counts = sample_3mer_counts[sample]
+        c2t_counts = {k: kmer_counts.get(k, 0) for k in all_c2t_kmers}
+        g2a_counts = {k: kmer_counts.get(k, 0) for k in all_g2a_kmers}
+        total_c2t = sum(c2t_counts.values())
+        total_g2a = sum(g2a_counts.values())
+        c2t_norm = [c2t_counts[k] / total_c2t if total_c2t > 0 else 0 for k in all_c2t_kmers]
+        g2a_norm = [g2a_counts[k] / total_g2a if total_g2a > 0 else 0 for k in all_g2a_kmers]
+        ax.bar(x_c2t, c2t_norm, color='orange', label='C>T', width=0.8)
+        ax.bar(x_g2a, g2a_norm, color='blue', label='G>A', width=0.8)
+        ax.set_title(sample)
+        if idx % n_cols == 0:
+            ax.set_ylabel('Normalized Frequency')
+        if idx >= (n_rows-1)*n_cols:
+            ax.set_xticks(x_all)
+            ax.set_xticklabels(all_xticks, rotation=90, fontsize=7)
+        else:
+            ax.set_xticks([])
+        if idx == 0:
+            ax.legend()
+    # Hide unused axes
+    for j in range(idx+1, len(axes)):
+        axes[j].axis('off')
+    plt.tight_layout()
+    outpath = os.path.join(output_dir, 'ems_3mer_signature_multiplot.png')
+    plt.savefig(outpath, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_ems_5mer_signature_multiplot(context_counts: dict, output_dir: str):
+    """
+    Create a multi-panel plot of normalized 5-mer signatures for all EMS samples (excluding 3d/7d).
+    Each subplot shows the normalized 5-mer signature for one sample, with C>T and G>A colored differently.
+    X-axis is consistent across all subplots. Sample names are shortened and x-axis labels are removed.
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    # Select EMS samples without 3d/7d
+    ems_samples = [s for s in context_counts if 'EMS' in s and '3d' not in s and '7d' not in s]
+    if not ems_samples:
+        print("No EMS samples found for 5-mer multiplot.")
+        return
+
+    # Collect all 5-mers observed in any sample (for consistent x-axis)
+    all_c2t_kmers = set()
+    all_g2a_kmers = set()
+    for sample in ems_samples:
+        for kmer in context_counts[sample]:
+            if len(kmer) == 5:
+                center = kmer[2]
+                if center == 'C':
+                    all_c2t_kmers.add(kmer)
+                elif center == 'G':
+                    all_g2a_kmers.add(kmer)
+    all_c2t_kmers = sorted(all_c2t_kmers)
+    all_g2a_kmers = sorted(all_g2a_kmers)
+    all_xticks = all_c2t_kmers + all_g2a_kmers
+    x_c2t = np.arange(len(all_c2t_kmers))
+    x_g2a = np.arange(len(all_g2a_kmers)) + len(all_c2t_kmers)
+    x_all = np.concatenate([x_c2t, x_g2a])
+
+    n_samples = len(ems_samples)
+    n_cols = 3
+    n_rows = int(np.ceil(n_samples / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(max(12, 4*n_cols), 3*n_rows), sharex=True, sharey=True)
+    axes = axes.flatten()
+
+    for idx, sample in enumerate(ems_samples):
+        ax = axes[idx]
+        kmer_counts = context_counts[sample]
+        c2t_counts = {k: kmer_counts.get(k, 0) for k in all_c2t_kmers}
+        g2a_counts = {k: kmer_counts.get(k, 0) for k in all_g2a_kmers}
+        total_c2t = sum(c2t_counts.values())
+        total_g2a = sum(g2a_counts.values())
+        c2t_norm = [c2t_counts[k] / total_c2t if total_c2t > 0 else 0 for k in all_c2t_kmers]
+        g2a_norm = [g2a_counts[k] / total_g2a if total_g2a > 0 else 0 for k in all_g2a_kmers]
+        ax.bar(x_c2t, c2t_norm, color='orange', label='C>T', width=0.8)
+        ax.bar(x_g2a, g2a_norm, color='blue', label='G>A', width=0.8)
+        # Use shortened sample name
+        short_name = extract_sample_id(sample)
+        ax.set_title(short_name)
+        if idx % n_cols == 0:
+            ax.set_ylabel('Normalized Frequency')
+        else:
+            ax.set_ylabel('')
+        # Remove all x-axis tick labels
+        ax.set_xticks([])
+        if idx == 0:
+            ax.legend()
+    # Hide unused axes
+    for j in range(idx+1, len(axes)):
+        axes[j].axis('off')
+    plt.tight_layout()
+    outpath = os.path.join(output_dir, 'ems_5mer_signature_multiplot.png')
+    plt.savefig(outpath, dpi=300, bbox_inches='tight')
     plt.close()
 
 def main():
@@ -1530,6 +1995,14 @@ def main():
         analyze_ems_cg_kmer_bias(context_counts, genome_kmer_counts, args.output_dir)
         plot_consistently_enriched_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
         plot_consistently_depleted_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
+        plot_consistently_enriched_3mer_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
+        plot_consistently_depleted_3mer_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
+        plot_ems_5mer_signature_per_sample(context_counts, args.output_dir)
+        plot_ems_5mer_signature_all_samples(context_counts, args.output_dir)
+        plot_ems_3mer_signature_per_sample(context_counts, genome_kmer_counts, args.output_dir)
+        plot_ems_3mer_signature_all_samples(context_counts, genome_kmer_counts, args.output_dir)
+        plot_ems_3mer_signature_multiplot(context_counts, genome_kmer_counts, args.output_dir)
+        plot_ems_5mer_signature_multiplot(context_counts, args.output_dir)
     else:
         print("Warning: contextcounts.json or genome_kmer_counts.json not found in results directory")
     

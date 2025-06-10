@@ -117,7 +117,7 @@ def get_sequence_context(
     position: int, 
     ref_base: str,
     genome_seq: str,
-    context_size: int = 5
+    context_size: int = 7
 ) -> str:
     '''Get sequence context around a mutation site.
     
@@ -125,13 +125,13 @@ def get_sequence_context(
         position (int): Position of mutation in genome (1-based)
         ref_base (str): Reference base at mutation site
         genome_seq (str): Full genome sequence
-        context_size (int): Size of context window (3 or 5, default=3)
+        context_size (int): Size of context window (3 or 7, default=7)
         
     Returns:
         str: Sequence context with mutation site in center (e.g., 'ATC' for 3mer)
     '''
-    if context_size not in [3, 5]:
-        raise ValueError("Context size must be 3 or 5")
+    if context_size not in [3, 7]:
+        raise ValueError("Context size must be 3 or 7")
         
     pos_0based = position - 1
     flank = context_size // 2
@@ -148,7 +148,7 @@ def check_mutations(
     base_counts: Dict[str, int],
     genome_seq: str,
     context_counts: Dict[str, int],
-    context_size: int = 5
+    context_size: int = 7
 ) -> Tuple[Dict[str, int], int, Dict[str, int]]:
     '''Analyze a mpileup entry to identify mutations and count contexts.'''
     muts: Dict[str, int] = {}    
@@ -353,7 +353,7 @@ def get_chunk_boundaries(mpileup_file, chunk_size: int, gff_features: List[Tuple
     return boundaries
 
 def parse_mpile(mpile: str, seqobject: 'SeqContext', ems_only: bool, base_counts: Dict[str, int],
-                context_counts: Dict[str, int], context_size: int = 5,
+                context_counts: Dict[str, int], context_size: int = 7,
                 chunk_size: int = 100000) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, int]]]:
     '''Parse a single mpileup file to identify mutations.'''
     # Load and sort GFF features once, filtering for protein-coding genes only
