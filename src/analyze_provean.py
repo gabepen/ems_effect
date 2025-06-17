@@ -1331,6 +1331,11 @@ def plot_expression_vs_mutations(df: pd.DataFrame, expression_df: pd.DataFrame, 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
     # Define significance
+    # Print one row of plot_df to inspect the data
+    print("\nExample row from plot_df:")
+    print(plot_df.iloc[0].to_string())
+    print()  
+    input()
     significant = plot_df['padj'] < 0.05
     nonsig = ~significant
     
