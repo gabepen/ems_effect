@@ -117,7 +117,7 @@ def get_sequence_context(
     position: int, 
     ref_base: str,
     genome_seq: str,
-    context_size: int = 3
+    context_size: int = 7
 ) -> str:
     '''Get sequence context around a mutation site.
     
@@ -125,13 +125,13 @@ def get_sequence_context(
         position (int): Position of mutation in genome (1-based)
         ref_base (str): Reference base at mutation site
         genome_seq (str): Full genome sequence
-        context_size (int): Size of context window (3 or 5, default=3)
+        context_size (int): Size of context window (3 or 7, default=7)
         
     Returns:
         str: Sequence context with mutation site in center (e.g., 'ATC' for 3mer)
     '''
-    if context_size not in [3, 5]:
-        raise ValueError("Context size must be 3 or 5")
+    if context_size not in [3, 7]:
+        raise ValueError("Context size must be 3 or 7")
         
     pos_0based = position - 1
     flank = context_size // 2
@@ -148,26 +148,9 @@ def check_mutations(
     base_counts: Dict[str, int],
     genome_seq: str,
     context_counts: Dict[str, int],
-    context_size: int = 3
+    context_size: int = 7
 ) -> Tuple[Dict[str, int], int, Dict[str, int]]:
-    '''Analyze a mpileup entry to identify mutations and count contexts.
-    
-    Args:
-        entry (List[str]): A line from mpileup file split into fields
-        genestart (int): Start position of the gene in the genome
-        sample (str): Sample identifier
-        ems_only (bool): If True, only return EMS canonical mutations (C>T or G>A)
-        base_counts (Dict[str, int]): Dictionary to track base counts
-        genome_seq (str): Full genome sequence for context
-        context_counts (Dict[str, int]): Dictionary to track context counts
-        context_size (int): Size of sequence context window (3 or 5)
-        
-    Returns:
-        Tuple containing:
-            - Dict[str, int]: Dictionary of mutations and their counts
-            - int: Read depth at this position
-            - Dict[str, int]: Dictionary of base counts
-    '''
+    '''Analyze a mpileup entry to identify mutations and count contexts.'''
     muts: Dict[str, int] = {}    
     bp = (int(entry[1]) - int(genestart))
     bp = str(bp) + '_'
@@ -175,82 +158,74 @@ def check_mutations(
     ref = entry[2]
     depth = int(entry[3])
     position = int(entry[1])
+    
+    # ems only skip 
+    if ems_only:
+        if ref not in ['G', 'C']:
+            return {}, depth, {}
 
     # Get sequence context
     context = get_sequence_context(position, ref, genome_seq, context_size)
 
-    # Count reference base occurrences
-    local_base_counts = {'A': 0, 'T': 0, 'G': 0, 'C': 0}
-    local_base_counts[ref] += depth
+    # Count total contexts at covered positions (weighted by coverage depth)
+    if len(context) == context_size:
+        context_counts[context] = context_counts.get(context, 0) + 1
 
     reads = entry[4]
     reads = enumerate(reads)
     r_iter = iter(reads)
-    for i, r in reads:
-        if r != '.' and r != 'N' and r != '$' and r != '*':
-            # Handle insertions
-            if r == '+':
-                insert = next(r_iter)[1]
-                mut = bp+ref+'>'
-                for c in islice(r_iter,int(insert)):
-                    mut+=c[1]
-            # Handle deletions
-            elif r == '-':
-                delete = next(r_iter)[1]
-                mut = bp+'del'
-                for c in islice(r_iter,int(delete)):
-                    mut+=c[1]
-            # Handle point mutations
-            else:
-                mut = f"{ref}>{r}"
-                if ems_only and mut not in ['C>T', 'G>A']:
-                    continue
-                    
-                # Only count contexts for point mutations
-                context_counts[context] = context_counts.get(context, 0) + 1
-                
-                mut = bp + mut
-
-            # Record all mutations (including indels)
-            muts[mut] = muts.get(mut, 0) + 1
-
-    return muts, depth, local_base_counts
-
-def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[Tuple], int, int, int]) -> Tuple[str, Dict, Dict, Dict]:
-    '''Process a chunk of mpileup lines.
     
-    Args:
-        args (Tuple): Contains:
-            - sample (str): Sample name
-            - lines (List[str]): Chunk of mpileup lines
-            - seqobject (SeqContext): Genome context object
-            - ems_only (bool): Whether to only process EMS mutations
-            - gff_features (List[Tuple]): Sorted list of gene features
-            - context_size (int): Size of context window
-            - start_idx (int): Starting line index
-            - chunk_size (int): Size of chunk
-            
-    Returns:
-        Tuple containing:
-            - str: Sample name
-            - Dict: Mutations per gene
-            - Dict: Base counts
-            - Dict: Intergenic counts
-    '''
+    for i, r in reads:
+        if r in '.,':  # Reference matches - skip
+            continue
+        elif r in 'ATGC':  # Forward strand mutation
+            mut = f"{ref}>{r}"
+            if ems_only and mut not in ['C>T', 'G>A']:
+                continue
+            mut = bp + mut
+            muts[mut] = muts.get(mut, 0) + 1
+        elif r in 'atgc':  # Reverse strand mutation
+            r_upper = r.upper()
+            mut = f"{ref}>{r_upper}"
+            if ems_only and mut not in ['C>T', 'G>A']:
+                continue
+            mut = bp + mut
+            muts[mut] = muts.get(mut, 0) + 1
+        elif r == '+':  # Insertion
+            insert = next(r_iter)[1]
+            mut = bp+ref+'>'
+            for c in islice(r_iter,int(insert)):
+                mut+=c[1]
+            muts[mut] = muts.get(mut, 0) + 1
+        elif r == '-':  # Deletion
+            delete = next(r_iter)[1]
+            mut = bp+'del'
+            for c in islice(r_iter,int(delete)):
+                mut+=c[1]
+            muts[mut] = muts.get(mut, 0) + 1
+        elif r == '^':  # Start of read marker
+            next(r_iter)  # Skip quality score
+        elif r in '$*Nn':  # End of read, deletion, or N
+            continue
+
+    # Return empty dict for local_base_counts since we're not using it
+    return muts, depth, {}
+
+def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[Tuple], int, int, int]) -> Tuple[str, Dict, Dict, Dict, Dict]:
+    '''Process a chunk of mpileup lines.'''
     sample, lines, seqobject, ems_only, gff_features, context_size, start_idx, chunk_size = args
     
     mutations = {}
-    base_counts = {'A': 0, 'T': 0, 'G': 0, 'C': 0}  # Initialize local base counts
-    context_counts = {}
+    context_counts = {}  # Total contexts at covered positions
     
     # Initialize intergenic counts before combining chunks
     intergenic_counts = {
-        'mutation_types': {'C>T': 0, 'G>A': 0},  # Only track EMS mutation counts
-        'unique_sites': 0,  # Count of unique positions mutated
-        'gc_sites': 0,  # Total G/C sites
-        'total_sites': 0,  # Total sites processed
-        'coverage_depths': [],  # For calculating average coverage
-        'count_bins': {str(i): 0 for i in range(1, 16)}  # Bins for mutation counts 1-15, with 15+ in bin '15'
+        'mutation_types': {'C>T': 0, 'G>A': 0},
+        'unique_sites': 0,
+        'gc_sites': 0,
+        'total_sites': 0,
+        'coverage_depths': [],
+        'count_bins': {str(i): 0 for i in range(1, 16)}
     }
     
     current_gene_idx = 0
@@ -266,9 +241,6 @@ def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[T
         if not seqobject.overlap_mask[pos]:
             continue
             
-        # Count bases directly here instead of in check_mutations
-        base_counts[ref] += depth
-        
         # Move to next gene if we're past the current one
         while current_gene and pos > current_gene[1]:
             current_gene_idx += 1
@@ -278,14 +250,14 @@ def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[T
                 current_gene = None
                 break
         
-        muts, depth, chunk_base_counts = check_mutations(
+        muts, depth, local_base_counts = check_mutations(
             entry,
             current_gene[0] if current_gene and int(entry[1]) >= current_gene[0] else 0,
             sample,
             ems_only,
-            base_counts,
+            {},  # No longer tracking base counts here
             str(seqobject.genome),
-            context_counts,
+            context_counts,  # Total context counts
             context_size
         )
         
@@ -311,11 +283,11 @@ def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[T
             
             # Track mutation types in intergenic regions
             for mut in muts:
-                mut_type = mut.split('_')[1]  # Get mutation type (e.g., 'C>T')
-                position = int(mut.split('_')[0])  # Get position
-                count = muts[mut]  # Get mutation count
+                mut_type = mut.split('_')[1]
+                position = int(mut.split('_')[0])
+                count = muts[mut]
                 
-                if mut_type in ['C>T', 'G>A']:  # Only track EMS mutations
+                if mut_type in ['C>T', 'G>A']:
                     intergenic_counts['mutation_types'][mut_type] += count
                     
                     # Track unique sites
@@ -325,15 +297,15 @@ def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[T
                         intergenic_counts['_temp_sites'].add(position)
                         intergenic_counts['unique_sites'] += 1
                     
-                    # Track count bins for mutations (how many times each mutation was observed)
-                    count_bin = str(min(15, count))  # Cap at 15+
+                    # Track count bins for mutations
+                    count_bin = str(min(15, count))
                     intergenic_counts['count_bins'][count_bin] += 1
     
     # Remove temporary set before returning
     if '_temp_sites' in intergenic_counts:
         del intergenic_counts['_temp_sites']
     
-    return sample, mutations, base_counts, intergenic_counts
+    return sample, mutations, {}, intergenic_counts, context_counts
 
 def get_chunk_boundaries(mpileup_file, chunk_size: int, gff_features: List[Tuple]) -> List[Tuple[int, int]]:
     '''Determine chunk boundaries that don't split genes.
@@ -381,25 +353,9 @@ def get_chunk_boundaries(mpileup_file, chunk_size: int, gff_features: List[Tuple
     return boundaries
 
 def parse_mpile(mpile: str, seqobject: 'SeqContext', ems_only: bool, base_counts: Dict[str, int],
-                context_counts: Dict[str, int], context_size: int = 3,
+                context_counts: Dict[str, int], context_size: int = 7,
                 chunk_size: int = 100000) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, int], Dict[str, Dict[str, int]]]:
-    '''Parse a single mpileup file to identify mutations.
-    
-    Args:
-        mpile (str): Path to single mpileup file
-        seqobject (SeqContext): Genome context object
-        ems_only (bool): Whether to only process EMS mutations
-        base_counts (Dict[str, int]): Dictionary to store base counts
-        context_counts (Dict[str, int]): Dictionary to store context counts
-        context_size (int): Size of context window
-        chunk_size (int): Size of chunks for parallel processing
-        
-    Returns:
-        Tuple containing:
-            - Dict: Mutations per gene
-            - Dict: Context counts
-            - Dict: Intergenic counts
-    '''
+    '''Parse a single mpileup file to identify mutations.'''
     # Load and sort GFF features once, filtering for protein-coding genes only
     gff_features = []
     with open(seqobject.annot) as gff_file:
@@ -429,12 +385,12 @@ def parse_mpile(mpile: str, seqobject: 'SeqContext', ems_only: bool, base_counts
     
     # Initialize intergenic counts BEFORE processing chunks
     intergenic_counts = {
-        'mutation_types': {'C>T': 0, 'G>A': 0},  # Only track EMS mutation counts
-        'unique_sites': 0,  # Count of unique positions mutated
-        'gc_sites': 0,  # Total G/C sites
-        'total_sites': 0,  # Total sites processed
-        'coverage_depths': [],  # For calculating average coverage
-        'count_bins': {str(i): 0 for i in range(1, 16)}  # Bins for mutation counts 1-15, with 15+ in bin '15'
+        'mutation_types': {'C>T': 0, 'G>A': 0},
+        'unique_sites': 0,
+        'gc_sites': 0,
+        'total_sites': 0,
+        'coverage_depths': [],
+        'count_bins': {str(i): 0 for i in range(1, 16)}
     }
     
     # Process chunks in parallel
@@ -444,10 +400,14 @@ def parse_mpile(mpile: str, seqobject: 'SeqContext', ems_only: bool, base_counts
     # Combine chunk results
     sample_mutations = {}
     
-    for _, mutations, chunk_base_counts, chunk_intergenic in chunk_results:
+    for _, mutations, chunk_base_counts, chunk_intergenic, chunk_context_counts in chunk_results:
         # Combine base counts from chunk
         for base, count in chunk_base_counts.items():
-            base_counts[base] += count  # Add chunk counts to main base_counts
+            base_counts[base] += count
+            
+        # Combine context counts from chunk
+        for context, count in chunk_context_counts.items():
+            context_counts[context] = context_counts.get(context, 0) + count
             
         # Combine mutations
         for gene_id, gene_data in mutations.items():
@@ -464,7 +424,6 @@ def parse_mpile(mpile: str, seqobject: 'SeqContext', ems_only: bool, base_counts
         # Combine intergenic data
         if 'mutation_types' in chunk_intergenic:
             for mut_type, count in chunk_intergenic['mutation_types'].items():
-                # Combine total mutations
                 intergenic_counts['mutation_types'][mut_type] = \
                     intergenic_counts['mutation_types'].get(mut_type, 0) + count
         

@@ -16,6 +16,9 @@ import operator
 from statsmodels.stats.multitest import multipletests
 import pdb
 import matplotlib.gridspec as gridspec
+from scipy.stats import percentileofscore
+import ast
+
 
 def load_gene_info_cache(cache_file: str) -> Dict[str, Dict]:
     """Load cached gene info from JSON file."""
@@ -81,9 +84,67 @@ def lookup_gene_info(ncbi_id: str, cache_file: str = "gene_info_cache.json") -> 
     
     return None
 
-def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[str, pd.DataFrame]:
+def build_wd_to_ncbi_map(gff_path: str) -> dict:
+    """
+    Build a mapping from WD gene IDs to NCBI Gene IDs using the GFF file.
+    Returns: dict mapping WDxxxxxx -> ncbi_numeric_id (as string)
+    """
+    mapping = {}
+    print(f"Building WD to NCBI mapping from {gff_path}")
+    
+    try:
+        with open(gff_path) as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                parts = line.strip().split('\t')
+                if len(parts) < 9 or parts[2] != 'gene':
+                    continue
+                attrs = dict(attr.split('=') for attr in parts[8].split(';') if '=' in attr)
+                wd_id = attrs.get('ID', None)
+                # Remove 'gene-' prefix if present
+                if wd_id and wd_id.startswith('gene-'):
+                    wd_id = wd_id[5:]  # Remove 'gene-' prefix
+                dbxref = attrs.get('Dbxref', '')
+                ncbi_id = None
+                if 'GeneID:' in dbxref:
+                    ncbi_id = dbxref.split('GeneID:')[1]
+                if wd_id and ncbi_id:
+                    mapping[wd_id] = ncbi_id
+        
+        print(f"Found {len(mapping)} WD to NCBI mappings")
+        print("First few mappings:")
+        for i, (wd, ncbi) in enumerate(mapping.items()):
+            if i < 5:  # Print first 5 mappings
+                print(f"{wd} -> {ncbi}")
+            else:
+                break
+                
+        return mapping
+    except Exception as e:
+        print(f"Error building WD to NCBI mapping: {e}")
+        return {}
+
+
+def load_sample_results(results_dir: str, gene_lengths: Dict[str, int], output_dir: str) -> Dict[str, pd.DataFrame]:
     """Load all sample results and convert to DataFrames."""
     sample_dfs = {}
+    
+    # First load gene statistics to get coverage information
+    gene_stats_file = os.path.join(results_dir, 'gene_statistics.json')
+    gene_coverage = {}
+    if os.path.exists(gene_stats_file):
+        with open(gene_stats_file) as f:
+            gene_stats = json.load(f)
+            # Calculate average coverage across samples for each gene
+            for sample, stats in gene_stats.items():
+                for gene_id, gene_data in stats.items():
+                    if gene_id not in gene_coverage:
+                        gene_coverage[gene_id] = []
+                    gene_coverage[gene_id].append(gene_data.get('average_coverage', 0))
+            
+            # Calculate mean coverage for each gene
+            gene_coverage = {gene: np.mean(covs) for gene, covs in gene_coverage.items()}
     
     for file in Path(results_dir).glob('*_results.json'):
         sample = file.stem.replace('_results', '')
@@ -93,10 +154,10 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[
         # Convert to DataFrame
         rows = []
         for gene_id, values in data.items():
+            
             # Calculate p-value (two-tailed) for effect score
             perm_scores = values['permutation']['scores']
             effect_score = values['effect']
-            
             if len(perm_scores) <= 10:
                 pvalue_more = None
                 pvalue_less = None
@@ -125,14 +186,15 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[
                 'n_permutations': len(perm_scores),
                 'deleterious_mutations': values.get('mutation_stats', {}).get('deleterious_count', 0),
                 'total_mutations': values.get('mutation_stats', {}).get('total_mutations', 0),
-                'deleterious_ratio': deleterious_ratio
+                'deleterious_ratio': deleterious_ratio,
+                'avg_cov': gene_coverage.get(gene_id, 0)  # Use average coverage from gene statistics
             }
             rows.append(row)
             
         df = pd.DataFrame(rows)
         
-        # Calculate normalized scores using gene lengths
-        df['effect_norm_len'] = df.apply(lambda x: x['effect_score'] / gene_lengths.get(x['gene_id'], 1), axis=1)
+        # Calculate normalized scores using both gene lengths and average coverage
+        df['effect_norm'] = df.apply(lambda x: x['effect_score'] / (gene_lengths.get(x['gene_id'], 1) * max(x['avg_cov'], 1)), axis=1)
         
         # Apply FDR corrections
         valid_pvals_more = df['pvalue_more'].notna()
@@ -149,12 +211,23 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int]) -> Dict[
         
         valid_ratio_less = df['pvalue_ratio_less'].notna()
         if valid_ratio_less.any():
-            df.loc[valid_ratio_less, 'pvalue_ratio_less_fdr'] = multipletests(df.loc[valid_ratio_less, 'pvalue_ratio_less'], method='fdr_bh')[1]
+            df.loc[valid_ratio_less, 'pvalue_ratio_less_fdr'] = multipletests(df.loc[valid_ratio_less, 'pvalue_ratio_less'], method='fdr_bh')[1] 
         
         sample_dfs[sample] = df
         
     return sample_dfs
 
+def plot_deleterious_ratio_distribution(gene: str, observed_ratio: float, permuted_ratios: List[float], output_dir: str) -> None:
+    """Plot the distribution of deleterious ratios for a given gene."""
+    plt.hist(permuted_ratios, bins=30, alpha=0.7, label='Permuted')
+    plt.axvline(observed_ratio, color='red', linestyle='--', label='Observed')
+    plt.title(f'Deleterious Ratio Distribution for {gene}')
+    plt.xlabel('Deleterious Ratio')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, f'deleterious_ratio_dist_{gene}.png'))
+    plt.close()
+    
 def calculate_summed_effect_pvalue(observed_value: float, null_distribution: List[float]) -> float:
     """Calculate proper two-tailed empirical p-value.
     
@@ -210,7 +283,7 @@ def create_significant_genes_summary(df: pd.DataFrame, sample: str, output_dir: 
     summary_df = sig_genes[[
         'gene_id',
         'effect_score',
-        'effect_norm_len',
+        'effect_norm',
         'pvalue_more',
         'pvalue_less',
         'pvalue_more_fdr',
@@ -226,7 +299,7 @@ def create_significant_genes_summary(df: pd.DataFrame, sample: str, output_dir: 
     # Rename columns for clarity
     summary_df = summary_df.rename(columns={
         'effect_score': 'raw_effect_score',
-        'effect_norm_len': 'length_normalized_score',
+        'effect_norm': 'length_normalized_score',
         'permutation_mean': 'permutation_mean_score',
         'permutation_std': 'permutation_std_dev',
         'n_permutations': 'number_of_permutations',
@@ -251,7 +324,7 @@ def create_significant_genes_summary(df: pd.DataFrame, sample: str, output_dir: 
         'gene_name': sig_genes.get('gene_name', ''),
         'gene_description': sig_genes.get('gene_description', ''),
         'effect_score': sig_genes['effect_score'],
-        'effect_norm_len': sig_genes['effect_norm_len'],
+        'effect_norm': sig_genes['effect_norm'],
         'deleterious_ratio': sig_genes['deleterious_ratio'],
         'pvalue_more': sig_genes['pvalue_more'],
         'pvalue_less': sig_genes['pvalue_less'],
@@ -645,6 +718,10 @@ def compare_scoring_methods(df: pd.DataFrame, gene_lengths: Dict[str, int], samp
     # Filter out None/NaN p-values
     df_valid = df.dropna(subset=['pvalue_more_fdr', 'pvalue_less_fdr'])
     
+    # Add gene lengths and calculate normalized scores
+    df_valid['gene_length'] = df_valid['gene_id'].map(gene_lengths)
+    df_valid['length_normalized_score'] = df_valid['effect_score'] / df_valid['gene_length']
+    
     # Define significance for effect scores
     deleterious = (df_valid['pvalue_more_fdr'] < 0.05) & (df_valid['effect_score'] < 0)
     protective = (df_valid['pvalue_less_fdr'] < 0.05) & (df_valid['effect_score'] > 0)
@@ -691,7 +768,7 @@ def compare_scoring_methods(df: pd.DataFrame, gene_lengths: Dict[str, int], samp
     
     # Calculate correlations
     score_ratio_corr = df_valid['effect_score'].corr(df_valid['deleterious_ratio'])
-    norm_score_ratio_corr = df_valid['effect_norm_len'].corr(df_valid['deleterious_ratio'])
+    norm_score_ratio_corr = df_valid['length_normalized_score'].corr(df_valid['deleterious_ratio'])
     pval_corr = df_valid['pvalue_more_fdr'].corr(df_valid['pvalue_ratio_more_fdr'])
     
     # Add correlation text
@@ -747,17 +824,7 @@ def plot_volcano_ratio(df: pd.DataFrame, sample: str, output_dir: str) -> None:
     plt.close()
 
 def list_significant_genes(df: pd.DataFrame, sample: str, output_dir: str, cache_file: str = None) -> None:
-    """List genes with significant protective and deleterious FDR-corrected p-values."""
-    # Filter out None/NaN p-values
-    df_valid = df.dropna(subset=['pvalue_more_fdr', 'pvalue_less_fdr'])
-    
-    # Filter for significant deleterious and protective genes
-    significant_deleterious = df_valid[(df_valid['pvalue_more_fdr'] < 0.05) & (df_valid['effect_score'] < 0)]
-    significant_protective = df_valid[(df_valid['pvalue_less_fdr'] < 0.05) & (df_valid['effect_score'] > 0)]
-    
-    # Also get ratio-based significant genes
-    ratio_high = df_valid[df_valid['pvalue_ratio_more_fdr'] < 0.05]
-    ratio_low = df_valid[df_valid['pvalue_ratio_less_fdr'] < 0.05]
+    """List genes with significant FDR-corrected p-values in 4 separate categories."""
     
     # Add gene descriptions
     gene_info_cache = load_gene_info_cache(cache_file) if cache_file else {}
@@ -777,42 +844,83 @@ def list_significant_genes(df: pd.DataFrame, sample: str, output_dir: str, cache
                 if gene_info:
                     result_df.at[i, 'gene_description'] = gene_info.get('description', '')
         
-        # Select and reorder columns
-        columns = [
+        # Select and reorder columns based on what's available
+        base_columns = [
             'gene_id', 
             'gene_description', 
             'effect_score',
-            'pvalue_more_fdr', 
-            'pvalue_less_fdr',
             'deleterious_mutations',
             'total_mutations',
             'deleterious_ratio'
         ]
         
+        # Add p-value columns that exist
+        available_pval_cols = [col for col in ['pvalue_more_fdr', 'pvalue_less_fdr', 'pvalue_ratio_more_fdr', 'pvalue_ratio_less_fdr'] 
+                              if col in result_df.columns]
+        
+        columns = base_columns + available_pval_cols
+        
         return result_df[columns]
     
-    # Process each dataframe
-    del_df = add_gene_info(significant_deleterious)
-    prot_df = add_gene_info(significant_protective)
-    high_ratio_df = add_gene_info(ratio_high)
-    low_ratio_df = add_gene_info(ratio_low)
+    # Check which FDR columns exist
+    has_effect_fdr = 'pvalue_more_fdr' in df.columns and 'pvalue_less_fdr' in df.columns
+    has_ratio_fdr = 'pvalue_ratio_more_fdr' in df.columns and 'pvalue_ratio_less_fdr' in df.columns
     
-    # Save to CSV
-    deleterious_file = os.path.join(output_dir, f"{sample}_significant_deleterious_genes.csv")
-    protective_file = os.path.join(output_dir, f"{sample}_significant_protective_genes.csv")
-    ratio_high_file = os.path.join(output_dir, f"{sample}_significant_high_ratio_genes.csv")
-    ratio_low_file = os.path.join(output_dir, f"{sample}_significant_low_ratio_genes.csv")
+    # Initialize empty DataFrames
+    effect_more_df = pd.DataFrame()
+    effect_less_df = pd.DataFrame()
+    ratio_more_df = pd.DataFrame()
+    ratio_less_df = pd.DataFrame()
     
-    del_df.to_csv(deleterious_file, index=False)
-    prot_df.to_csv(protective_file, index=False)
-    high_ratio_df.to_csv(ratio_high_file, index=False)
-    low_ratio_df.to_csv(ratio_low_file, index=False)
+    # 1. Genes with significant pvalue_more_fdr < 0.05 (deleterious effect)
+    if has_effect_fdr:
+        significant_effect_more = df[df['pvalue_more_fdr'] < 0.05].dropna(subset=['pvalue_more_fdr'])
+        effect_more_df = add_gene_info(significant_effect_more)
+        if not effect_more_df.empty:
+            effect_more_df = effect_more_df.sort_values('pvalue_more_fdr')
+    
+    # 2. Genes with significant pvalue_less_fdr < 0.05 (protective effect)  
+    if has_effect_fdr:
+        significant_effect_less = df[df['pvalue_less_fdr'] < 0.05].dropna(subset=['pvalue_less_fdr'])
+        effect_less_df = add_gene_info(significant_effect_less)
+        if not effect_less_df.empty:
+            effect_less_df = effect_less_df.sort_values('pvalue_less_fdr')
+    
+    # 3. Genes with significant pvalue_ratio_more_fdr < 0.05 (high deleterious ratio)
+    if has_ratio_fdr:
+        significant_ratio_more = df[df['pvalue_ratio_more_fdr'] < 0.05].dropna(subset=['pvalue_ratio_more_fdr'])
+        ratio_more_df = add_gene_info(significant_ratio_more)
+        if not ratio_more_df.empty:
+            ratio_more_df = ratio_more_df.sort_values('pvalue_ratio_more_fdr')
+    
+    # 4. Genes with significant pvalue_ratio_less_fdr < 0.05 (low deleterious ratio)
+    if has_ratio_fdr:
+        significant_ratio_less = df[df['pvalue_ratio_less_fdr'] < 0.05].dropna(subset=['pvalue_ratio_less_fdr'])
+        ratio_less_df = add_gene_info(significant_ratio_less)
+        if not ratio_less_df.empty:
+            ratio_less_df = ratio_less_df.sort_values('pvalue_ratio_less_fdr')
+    
+    # Save to CSV files
+    effect_more_file = os.path.join(output_dir, f"{sample}_significant_effect_more_genes.csv")
+    effect_less_file = os.path.join(output_dir, f"{sample}_significant_effect_less_genes.csv")
+    ratio_more_file = os.path.join(output_dir, f"{sample}_significant_ratio_more_genes.csv")
+    ratio_less_file = os.path.join(output_dir, f"{sample}_significant_ratio_less_genes.csv")
+    
+    effect_more_df.to_csv(effect_more_file, index=False)
+    effect_less_df.to_csv(effect_less_file, index=False)
+    ratio_more_df.to_csv(ratio_more_file, index=False)
+    ratio_less_df.to_csv(ratio_less_file, index=False)
     
     print(f"\nSignificant genes for {sample}:")
-    print(f"Deleterious genes: {len(significant_deleterious)}")
-    print(f"Protective genes: {len(significant_protective)}")
-    print(f"High ratio genes: {len(ratio_high)}")
-    print(f"Low ratio genes: {len(ratio_low)}")
+    print(f"Effect more significant (pvalue_more_fdr < 0.05): {len(effect_more_df)}")
+    print(f"Effect less significant (pvalue_less_fdr < 0.05): {len(effect_less_df)}")
+    print(f"Ratio more significant (pvalue_ratio_more_fdr < 0.05): {len(ratio_more_df)}")
+    print(f"Ratio less significant (pvalue_ratio_less_fdr < 0.05): {len(ratio_less_df)}")
+    
+    if not has_effect_fdr:
+        print("Warning: Effect FDR columns not found in DataFrame")
+    if not has_ratio_fdr:
+        print("Warning: Ratio FDR columns not found in DataFrame")
 
 def generate_summary_tables(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, cache_file: str = None) -> None:
     """Generate comprehensive summary tables of significant genes."""
@@ -1064,6 +1172,207 @@ def load_gene_lengths(gff_path: str) -> Dict[str, int]:
         print(f"Error loading GFF file: {e}")
         return {}
 
+def load_module_assignments(module_file: str) -> pd.DataFrame:
+    """Load gene module assignments from transcriptomic data."""
+    return pd.read_csv(module_file, sep='\t')
+
+def load_expression_data(expression_file: str) -> pd.DataFrame:
+    """Load expression data from DESeq2 results file."""
+    return pd.read_csv(expression_file, sep='\t')
+
+def plot_effect_coverage_by_module(df: pd.DataFrame, module_df: pd.DataFrame, output_dir: str, wd_to_gid_map: Dict[str, str], gene_lengths: Dict[str, int]) -> None:
+    """Create scatter plots of effect scores and deleterious ratios against gene length, colored by module."""
+    # Create reverse mapping (GID to WD)
+    gid_to_wd_map = {v: k for k, v in wd_to_gid_map.items()}
+    
+    # Add WD IDs to the effect scores DataFrame
+    df['wd_id'] = df['gene_id'].map(gid_to_wd_map)
+    
+    # Add gene lengths
+    df['gene_length'] = df['gene_id'].map(gene_lengths)
+    
+    # Merge effect scores with module assignments using WD IDs
+    merged_df = pd.merge(df, module_df, left_on='wd_id', right_on='gene', how='inner')
+    
+    if merged_df.empty:
+        return
+    
+    # Drop any rows with NaN values in the columns we'll plot
+    plot_df = merged_df.dropna(subset=['gene_length', 'effect_score', 'deleterious_ratio', 'module'])
+    
+    if plot_df.empty:
+        return
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot 1: Effect Score vs Gene Length
+    for module in sorted(plot_df['module'].unique()):
+        module_data = plot_df[plot_df['module'] == module]
+        if not module_data.empty:
+            ax1.scatter(module_data['gene_length'].astype(float), 
+                       module_data['effect_score'].astype(float),
+                       label=f'Module {module}',
+                       alpha=0.6)
+    
+    ax1.set_xlabel('Gene Length (bp)')
+    ax1.set_ylabel('Effect Score')
+    ax1.set_title('Effect Score vs Gene Length by Module')
+    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xscale('log')  # Log scale for gene length
+    
+    # Plot 2: Deleterious Ratio vs Gene Length
+    for module in sorted(plot_df['module'].unique()):
+        module_data = plot_df[plot_df['module'] == module]
+        if not module_data.empty:
+            ax2.scatter(module_data['gene_length'].astype(float), 
+                       module_data['deleterious_ratio'].astype(float),
+                       label=f'Module {module}',
+                       alpha=0.6)
+    
+    ax2.set_xlabel('Gene Length (bp)')
+    ax2.set_ylabel('Deleterious Ratio')
+    ax2.set_title('Deleterious Ratio vs Gene Length by Module')
+    ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xscale('log')  # Log scale for gene length
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'effect_coverage_by_module.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_effect_by_expression(df: pd.DataFrame, expression_df: pd.DataFrame, output_dir: str, wd_to_gid_map: Dict[str, str]) -> None:
+    """Create scatter plots of effect scores and deleterious ratios against log2FoldChange, colored by significance."""
+    # Create reverse mapping (GID to WD)
+    gid_to_wd_map = {v: k for k, v in wd_to_gid_map.items()}
+    
+    # Add WD IDs to the effect scores DataFrame
+    df['wd_id'] = df['gene_id'].map(gid_to_wd_map)
+    
+    # Merge effect scores with expression data using WD IDs
+    merged_df = pd.merge(df, expression_df, left_on='wd_id', right_on='gene', how='inner')
+    
+    if merged_df.empty:
+        return
+    
+    # Drop any rows with NaN values in the columns we'll plot
+    plot_df = merged_df.dropna(subset=['log2FoldChange', 'effect_norm', 'deleterious_ratio', 'padj'])
+    
+    if plot_df.empty:
+        return
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Define significance
+    significant = plot_df['padj'] < 0.05
+    nonsig = ~significant
+    
+    # Plot 1: Normalized Effect Score vs log2FoldChange
+    ax1.scatter(plot_df[nonsig]['baseMean'], 
+                plot_df[nonsig]['effect_norm'],
+                color='grey', alpha=0.3, label='Non-significant')
+    ax1.scatter(plot_df[significant]['baseMean'], 
+                plot_df[significant]['effect_norm'],
+                color='red', alpha=0.6, label='Significant (padj < 0.05)')
+    
+    ax1.set_xlabel('baseMean')
+    ax1.set_ylabel('Length-Normalized Effect Score')
+    ax1.set_title('Normalized Effect Score vs Expression Change')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Deleterious Ratio vs log2FoldChange
+    ax2.scatter(plot_df[nonsig]['baseMean'], 
+                plot_df[nonsig]['deleterious_ratio'],
+                color='grey', alpha=0.3, label='Non-significant')
+    ax2.scatter(plot_df[significant]['baseMean'], 
+                plot_df[significant]['deleterious_ratio'],
+                color='red', alpha=0.6, label='Significant (padj < 0.05)')
+    
+    ax2.set_xlabel('baseMean')
+    ax2.set_ylabel('Deleterious Ratio')
+    ax2.set_title('Deleterious Ratio vs Expression Change')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'effect_by_expression.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_expression_vs_mutations(df: pd.DataFrame, expression_df: pd.DataFrame, output_dir: str, wd_to_gid_map: Dict[str, str], gene_lengths: Dict[str, int]) -> None:
+    """Create scatter plots comparing baseMean expression to total mutations normalized by gene length."""
+    # Create reverse mapping (GID to WD)
+    gid_to_wd_map = {v: k for k, v in wd_to_gid_map.items()}
+    
+    # Add WD IDs to the effect scores DataFrame
+    df['wd_id'] = df['gene_id'].map(gid_to_wd_map)
+    
+    # Add gene lengths
+    df['gene_length'] = df['gene_id'].map(gene_lengths)
+    
+    # Merge effect scores with expression data using WD IDs
+    merged_df = pd.merge(df, expression_df, left_on='wd_id', right_on='gene', how='inner')
+    
+    if merged_df.empty:
+        return
+    
+    # Drop any rows with NaN values in the columns we'll plot
+    plot_df = merged_df.dropna(subset=['baseMean', 'total_mutations', 'gene_length', 'padj'])
+    
+    if plot_df.empty:
+        return
+    
+    # Calculate mutations per base pair
+    plot_df['mutations_per_bp'] = plot_df['total_mutations'] / plot_df['gene_length']
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Define significance
+    # Print one row of plot_df to inspect the data
+    print("\nExample row from plot_df:")
+    print(plot_df.iloc[0].to_string())
+    print()  
+    input()
+    significant = plot_df['padj'] < 0.05
+    nonsig = ~significant
+    
+    # Plot 1: baseMean vs Total Mutations
+    ax1.scatter(plot_df[nonsig]['baseMean'], 
+                plot_df[nonsig]['total_mutations'],
+                color='grey', alpha=0.3, label='Non-significant')
+    ax1.scatter(plot_df[significant]['baseMean'], 
+                plot_df[significant]['total_mutations'],
+                color='red', alpha=0.6, label='Significant (padj < 0.05)')
+    
+    ax1.set_xlabel('baseMean Expression')
+    ax1.set_ylabel('Total Mutations')
+    ax1.set_title('Expression vs Total Mutations')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xscale('log')  # Log scale for baseMean
+    
+    # Plot 2: baseMean vs Mutations per bp
+    ax2.scatter(plot_df[nonsig]['baseMean'], 
+                plot_df[nonsig]['mutations_per_bp'],
+                color='grey', alpha=0.3, label='Non-significant')
+    ax2.scatter(plot_df[significant]['baseMean'], 
+                plot_df[significant]['mutations_per_bp'],
+                color='red', alpha=0.6, label='Significant (padj < 0.05)')
+    
+    ax2.set_xlabel('baseMean Expression')
+    ax2.set_ylabel('Mutations per bp')
+    ax2.set_title('Expression vs Mutations per bp')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xscale('log')  # Log scale for baseMean
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'expression_vs_mutations.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze PROVEAN score results')
     parser.add_argument('results_dir', help='Directory containing sample results JSON files')
@@ -1084,8 +1393,17 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Load module assignments
+    module_df = load_module_assignments(config['references']['module_assignments'])
+    
+    # Load expression data
+    expression_df = load_expression_data(config['references']['expression_data'])
+    
+    # Build WD to GID mapping
+    wd_to_gid_map = build_wd_to_ncbi_map(config['references']['annotation'])
+    
     # Load all sample results with gene lengths
-    sample_dfs = load_sample_results(args.results_dir, gene_lengths)
+    sample_dfs = load_sample_results(args.results_dir, gene_lengths, args.output_dir)
     
     # First analyze each sample to get gene descriptions
     samples_with_info = {}
@@ -1094,7 +1412,17 @@ def main():
         sample_dir = os.path.join(args.output_dir, sample)
         os.makedirs(sample_dir, exist_ok=True)
         analyze_sample(df, sample, sample_dir, cache_file, gene_lengths)
+        df.to_csv(os.path.join(sample_dir, "results_with_percentiles.csv"), index=False)
         samples_with_info[sample] = df
+        
+        # Create effect coverage plots
+        plot_effect_coverage_by_module(df, module_df, sample_dir, wd_to_gid_map, gene_lengths)
+        
+        # Create effect by expression plots
+        plot_effect_by_expression(df, expression_df, sample_dir, wd_to_gid_map)
+        
+        # Create expression vs mutations plots
+        plot_expression_vs_mutations(df, expression_df, sample_dir, wd_to_gid_map, gene_lengths)
     
     # Now do shared gene analysis
     if samples_with_info:

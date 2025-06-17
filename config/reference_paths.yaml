@@ -5,6 +5,8 @@ references:
   prov_score_sql_db: '/storage1/gabe/ems_effect_code/data/provean_database/provean.db'
   prov_score_json_db: '/storage1/gabe/ems_effect_code/data/provean_database/provean_db.json'
   gene_info_cache: '/storage1/gabe/ems_effect_code/data/references/gene_info_cache.json'
+  module_assignments: '/storage1/gabe/ems_effect_code/data/transcriptomic_data/S18.wMel.genes.by.module.tsv'
+  expression_data: '/storage1/gabe/ems_effect_code/data/transcriptomic_data/S15.WaldT.wMel.JW18.vs.S2.tsv'
 provean:
   data_dir: '/storage1/gabe/ems_effect_code/data/provean_sets'
   executable: '/storage1/gabe/ems_effect_code/provean/provean.sh'

@@ -459,6 +459,10 @@ def process_line(line, depth_threshold, seq_context):
     
     if not alt or alt_base_count == 0:  # No alternate allele found
         return None, (set(), set(), set()), None
+
+    if alt_base_count < 3:
+        n_filtered = set([pos])
+        return None, (set(), n_filtered, set()), None
     
     # Initialize filter sets
     depth_filtered = set()
@@ -483,6 +487,7 @@ def process_line(line, depth_threshold, seq_context):
         measurement = (depth, n_count, alt_base_count)
     
     # Filter if more Ns than alternate bases
+    
     if base_counts['N'] > alt_base_count*10:
         n_filtered.add(pos)
         return None, (depth_filtered, n_filtered, bias_filtered), measurement
@@ -625,6 +630,7 @@ def main(mpileup_dir, output_dir, config_path):
         depth_filtered_sites = set()
         n_filtered_sites = set()
         bias_filtered_sites = set()
+        low_alt_filtered_sites = set()
         
         with open(mpileup_file) as f_in, \
              open(output_file, 'w') as f_out, \
@@ -638,6 +644,9 @@ def main(mpileup_dir, output_dir, config_path):
                     [(line, depth_threshold, seq_context) for line in lines]
                 )
             
+            # Counter for lines with mutations written to output
+            written_mutation_lines = 0
+
             # Process results and accumulate filtered positions
             for result, (depth_filtered, n_filtered, bias_filtered), measurement in results:
                 if measurement is not None:
@@ -645,25 +654,31 @@ def main(mpileup_dir, output_dir, config_path):
                 
                 # Accumulate filtered positions by reason
                 depth_filtered_sites.update(depth_filtered)
-                n_filtered_sites.update(n_filtered)
                 bias_filtered_sites.update(bias_filtered)
-                
-                # Combine all filtered positions
                 filtered_positions[sample_name].update(depth_filtered)
-                filtered_positions[sample_name].update(n_filtered)
                 filtered_positions[sample_name].update(bias_filtered)
+                if n_filtered and not depth_filtered and not bias_filtered:
+                    # low-alt filter, do not add to filtered_positions
+                    low_alt_filtered_sites.update(n_filtered)
+                else:
+                    n_filtered_sites.update(n_filtered)
+                    filtered_positions[sample_name].update(n_filtered)
                 
                 if result:
                     chrom, pos, ref, depth, reads, qual, mutation_type = result
                     f_out.write(f"{chrom}\t{pos}\t{ref}\t{depth}\t{reads}\t{qual}\n")
                     if mutation_type:
                         f_mut.write(f"{chrom}\t{pos}\t{ref}\t{depth}\t{reads}\t{qual}\t{mutation_type}\n")
+                    written_mutation_lines += 1
         
         print(f"Results for {sample_name}:")
         print(f"Total sites processed: {len(lines)}")
         print(f"Sites filtered due to depth: {len(depth_filtered_sites)}")
         print(f"Sites filtered due to excess N bases: {len(n_filtered_sites)}")
         print(f"Sites filtered due to position bias: {len(bias_filtered_sites)}")
+        print(f"Sites filtered due to <4 alternate alleles: {len(low_alt_filtered_sites)}")
+        print(f"Sites with mutations remaining: {len(lines) - len(depth_filtered_sites) - len(n_filtered_sites) - len(bias_filtered_sites) - len(low_alt_filtered_sites)}")
+        print(f"Lines with mutations written to output: {written_mutation_lines}")
     
     
     # Filter and save genic positions to JSON

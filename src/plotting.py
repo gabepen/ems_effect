@@ -10,6 +10,8 @@ import numpy as np
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
+from scipy.stats import fisher_exact
+from collections import defaultdict
 
 def load_json(file_path):
     with open(file_path, 'r') as file:
@@ -59,55 +61,40 @@ def count_mutations(json_files: list) -> dict:
                
     return total_freqs
 
-def plot_kmer_context(data_dict: dict, genome_kmer_counts: dict, output_dir: str) -> None:
-    '''Plot the kmer context barplot.
-    
-    Args:
-        data_dict (dict): Dictionary of kmer context data
-        output_dir (str): Directory to save output plot
-    '''
-    
-    # Set output path for the plot 
+def plot_kmer_context(context_counts: dict, genome_kmer_counts: dict, output_dir: str) -> None:
+    '''Plot the 7-mer context barplot (7-mers only).'''
     output_path = os.path.join(output_dir, 'kmer_context.png')
-
-    # initialize a dictionary to store the observed kmers
     observed_kmers = {}
-    ems_samples = []
-    
-    # normalize and average the observed kmer rate across all treated samples
-    for sample in data_dict:
-        if 'EMS' in sample:
-            ems_samples.append(sample)
-            for kmer in data_dict[sample]:
+    ems_samples = [sample for sample in context_counts if 'EMS' in sample and '7d' not in sample and '3d' not in sample]
+
+    # Use only 7-mers and the '7' key in genome_kmer_counts
+    genome_7mer_counts = genome_kmer_counts['7'] if '7' in genome_kmer_counts else {}
+
+    for sample in ems_samples:
+        sample_data = context_counts[sample]
+        for kmer, count in sample_data.items():
+            if len(kmer) == 7 and kmer in genome_7mer_counts and genome_7mer_counts[kmer] > 0:
+                freq = count / genome_7mer_counts[kmer]
                 if kmer not in observed_kmers:
-                    observed_kmers[kmer] = data_dict[sample][kmer] / genome_kmer_counts[kmer]
-                else:
-                    observed_kmers[kmer] += data_dict[sample][kmer] / genome_kmer_counts[kmer] 
-                     
-    for kmer in observed_kmers:
-        observed_kmers[kmer] = observed_kmers[kmer] / len(ems_samples)
-            
-    # plot the kmer context barplot 
-    # Sort kmers by count and get top 10
-    top_kmers = dict(sorted(observed_kmers.items(), key=lambda x: x[1], reverse=True)[:30])
-    
-    # Create figure and axis
+                    observed_kmers[kmer] = []
+                observed_kmers[kmer].append(freq)
+
+    # Average across samples
+    averaged_kmers = {kmer: np.mean(freqs) for kmer, freqs in observed_kmers.items() if freqs}
+
+    # Sort and get top 30
+    top_kmers = dict(sorted(averaged_kmers.items(), key=lambda x: x[1], reverse=True)[:30])
+
     plt.figure(figsize=(12, 6))
-    
-    # Create bar plot
     plt.bar(top_kmers.keys(), top_kmers.values(), color='darkorange')
-    
-    # Customize plot
-    plt.xlabel('Kmer Context')
-    plt.ylabel('Frequency')
-    plt.title('Top 30 Most Frequent Kmer Contexts')
+    plt.xlabel('7-mer Context')
+    plt.ylabel('Normalized Frequency (Observed/Genome)')
+    plt.title('Top 30 Most Frequent 7-mer Contexts (EMS Samples)')
     plt.xticks(rotation=45, ha='right')
-    
-    # Adjust layout and save
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
 def extract_sample_id(sample):
     '''Extract abbreviated sample ID from full sample name.
     
@@ -301,35 +288,47 @@ def plot_ems_mutation_frequencies_seaborn(data_path: str, output_dir: str) -> No
     # Save the plot to a file
     plt.savefig(output_path, dpi=300, pad_inches=0.1)
 
-def normalize_mutation_counts(total_freqs: dict, base_counts: dict, output_file_dir: str) -> str:
-    '''Normalize mutation counts by total reference base counts and write to CSV.
+def normalize_mutation_counts(total_freqs: dict, base_counts: dict, output_dir: str) -> str:
+    '''Normalize mutation counts by base counts and save to CSV.
     
     Args:
         total_freqs (dict): Dictionary of mutation frequencies per sample
-        base_counts (dict): Dictionary of total base counts per sample from basecounts.json
-        output_file_dir (str): Directory to write output CSV
+        base_counts (dict): Dictionary of genome-wide base counts {'A': count, 'T': count, ...}
+        output_dir (str): Directory to save output CSV
         
     Returns:
-        str: Path to output CSV file
+        str: Path to the saved CSV file
     '''
-    output_file = os.path.join(output_file_dir, 'normalized_ems_mutations_freqs.csv')
-    header = ['sample','ems','norm_count','mutation']
     
-    with open(output_file, 'w') as csvf:
-        writer = csv.writer(csvf)
-        writer.writerow(header)
-        for sample in total_freqs:
-            if 'NT' in sample or 'Minus' in sample or 'Pre' in sample:
-                ems = '-'
-            else:
-                ems = '+'
-            for mut_type in total_freqs[sample]:
-                ref = mut_type[0]  # Get reference base from mutation type
-                # Normalize by total count of reference base from basecounts
-                norm_freq = total_freqs[sample][mut_type] / base_counts[sample][ref]
-                writer.writerow([sample, ems, norm_freq, mut_type])
+    output_path = os.path.join(output_dir, 'mutation_frequencies.csv')
     
-    return output_file
+    # Prepare data for CSV
+    csv_data = []
+    
+    for sample in total_freqs:
+        # Determine if sample is EMS treated
+        ems_status = '+' if 'EMS' in sample else '-'
+        
+        for mut_type in total_freqs[sample]:
+            if '>' in mut_type:
+                ref = mut_type.split('>')[0]
+                if ref in base_counts:
+                    # Normalize by genome-wide base count
+                    norm_freq = total_freqs[sample][mut_type] / base_counts[ref]
+                    
+                    csv_data.append({
+                        'sample': sample,
+                        'mutation': mut_type,
+                        'count': total_freqs[sample][mut_type],
+                        'norm_count': norm_freq,
+                        'ems': ems_status
+                    })
+    
+    # Save to CSV
+    df = pd.DataFrame(csv_data)
+    df.to_csv(output_path, index=False)
+    
+    return output_path
 
 def plot_dnds_ratio(amino_acid_mutations, output_dir, sample_name):
     '''Plot dN/dS ratio relationships.
@@ -382,23 +381,24 @@ def plot_dnds_ratio(amino_acid_mutations, output_dir, sample_name):
     plt.savefig(os.path.join(output_dir, f'dnds_relationships_{sample_name}.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
-def mutation_type_barplot(json_file_dir: list, base_counts: dict, output_file_dir: str):
-    '''Generate mutation type frequency barplot using basecounts for normalization.
+def mutation_type_barplot(json_files: list, base_counts: dict, output_dir: str) -> None:
+    '''Generate mutation type frequency barplot.
     
     Args:
-        json_file_dir (list): List of paths to mutation JSON files
-        base_counts (dict): Dictionary of total base counts per sample
-        output_file_dir (str): Directory to write output files
+        json_files (list): List of paths to mutation JSON files
+        base_counts (dict): Dictionary of genome-wide base counts {'A': count, 'T': count, ...}
+        output_dir (str): Directory to save output plot
     '''
-    # Count mutation frequencies
-    total_frequencies = count_mutations(json_file_dir)
     
-    # Normalize using provided base counts
-    mutation_frequence_csv = normalize_mutation_counts(total_frequencies, base_counts, output_file_dir)
+    # Count mutations across all samples
+    total_freqs = count_mutations(json_files)
     
-    # Generate plot
-    plot_ems_mutation_frequencies(mutation_frequence_csv, output_file_dir)
-    plot_ems_mutation_frequencies_per_sample(mutation_frequence_csv, output_file_dir)   
+    # Normalize using provided base counts and generate CSV
+    mutation_frequency_csv = normalize_mutation_counts(total_freqs, base_counts, output_dir)
+    
+    # Generate plots using the CSV
+    plot_ems_mutation_frequencies(mutation_frequency_csv, output_dir)
+    plot_ems_mutation_frequencies_per_sample(mutation_frequency_csv, output_dir)
 
 def plot_combined_dnds_ratios(aa_mutations_files: list, output_dir: str) -> None:
     """Plot combined dN/dS ratio analysis."""
@@ -640,7 +640,7 @@ def plot_dnds_analysis(results_csv: str, output_dir: str, title: str = "dN/dS An
     plt.savefig(f"{output_dir}/dnds_analysis.png", dpi=300)
     plt.savefig(f"{output_dir}/dnds_analysis.pdf")
     plt.close()
-    
+
     # Also create a version with samples sorted by type (NT vs EMS)
     df['Sample_Type'] = df['Sample_ID'].str.extract(r'(NT|EMS)')
     df = df.sort_values(['Sample_Type', 'Ratio'], ascending=[True, False])
@@ -758,6 +758,1121 @@ def plot_per_gene_dnds(results_dir: str, output_dir: str) -> None:
                 plt.savefig(f"{output_dir}/per_gene_dnds_{sample_name}.png", dpi=300, bbox_inches='tight')
                 plt.close()
 
+def plot_normalized_kmer_context_per_sample(context_counts: dict, genome_kmer_counts: dict, output_dir: str) -> None:
+    '''Plot normalized 7-mer context for each sample.'''
+    output_path = os.path.join(output_dir, 'normalized_kmer_context_per_sample.png')
+    sample_data = {}
+    all_kmers = set()
+    genome_7mer_counts = genome_kmer_counts['7'] if '7' in genome_kmer_counts else {}
+
+    for sample, data in context_counts.items():
+        if '7d' in sample or '3d' in sample:
+            continue
+        sample_data[sample] = {}
+        for kmer, count in data.items():
+            if len(kmer) == 7 and kmer in genome_7mer_counts and genome_7mer_counts[kmer] > 0:
+                norm_freq = count / genome_7mer_counts[kmer]
+                sample_data[sample][kmer] = norm_freq
+                all_kmers.add(kmer)
+
+    if not sample_data:
+        print("No normalized 7-mer kmer data found")
+        return
+
+    # Get top 20 most variable kmers across all samples
+    kmer_variances = {}
+    for kmer in all_kmers:
+        values = [sample_data[sample].get(kmer, 0) for sample in sample_data]
+        if len(values) > 1:
+            kmer_variances[kmer] = np.var(values)
+
+    top_kmers = sorted(kmer_variances.items(), key=lambda x: x[1], reverse=True)[:20]
+    top_kmer_names = [kmer for kmer, _ in top_kmers]
+
+    ems_samples = [s for s in sample_data.keys() if 'EMS' in s and '7d' not in s and '3d' not in s]
+    control_samples = [s for s in sample_data.keys() if 'EMS' not in s and '3d' not in s]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+    plot_data = []
+    sample_labels = []
+
+    for sample in control_samples + ems_samples:
+        row = [sample_data[sample].get(kmer, 0) for kmer in top_kmer_names]
+        plot_data.append(row)
+        sample_labels.append(sample)
+
+    im = ax1.imshow(plot_data, cmap='RdYlBu_r', aspect='auto')
+    ax1.set_xticks(range(len(top_kmer_names)))
+    ax1.set_xticklabels(top_kmer_names, rotation=45, ha='right')
+    ax1.set_yticks(range(len(sample_labels)))
+    ax1.set_yticklabels(sample_labels)
+    ax1.set_title('Normalized 7-mer Context Frequencies (Top 20 Most Variable)')
+    ax1.set_xlabel('7-mer Context')
+    ax1.set_ylabel('Sample')
+    plt.colorbar(im, ax=ax1, label='Normalized Frequency')
+
+    if control_samples:
+        ax1.axhline(y=len(control_samples)-0.5, color='black', linewidth=2)
+
+    if control_samples and ems_samples:
+        control_means = {kmer: np.mean([sample_data[s].get(kmer, 0) for s in control_samples]) for kmer in top_kmer_names}
+        ems_means = {kmer: np.mean([sample_data[s].get(kmer, 0) for s in ems_samples]) for kmer in top_kmer_names}
+        x = np.arange(len(top_kmer_names))
+        width = 0.35
+        ax2.bar(x - width/2, [control_means[k] for k in top_kmer_names], width, label='Control', color='lightgray', alpha=0.7)
+        ax2.bar(x + width/2, [ems_means[k] for k in top_kmer_names], width, label='EMS Treated', color='darkorange', alpha=0.7)
+        ax2.set_xlabel('7-mer Context')
+        ax2.set_ylabel('Mean Normalized Frequency')
+        ax2.set_title('Average Normalized 7-mer Frequencies: Control vs EMS')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(top_kmer_names, rotation=45, ha='right')
+        ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def analyze_ems_mutation_kmer_bias(context_counts: dict, genome_kmer_counts: dict, output_dir: str) -> None:
+    '''Analyze 7-mer kmer bias for each EMS sample individually.'''
+    if not genome_kmer_counts or '7' not in genome_kmer_counts:
+        print("No genome 7-mer kmer counts found for bias analysis")
+        return
+
+    genome_7mer_counts = genome_kmer_counts['7']
+    # Only use C/G-centered 7-mers for expected
+    cg_genome_kmers = {kmer: count for kmer, count in genome_7mer_counts.items() if len(kmer) == 7 and kmer[3] in ['C', 'G']}
+    total_genome_kmers = sum(cg_genome_kmers.values())
+
+    for sample, sample_kmers in context_counts.items():
+        if 'EMS' not in sample or '7d' in sample or '3d' in sample:
+            continue
+
+        output_path = os.path.join(output_dir, f'ems_mutation_kmer_bias_{sample}.png')
+        # Only use C/G-centered 7-mers for observed
+        ems_mutation_kmers = {kmer: count for kmer, count in sample_kmers.items() if len(kmer) == 7 and kmer[3] in ['C', 'G']}
+
+        total_mutations = sum(ems_mutation_kmers.values())
+
+        bias_analysis = []
+        for kmer, observed_count in ems_mutation_kmers.items():
+            genome_count = cg_genome_kmers.get(kmer, 0)
+            if genome_count == 0:
+                continue
+            expected_freq = genome_count / total_genome_kmers
+            expected_count = expected_freq * total_mutations
+            enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else np.nan
+
+            # Fisher's exact test
+            table = [
+                [observed_count, total_mutations - observed_count],
+                [genome_count, total_genome_kmers - genome_count]
+            ]
+            _, p_value = fisher_exact(table, alternative='greater')
+
+            bias_analysis.append({
+                'kmer': kmer,
+                'observed_count': observed_count,
+                'expected_count': expected_count,
+                'enrichment_ratio': enrichment_ratio,
+                'p_value': p_value,
+                'significant': bool(p_value < 0.05 and enrichment_ratio > 1)
+            })
+
+        bias_analysis.sort(key=lambda x: x['enrichment_ratio'], reverse=True)
+        significant_kmers = [x for x in bias_analysis if x['significant']]
+
+        # Save detailed results
+        results_path = os.path.join(output_dir, f'ems_kmer_bias_analysis_{sample}.json')
+        with open(results_path, 'w') as f:
+            json.dump({
+                'summary': {
+                    'total_mutations': total_mutations,
+                    'total_kmers_analyzed': len(bias_analysis),
+                    'significantly_enriched': len(significant_kmers),
+                    'median_enrichment': float(np.median([x['enrichment_ratio'] for x in bias_analysis if not np.isnan(x['enrichment_ratio'])])),
+                    'mean_enrichment': float(np.mean([x['enrichment_ratio'] for x in bias_analysis if not np.isnan(x['enrichment_ratio'])]))
+                },
+                'top_enriched_kmers': bias_analysis[:20],
+                'significant_kmers': significant_kmers
+            }, f, indent=2)
+
+        # Plot top 20 enriched kmers for this sample
+        top_kmers = bias_analysis[:20]
+        if top_kmers:
+            kmers = [x['kmer'] for x in top_kmers]
+            ratios = [x['enrichment_ratio'] for x in top_kmers]
+            colors = ['red' if x['significant'] else 'orange' for x in top_kmers]
+
+            plt.figure(figsize=(10, 6))
+            y_pos = np.arange(len(kmers))
+            plt.barh(y_pos, ratios, color=colors, alpha=0.7)
+            plt.yticks(y_pos, kmers)
+            plt.xlabel('Enrichment Ratio (Observed/Expected)')
+            plt.title(f'Top 20 Enriched 7-mers in {sample}')
+            plt.axvline(x=1, color='black', linestyle='--', alpha=0.5)
+            plt.gca().invert_yaxis()
+            plt.tight_layout()
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+        # Print summary
+        print(f"\nEMS Mutation 7-mer Kmer Bias Analysis for {sample}:")
+        print(f"Total mutations analyzed: {total_mutations:,}")
+        print(f"Significantly enriched kmers: {len(significant_kmers)}")
+        if significant_kmers:
+            print(f"\nTop 5 significantly enriched kmers:")
+            for i, kmer_data in enumerate(significant_kmers[:5]):
+                print(f"  {i+1}. {kmer_data['kmer']}: {kmer_data['enrichment_ratio']:.2f}x enriched (p={kmer_data['p_value']:.2e})")
+        print(f"Detailed results saved to {results_path}")
+
+def analyze_ems_cg_kmer_bias(context_counts: dict, genome_kmer_counts: dict, output_dir: str) -> None:
+    '''Analyze EMS mutation bias specifically for 7-mers with C or G as center base.'''
+    output_path = os.path.join(output_dir, 'ems_cg_kmer_bias.png')
+    if not genome_kmer_counts or '7' not in genome_kmer_counts:
+        print("No genome 7-mer kmer counts found for C/G kmer bias analysis")
+        return
+    genome_7mer_counts = genome_kmer_counts['7']
+    ems_mutation_kmers = {}
+    cg_genome_kmers = genome_7mer_counts
+    # Collect mutation kmers from EMS samples (only C/G center, 7-mers only)
+    for sample, data in context_counts.items():
+        if 'EMS' in sample and sample != 'genome_kmer_counts' and '7d' not in sample and '3d' not in sample:
+            for kmer, count in data.items():
+                if isinstance(count, int) and len(kmer) == 7 and kmer[3] in ['C', 'G']:
+                    ems_mutation_kmers[kmer] = ems_mutation_kmers.get(kmer, 0) + count
+    if not ems_mutation_kmers:
+        print("No EMS mutation C/G 7-mer kmer data found")
+        return
+    total_mutations = sum(ems_mutation_kmers.values())
+    total_cg_genome_kmers = sum(cg_genome_kmers.values())
+    bias_analysis = []
+    for kmer in cg_genome_kmers:
+        observed_count = ems_mutation_kmers.get(kmer, 0)
+        expected_freq = cg_genome_kmers[kmer] / total_cg_genome_kmers
+        expected_count = expected_freq * total_mutations
+        enrichment_ratio = observed_count / expected_count if expected_count > 0 else 0
+        from scipy.stats import binomtest
+        if total_mutations > 0 and expected_freq > 0:
+            result = binomtest(observed_count, total_mutations, expected_freq)
+            p_value = result.pvalue
+        else:
+            p_value = 1.0
+        bias_analysis.append({
+            'kmer': kmer,
+            'center_base': kmer[3],
+            'observed': observed_count,
+            'expected': expected_count,
+            'genome_count': cg_genome_kmers[kmer],
+            'enrichment_ratio': enrichment_ratio,
+            'p_value': p_value,
+            'significant': bool(p_value < 0.05 and enrichment_ratio > 1.5)
+        })
+    bias_analysis.sort(key=lambda x: x['enrichment_ratio'], reverse=True)
+    c_kmers = [x for x in bias_analysis if x['center_base'] == 'C']
+    g_kmers = [x for x in bias_analysis if x['center_base'] == 'G']
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+    top_c_enriched = [x for x in c_kmers if x['enrichment_ratio'] > 1.0][:15]
+    if top_c_enriched:
+        kmers = [x['kmer'] for x in top_c_enriched]
+        ratios = [x['enrichment_ratio'] for x in top_c_enriched]
+        colors = ['red' if x['significant'] else 'orange' for x in top_c_enriched]
+        y_pos = np.arange(len(kmers))
+        ax1.barh(y_pos, ratios, color=colors, alpha=0.7)
+        ax1.set_yticks(y_pos)
+        ax1.set_yticklabels(kmers)
+        ax1.set_xlabel('Enrichment Ratio (Observed/Expected)')
+        ax1.set_title('Top Enriched C-Center 7-mers in EMS Mutations')
+        ax1.axvline(x=1, color='black', linestyle='--', alpha=0.5)
+    top_g_enriched = [x for x in g_kmers if x['enrichment_ratio'] > 1.0][:15]
+    if top_g_enriched:
+        kmers = [x['kmer'] for x in top_g_enriched]
+        ratios = [x['enrichment_ratio'] for x in top_g_enriched]
+        colors = ['red' if x['significant'] else 'orange' for x in top_g_enriched]
+        y_pos = np.arange(len(kmers))
+        ax2.barh(y_pos, ratios, color=colors, alpha=0.7)
+        ax2.set_yticks(y_pos)
+        ax2.set_yticklabels(kmers)
+        ax2.set_xlabel('Enrichment Ratio (Observed/Expected)')
+        ax2.set_title('Top Enriched G-Center 7-mers in EMS Mutations')
+        ax2.axvline(x=1, color='black', linestyle='--', alpha=0.5)
+    if top_c_enriched:
+        kmers = [x['kmer'] for x in top_c_enriched[:10]]
+        observed = [x['observed'] for x in top_c_enriched[:10]]
+        expected = [x['expected'] for x in top_c_enriched[:10]]
+        x = np.arange(len(kmers))
+        width = 0.35
+        ax3.bar(x - width/2, observed, width, label='Observed', color='red', alpha=0.7)
+        ax3.bar(x + width/2, expected, width, label='Expected', color='blue', alpha=0.7)
+        ax3.set_xlabel('C-Center 7-mer')
+        ax3.set_ylabel('Mutation Count')
+        ax3.set_title('Observed vs Expected Counts (Top C-Center 7-mers)')
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(kmers, rotation=45, ha='right')
+        ax3.legend()
+    if top_g_enriched:
+        kmers = [x['kmer'] for x in top_g_enriched[:10]]
+        observed = [x['observed'] for x in top_g_enriched[:10]]
+        expected = [x['expected'] for x in top_g_enriched[:10]]
+        x = np.arange(len(kmers))
+        width = 0.35
+        ax4.bar(x - width/2, observed, width, label='Observed', color='red', alpha=0.7)
+        ax4.bar(x + width/2, expected, width, label='Expected', color='blue', alpha=0.7)
+        ax4.set_xlabel('G-Center 7-mer')
+        ax4.set_ylabel('Mutation Count')
+        ax4.set_title('Observed vs Expected Counts (Top G-Center 7-mers)')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels(kmers, rotation=45, ha='right')
+        ax4.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    c_significant = [x for x in c_kmers if x['significant']]
+    g_significant = [x for x in g_kmers if x['significant']]
+    results_path = os.path.join(output_dir, 'ems_cg_kmer_bias_analysis.json')
+    with open(results_path, 'w') as f:
+        json.dump({
+            'summary': {
+                'total_mutations': total_mutations,
+                'total_cg_kmers_analyzed': len(bias_analysis),
+                'c_center_kmers': len(c_kmers),
+                'g_center_kmers': len(g_kmers),
+                'c_significant': len(c_significant),
+                'g_significant': len(g_significant),
+                'median_c_enrichment': np.median([x['enrichment_ratio'] for x in c_kmers]) if c_kmers else 0,
+                'median_g_enrichment': np.median([x['enrichment_ratio'] for x in g_kmers]) if g_kmers else 0,
+                'mean_c_enrichment': np.mean([x['enrichment_ratio'] for x in c_kmers]) if c_kmers else 0,
+                'mean_g_enrichment': np.mean([x['enrichment_ratio'] for x in g_kmers]) if g_kmers else 0
+            },
+            'top_c_enriched': c_kmers[:10],
+            'top_g_enriched': g_kmers[:10],
+            'significant_c_kmers': c_significant,
+            'significant_g_kmers': g_significant
+        }, f, indent=2)
+    print(f"\nEMS C/G 7-mer Bias Analysis:")
+    print(f"Total C/G mutations analyzed: {total_mutations:,}")
+    print(f"C-center 7-mers analyzed: {len(c_kmers)}")
+    print(f"G-center 7-mers analyzed: {len(g_kmers)}")
+    print(f"Significantly enriched C-center 7-mers: {len(c_significant)}")
+    print(f"Significantly enriched G-center 7-mers: {len(g_significant)}")
+    c_ratios = [x['enrichment_ratio'] for x in c_kmers]
+    g_ratios = [x['enrichment_ratio'] for x in g_kmers]
+    print(f"Median C-center enrichment: {np.median(c_ratios):.2f}" if c_ratios else "No C-center data")
+    print(f"Median G-center enrichment: {np.median(g_ratios):.2f}" if g_ratios else "No G-center data")
+    if c_significant:
+        print(f"\nTop 3 significantly enriched C-center 7-mers:")
+        for i, kmer_data in enumerate(c_significant[:3]):
+            print(f"  {i+1}. {kmer_data['kmer']}: {kmer_data['enrichment_ratio']:.2f}x enriched (p={kmer_data['p_value']:.2e})")
+    if g_significant:
+        print(f"\nTop 3 significantly enriched G-center 7-mers:")
+        for i, kmer_data in enumerate(g_significant[:3]):
+            print(f"  {i+1}. {kmer_data['kmer']}: {kmer_data['enrichment_ratio']:.2f}x enriched (p={kmer_data['p_value']:.2e})")
+    print(f"Detailed results saved to {results_path}")
+    print(f"Visualization saved to {output_path}")
+
+def plot_aggregate_mutation_frequencies(normalized_rates: dict, output_dir: str) -> None:
+    '''Plot aggregate mutation frequencies across treatment groups.'''
+    
+    output_path = os.path.join(output_dir, 'mutation_frequency_aggregate.png')
+    
+    # Create DataFrame for plotting
+    plot_data = []
+    for sample in normalized_rates:
+        sample_id = extract_sample_id(sample)
+        for mutation_type in normalized_rates[sample]:
+            plot_data.append({
+                'sample': sample_id,
+                'mutation_type': mutation_type,
+                'rate': normalized_rates[sample][mutation_type],
+                'treatment': 'EMS' if 'EMS' in sample else 'Control'
+            })
+    
+    if not plot_data:
+        print("No mutation data found for plotting")
+        return
+        
+    df = pd.DataFrame(plot_data)
+    
+    # Create the plot
+    plt.figure(figsize=(12, 8))
+    
+    # Filter for main mutation types
+    main_mutations = ['C>T', 'G>A', 'A>G', 'T>C', 'A>T', 'T>A', 'C>G', 'G>C']
+    df_filtered = df[df['mutation_type'].isin(main_mutations)]
+    
+    if df_filtered.empty:
+        print("No main mutation types found for plotting")
+        return
+    
+    # Create grouped bar plot
+    sns.barplot(data=df_filtered, x='mutation_type', y='rate', hue='treatment', 
+                palette=['orange', 'blue'], alpha=0.8)
+    
+    plt.title('Mutation Rates by Type and Treatment (Aggregate)')
+    plt.xlabel('Mutation Type')
+    plt.ylabel('Normalized Mutation Rate')
+    plt.xticks(rotation=45)
+    plt.legend(title='Treatment')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Aggregate mutation frequency plot saved to {output_path}")
+
+def plot_per_sample_mutation_frequencies(normalized_rates: dict, output_dir: str) -> None:
+    '''Plot mutation frequencies for each individual sample.'''
+    
+    output_path = os.path.join(output_dir, 'mutation_frequency_per_sample.png')
+    
+    # Create DataFrame for plotting
+    plot_data = []
+    for sample in normalized_rates:
+        sample_id = extract_sample_id(sample)
+        for mutation_type in normalized_rates[sample]:
+            plot_data.append({
+                'sample': sample_id,
+                'mutation_type': mutation_type,
+                'rate': normalized_rates[sample][mutation_type],
+                'treatment': 'EMS' if 'EMS' in sample else 'Control'
+            })
+    
+    if not plot_data:
+        print("No mutation data found for plotting")
+        return
+        
+    df = pd.DataFrame(plot_data)
+    
+    # Filter for main mutation types
+    main_mutations = ['C>T', 'G>A', 'A>G', 'T>C', 'A>T', 'T>A', 'C>G', 'G>C']
+    df_filtered = df[df['mutation_type'].isin(main_mutations)]
+    
+    if df_filtered.empty:
+        print("No main mutation types found for plotting")
+        return
+    
+    # Create a single plot with samples on x-axis and mutation types as different colors
+    plt.figure(figsize=(16, 8))
+    
+    # Create grouped bar plot with samples on x-axis and mutation types as hue
+    sns.barplot(data=df_filtered, x='sample', y='rate', hue='mutation_type', 
+                palette='Set2', alpha=0.8)
+    
+    plt.title('Mutation Rates by Sample and Type')
+    plt.xlabel('Sample')
+    plt.ylabel('Normalized Mutation Rate')
+    plt.xticks(rotation=45, ha='right')
+    plt.legend(title='Mutation Type', bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    # Add treatment group annotations
+    ax = plt.gca()
+    sample_names = df_filtered['sample'].unique()
+    for i, sample in enumerate(sample_names):
+        treatment = 'EMS' if any('EMS' in s for s in normalized_rates.keys() if extract_sample_id(s) == sample) else 'Control'
+        color = 'orange' if treatment == 'EMS' else 'blue'
+        ax.text(i, -0.05 * ax.get_ylim()[1], treatment, ha='center', va='top', 
+                color=color, fontweight='bold', transform=ax.get_xaxis_transform())
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Per-sample mutation frequency plot saved to {output_path}")
+
+def plot_ems_mutation_frequencies_heatmap(normalized_rates: dict, output_dir: str) -> None:
+    '''Create a heatmap of mutation frequencies across samples.'''
+    
+    output_path = os.path.join(output_dir, 'mutation_frequency_heatmap.png')
+    
+    # Prepare data for heatmap
+    samples = list(normalized_rates.keys())
+    mutation_types = ['C>T', 'G>A', 'A>G', 'T>C', 'A>T', 'T>A', 'C>G', 'G>C']
+    
+    # Create matrix
+    matrix_data = []
+    sample_labels = []
+    
+    for sample in samples:
+        sample_id = extract_sample_id(sample)
+        sample_labels.append(sample_id)
+        row = []
+        for mut_type in mutation_types:
+            rate = normalized_rates[sample].get(mut_type, 0)
+            row.append(rate)
+        matrix_data.append(row)
+    
+    # Convert to DataFrame
+    df_heatmap = pd.DataFrame(matrix_data, index=sample_labels, columns=mutation_types)
+    
+    # Create heatmap
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(df_heatmap, annot=True, fmt='.2e', cmap='YlOrRd', 
+                cbar_kws={'label': 'Normalized Mutation Rate'})
+    
+    plt.title('Mutation Rate Heatmap Across Samples')
+    plt.xlabel('Mutation Type')
+    plt.ylabel('Sample')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Mutation frequency heatmap saved to {output_path}")
+
+def plot_consistently_enriched_kmers_heatmap(context_counts: dict, genome_kmer_counts: dict, output_dir: str, min_enrichment: float = 1.5, top_n: int = 30):
+    """
+    Plot a heatmap of raw enrichment ratios for 7-mers that are consistently enriched across all EMS samples.
+    """
+    ems_samples = [sample for sample in context_counts if 'EMS' in sample and '7d' not in sample and '3d' not in sample]
+    if not ems_samples:
+        print("No EMS samples found for consistently enriched 7-mer heatmap.")
+        return
+    genome_7mer_counts = genome_kmer_counts['7'] if '7' in genome_kmer_counts else {}
+    cg_genome_kmers = {kmer: count for kmer, count in genome_7mer_counts.items() if len(kmer) == 7 and kmer[3] in ['C', 'G']}
+    total_genome_kmers = sum(cg_genome_kmers.values())
+    enrichment_data = {}
+    for sample in ems_samples:
+        sample_kmers = context_counts[sample]
+        ems_mutation_kmers = {kmer: count for kmer, count in sample_kmers.items() if len(kmer) == 7 and kmer[3] in ['C', 'G']}
+        total_mutations = sum(ems_mutation_kmers.values())
+        enrichment_data[sample] = {}
+        for kmer, observed_count in ems_mutation_kmers.items():
+            genome_count = cg_genome_kmers.get(kmer, 0)
+            if genome_count == 0 or total_mutations == 0:
+                continue
+            expected_freq = genome_count / total_genome_kmers
+            expected_count = expected_freq * total_mutations
+            enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else np.nan
+            enrichment_data[sample][kmer] = enrichment_ratio
+    df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    consistently_enriched_kmers = df.columns[(df.min(axis=0) > min_enrichment)]
+    if len(consistently_enriched_kmers) == 0:
+        print(f"No 7-mers found with minimum enrichment > {min_enrichment} across all samples.")
+        return
+    top_kmers = df[consistently_enriched_kmers].median(axis=0).sort_values(ascending=False).head(top_n).index
+    df_top = df[top_kmers]
+    plt.figure(figsize=(1.2*len(top_kmers), 0.5*len(df_top)+4))
+    sns.heatmap(df_top, cmap='YlOrRd', annot=True, fmt=".2f", cbar_kws={'label': 'Enrichment Ratio (Obs/Exp)'})
+    plt.title(f'Consistently Enriched 7-mers (min enrichment > {min_enrichment})\nTop {top_n} by median enrichment')
+    plt.xlabel('7-mer')
+    plt.ylabel('Sample')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'consistently_enriched_7mer_heatmap_top{top_n}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_consistently_depleted_kmers_heatmap(
+    context_counts: dict,
+    genome_kmer_counts: dict,
+    output_dir: str,
+    max_enrichment: float = 0.67,
+    top_n: int = 30
+):
+    """
+    Plot a heatmap of raw enrichment ratios for 7-mers that are consistently depleted across all EMS samples.
+    """
+    ems_samples = [sample for sample in context_counts if 'EMS' in sample and '7d' not in sample and '3d' not in sample]
+    if not ems_samples:
+        print("No EMS samples found for consistently depleted 7-mer heatmap.")
+        return
+    genome_7mer_counts = genome_kmer_counts['7'] if '7' in genome_kmer_counts else {}
+    cg_genome_kmers = {kmer: count for kmer, count in genome_7mer_counts.items() if len(kmer) == 7 and kmer[3] in ['C', 'G']}
+    total_genome_kmers = sum(cg_genome_kmers.values())
+    enrichment_data = {}
+    for sample in ems_samples:
+        sample_kmers = context_counts[sample]
+        ems_mutation_kmers = {kmer: count for kmer, count in sample_kmers.items() if len(kmer) == 7 and kmer[3] in ['C', 'G']}
+        total_mutations = sum(ems_mutation_kmers.values())
+        enrichment_data[sample] = {}
+        for kmer, observed_count in ems_mutation_kmers.items():
+            genome_count = cg_genome_kmers.get(kmer, 0)
+            if genome_count == 0 or total_mutations == 0:
+                continue
+            expected_freq = genome_count / total_genome_kmers
+            expected_count = expected_freq * total_mutations
+            enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else np.nan
+            enrichment_data[sample][kmer] = enrichment_ratio
+    df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    consistently_depleted_kmers = df.columns[(df.max(axis=0) < max_enrichment)]
+    if len(consistently_depleted_kmers) == 0:
+        print(f"No 7-mers found with maximum enrichment < {max_enrichment} across all samples.")
+        return
+    top_kmers = df[consistently_depleted_kmers].median(axis=0).sort_values(ascending=True).head(top_n).index
+    df_top = df[top_kmers]
+    plt.figure(figsize=(1.2*len(top_kmers), 0.5*len(df_top)+4))
+    sns.heatmap(df_top, cmap='Blues', annot=True, fmt=".2f", cbar_kws={'label': 'Enrichment Ratio (Obs/Exp)'})
+    plt.title(f'Consistently Depleted 7-mers (max enrichment < {max_enrichment})\nTop {top_n} by lowest median enrichment')
+    plt.xlabel('7-mer')
+    plt.ylabel('Sample')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'consistently_depleted_7mer_heatmap_top{top_n}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_gene_mutation_statistics(gene_stats_path: str, output_dir: str, top_n: int = 30):
+    """
+    Plots:
+    1. Scatter: total mutations per gene vs average coverage (across all samples, skipping 7d)
+    2. Scatter: total mutations per gene vs gene length (across all samples, skipping 7d)
+    3. Heatmap: top mutated genes (normalized by gene length) across samples (skipping 7d)
+    """
+
+    # Load gene statistics
+    with open(gene_stats_path) as f:
+        gene_stats = json.load(f)
+
+    # Build DataFrame: rows = (sample, gene), columns = mutations, coverage, gene_length
+    records = []
+    for sample, genes in gene_stats.items():
+        if "7d" in sample:
+            continue
+        for gene_id, stats in genes.items():
+            records.append({
+                "sample": sample,
+                "gene": gene_id,
+                "total_mutations": stats.get("total_mutations", 0),
+                "average_coverage": stats.get("average_coverage", None),
+                "gene_length": stats.get("gene_length", None)
+            })
+    df = pd.DataFrame(records)
+
+    # 1 & 2. Scatter plots (aggregate across samples)
+    agg = df.groupby("gene").agg(
+        total_mutations_sum=("total_mutations", "sum"),
+        average_coverage_mean=("average_coverage", "mean"),
+        gene_length=("gene_length", "first")
+    ).reset_index()
+
+    # Identify outliers: genes with total_mutations_sum > 99th percentile
+    outlier_thresh = agg["total_mutations_sum"].quantile(0.99)
+    outliers = agg[agg["total_mutations_sum"] > outlier_thresh]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    # Scatter: total mutations vs average coverage
+    axes[0].scatter(agg["average_coverage_mean"], agg["total_mutations_sum"], alpha=0.7)
+    axes[0].set_xlabel("Average Coverage (mean across samples)")
+    axes[0].set_ylabel("Total Mutations (sum across samples)")
+    axes[0].set_title("Total Mutations per Gene vs Average Coverage")
+
+    # Label outliers
+    for _, row in outliers.iterrows():
+        axes[0].annotate(row["gene"], (row["average_coverage_mean"], row["total_mutations_sum"]),
+                         textcoords="offset points", xytext=(5,5), ha='left', fontsize=8, color='red')
+
+    # Scatter: total mutations vs gene length
+    axes[1].scatter(agg["gene_length"], agg["total_mutations_sum"], alpha=0.7)
+    axes[1].set_xlabel("Gene Length")
+    axes[1].set_ylabel("Total Mutations (sum across samples)")
+    axes[1].set_title("Total Mutations per Gene vs Gene Length")
+
+    # Label outliers
+    for _, row in outliers.iterrows():
+        axes[1].annotate(row["gene"], (row["gene_length"], row["total_mutations_sum"]),
+                         textcoords="offset points", xytext=(5,5), ha='left', fontsize=8, color='red')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "gene_mutation_scatterplots.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 3. Heatmap: top mutated genes (normalized by gene length) across samples
+    # Compute normalized mutations
+    df["mut_per_kb"] = df["total_mutations"] / df["gene_length"] * 1000
+
+    # Filter out 3d and 7d samples
+    df_filtered = df[~df['sample'].str.contains('3d|7d')]
+
+    # Find top N genes by median mut_per_kb across samples
+    top_genes = (
+        df_filtered.groupby("gene")["mut_per_kb"]
+        .median()
+        .sort_values(ascending=False)
+        .head(top_n)
+        .index
+    )
+
+    heatmap_df = (
+        df_filtered[df_filtered["gene"].isin(top_genes)]
+        .pivot(index="sample", columns="gene", values="mut_per_kb")
+        .fillna(0)
+    )
+
+    # Order samples (rows) so EMS samples are grouped
+    heatmap_df = heatmap_df.loc[sorted(heatmap_df.index, key=lambda x: ("EMS" not in x, x))]
+
+    plt.figure(figsize=(1.2*top_n, 0.5*len(heatmap_df)+4))
+    sns.heatmap(heatmap_df, cmap="YlOrRd", annot=True, fmt=".2f", cbar_kws={"label": "Mutations per kb"})
+    plt.title(f"Top {top_n} Most Mutated Genes (Normalized by Length)\nAcross EMS Samples (Excluding 3d/7d)")
+    plt.xlabel("Gene")
+    plt.ylabel("Sample")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"top_mutated_genes_heatmap.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts):
+    """Aggregate 5-mer counts into 3-mer counts (centered on C/G)."""
+    # Count all 3-mers from the genome sequence
+    genome_3mer_counts = {}
+    for kmer5, gcount in genome_kmer_counts.items():
+        if len(kmer5) == 5:
+            # Extract all possible 3-mers from the 5-mer
+            for i in range(3):
+                kmer3 = kmer5[i:i+3]
+                if kmer3[1] in "CG":  # Only count 3-mers with C/G in the center
+                    genome_3mer_counts[kmer3] = genome_3mer_counts.get(kmer3, 0) + gcount
+
+    # Aggregate sample 3-mer counts from 5-mers
+    sample_3mer_counts = {}
+    for sample, sample_counts in context_counts.items():
+        sample_3mer_counts[sample] = {}
+        for kmer5, scount in sample_counts.items():
+            if len(kmer5) == 5:
+                # Extract all possible 3-mers from the 5-mer
+                for i in range(3):
+                    kmer3 = kmer5[i:i+3]
+                    if kmer3[1] in "CG":  # Only count 3-mers with C/G in the center
+                        sample_3mer_counts[sample][kmer3] = sample_3mer_counts[sample].get(kmer3, 0) + scount
+
+    return sample_3mer_counts, genome_3mer_counts
+
+def plot_consistently_enriched_3mer_kmers_heatmap(context_counts, genome_kmer_counts, output_dir, min_enrichment=1.5, top_n=30):
+   
+
+    sample_3mer_counts, genome_3mer_counts = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+    ems_samples = [s for s in sample_3mer_counts if 'EMS' in s and '7d' not in s and '3d' not in s]
+    if not ems_samples:
+        print("No EMS samples found for consistently enriched 3-mer kmer heatmap.")
+        return
+
+    total_genome_3mers = sum(genome_3mer_counts.values())
+    enrichment_data = {}
+    for sample in ems_samples:
+        sample_kmers = sample_3mer_counts[sample]
+        total_mutations = sum(sample_kmers.values())
+        enrichment_data[sample] = {}
+        for kmer, observed_count in sample_kmers.items():
+            genome_count = genome_3mer_counts.get(kmer, 0)
+            if genome_count == 0 or total_mutations == 0:
+                continue
+            expected_freq = genome_count / total_genome_3mers
+            expected_count = expected_freq * total_mutations
+            enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else float('nan')
+            enrichment_data[sample][kmer] = enrichment_ratio
+
+    df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    consistently_enriched_kmers = df.columns[(df.min(axis=0) > min_enrichment)]
+    if len(consistently_enriched_kmers) == 0:
+        print(f"No 3-mers found with minimum enrichment > {min_enrichment} across all samples.")
+        return
+
+    top_kmers = df[consistently_enriched_kmers].median(axis=0).sort_values(ascending=False).head(top_n).index
+    df_top = df[top_kmers]
+
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(1.2*len(top_kmers), 0.5*len(df_top)+4))
+    sns.heatmap(df_top, cmap='YlOrRd', annot=True, fmt=".2f", cbar_kws={'label': 'Enrichment Ratio (Obs/Exp)'})
+    plt.title(f'Consistently Enriched 3-mers (min enrichment > {min_enrichment})\nTop {top_n} by median enrichment')
+    plt.xlabel('3-mer')
+    plt.ylabel('Sample')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'consistently_enriched_3mer_heatmap_top{top_n}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_consistently_depleted_3mer_kmers_heatmap(context_counts, genome_kmer_counts, output_dir, max_enrichment=0.67, top_n=30):
+   
+
+    sample_3mer_counts, genome_3mer_counts = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+    ems_samples = [s for s in sample_3mer_counts if 'EMS' in s and '7d' not in s and '3d' not in s]
+    if not ems_samples:
+        print("No EMS samples found for consistently depleted 3-mer kmer heatmap.")
+        return
+
+    total_genome_3mers = sum(genome_3mer_counts.values())
+    enrichment_data = {}
+    for sample in ems_samples:
+        sample_kmers = sample_3mer_counts[sample]
+        total_mutations = sum(sample_kmers.values())
+        enrichment_data[sample] = {}
+        for kmer, observed_count in sample_kmers.items():
+            genome_count = genome_3mer_counts.get(kmer, 0)
+            if genome_count == 0 or total_mutations == 0:
+                continue
+            expected_freq = genome_count / total_genome_3mers
+            expected_count = expected_freq * total_mutations
+            enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else float('nan')
+            enrichment_data[sample][kmer] = enrichment_ratio
+
+    df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    consistently_depleted_kmers = df.columns[(df.max(axis=0) < max_enrichment)]
+    if len(consistently_depleted_kmers) == 0:
+        print(f"No 3-mers found with maximum enrichment < {max_enrichment} across all samples.")
+        return
+
+    top_kmers = df[consistently_depleted_kmers].median(axis=0).sort_values(ascending=True).head(top_n).index
+    df_top = df[top_kmers]
+
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(1.2*len(top_kmers), 0.5*len(df_top)+4))
+    sns.heatmap(df_top, cmap='Blues', annot=True, fmt=".2f", cbar_kws={'label': 'Enrichment Ratio (Obs/Exp)'})
+    plt.title(f'Consistently Depleted 3-mers (max enrichment < {max_enrichment})\nTop {top_n} by lowest median enrichment')
+    plt.xlabel('3-mer')
+    plt.ylabel('Sample')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'consistently_depleted_3mer_heatmap_top{top_n}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_ems_5mer_signature_per_sample(context_counts: dict, output_dir: str):
+    """
+    Plot normalized 5-mer context mutation signature for EMS canonical mutations (C>T and G>A) for each sample.
+    context_counts: dict mapping sample -> dict of 5-mer -> count
+    output_dir: directory to save plots
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    for sample, kmer_counts in context_counts.items():
+        # Skip 7d/3d samples if desired (but per user, do all samples here)
+        c2t_counts = {}
+        g2a_counts = {}
+        total_c2t = 0
+        total_g2a = 0
+        for kmer, count in kmer_counts.items():
+            if len(kmer) != 5:
+                continue
+            center = kmer[2]
+            if center == 'C':
+                c2t_counts[kmer] = count
+                total_c2t += count
+            elif center == 'G':
+                g2a_counts[kmer] = count
+                total_g2a += count
+        # Normalize
+        c2t_norm = {k: v / total_c2t for k, v in c2t_counts.items()} if total_c2t > 0 else {}
+        g2a_norm = {k: v / total_g2a for k, v in g2a_counts.items()} if total_g2a > 0 else {}
+        # Sort kmers alphabetically for consistent x-axis
+        c2t_kmers = sorted(c2t_norm.keys())
+        g2a_kmers = sorted(g2a_norm.keys())
+        # Plot
+        plt.figure(figsize=(max(12, 0.15*max(len(c2t_kmers), len(g2a_kmers))), 6))
+        x_c2t = np.arange(len(c2t_kmers))
+        x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
+        # Bar plots
+        plt.bar(x_c2t, [c2t_norm[k] for k in c2t_kmers], color='orange', label='C>T', width=0.8)
+        plt.bar(x_g2a, [g2a_norm[k] for k in g2a_kmers], color='blue', label='G>A', width=0.8)
+        # X-ticks
+        xticks = list(c2t_kmers) + list(g2a_kmers)
+        plt.xticks(np.concatenate([x_c2t, x_g2a]), xticks, rotation=90, fontsize=7)
+        plt.xlabel('5-mer Context')
+        plt.ylabel('Normalized Frequency')
+        plt.title(f'EMS 5-mer Mutation Signature ({sample})')
+        plt.legend()
+        plt.tight_layout()
+        outpath = os.path.join(output_dir, f'ems_5mer_signature_{sample}.png')
+        plt.savefig(outpath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+def plot_ems_5mer_signature_all_samples(context_counts: dict, output_dir: str):
+    """
+    Plot normalized 5-mer context mutation signature for EMS canonical mutations (C>T and G>A), aggregated across all samples (excluding 7d/3d).
+    context_counts: dict mapping sample -> dict of 5-mer -> count
+    output_dir: directory to save plot
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    c2t_counts = defaultdict(int)
+    g2a_counts = defaultdict(int)
+    total_c2t = 0
+    total_g2a = 0
+    for sample, kmer_counts in context_counts.items():
+        if '7d' in sample or '3d' in sample:
+            continue
+        for kmer, count in kmer_counts.items():
+            if len(kmer) != 5:
+                continue
+            center = kmer[2]
+            if center == 'C':
+                c2t_counts[kmer] += count
+                total_c2t += count
+            elif center == 'G':
+                g2a_counts[kmer] += count
+                total_g2a += count
+    # Normalize
+    c2t_norm = {k: v / total_c2t for k, v in c2t_counts.items()} if total_c2t > 0 else {}
+    g2a_norm = {k: v / total_g2a for k, v in g2a_counts.items()} if total_g2a > 0 else {}
+    # Sort kmers alphabetically for consistent x-axis
+    c2t_kmers = sorted(c2t_norm.keys())
+    g2a_kmers = sorted(g2a_norm.keys())
+    # Plot
+    plt.figure(figsize=(max(12, 0.15*max(len(c2t_kmers), len(g2a_kmers))), 6))
+    x_c2t = np.arange(len(c2t_kmers))
+    x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
+    # Bar plots
+    plt.bar(x_c2t, [c2t_norm[k] for k in c2t_kmers], color='orange', label='C>T', width=0.8)
+    plt.bar(x_g2a, [g2a_norm[k] for k in g2a_kmers], color='blue', label='G>A', width=0.8)
+    # X-ticks
+    xticks = list(c2t_kmers) + list(g2a_kmers)
+    plt.xticks(np.concatenate([x_c2t, x_g2a]), xticks, rotation=90, fontsize=7)
+    plt.xlabel('5-mer Context')
+    plt.ylabel('Normalized Frequency')
+    plt.title('EMS 5-mer Mutation Signature (All Samples, Excl. 7d/3d)')
+    plt.legend()
+    plt.tight_layout()
+    outpath = os.path.join(output_dir, 'ems_5mer_signature_all_samples.png')
+    plt.savefig(outpath, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_ems_3mer_signature_per_sample(context_counts: dict, genome_kmer_counts: dict, output_dir: str):
+    """
+    Plot normalized 3-mer context mutation signature for EMS canonical mutations (C>T and G>A) for each sample.
+    context_counts: dict mapping sample -> dict of 5-mer -> count
+    genome_kmer_counts: dict mapping 5-mer -> count
+    output_dir: directory to save plots
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    sample_3mer_counts, _ = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+
+    for sample, kmer_counts in sample_3mer_counts.items():
+        c2t_counts = {}
+        g2a_counts = {}
+        total_c2t = 0
+        total_g2a = 0
+        for kmer, count in kmer_counts.items():
+            if len(kmer) != 3:
+                continue
+            center = kmer[1]
+            if center == 'C':
+                c2t_counts[kmer] = count
+                total_c2t += count
+            elif center == 'G':
+                g2a_counts[kmer] = count
+                total_g2a += count
+        # Normalize
+        c2t_norm = {k: v / total_c2t for k, v in c2t_counts.items()} if total_c2t > 0 else {}
+        g2a_norm = {k: v / total_g2a for k, v in g2a_counts.items()} if total_g2a > 0 else {}
+        # Sort kmers alphabetically for consistent x-axis
+        c2t_kmers = sorted(c2t_norm.keys())
+        g2a_kmers = sorted(g2a_norm.keys())
+        # Plot
+        plt.figure(figsize=(max(12, 0.15*max(len(c2t_kmers), len(g2a_kmers))), 6))
+        x_c2t = np.arange(len(c2t_kmers))
+        x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
+        # Bar plots
+        plt.bar(x_c2t, [c2t_norm[k] for k in c2t_kmers], color='orange', label='C>T', width=0.8)
+        plt.bar(x_g2a, [g2a_norm[k] for k in g2a_kmers], color='blue', label='G>A', width=0.8)
+        # X-ticks
+        xticks = list(c2t_kmers) + list(g2a_kmers)
+        plt.xticks(np.concatenate([x_c2t, x_g2a]), xticks, rotation=90, fontsize=7)
+        plt.xlabel('3-mer Context')
+        plt.ylabel('Normalized Frequency')
+        plt.title(f'EMS 3-mer Mutation Signature ({sample})')
+        plt.legend()
+        plt.tight_layout()
+        outpath = os.path.join(output_dir, f'ems_3mer_signature_{sample}.png')
+        plt.savefig(outpath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+def plot_ems_3mer_signature_all_samples(context_counts: dict, genome_kmer_counts: dict, output_dir: str):
+    """
+    Plot normalized 3-mer context mutation signature for EMS canonical mutations (C>T and G>A), aggregated across all samples (excluding 7d/3d).
+    context_counts: dict mapping sample -> dict of 5-mer -> count
+    genome_kmer_counts: dict mapping 5-mer -> count
+    output_dir: directory to save plot
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    sample_3mer_counts, _ = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+
+    c2t_counts = defaultdict(int)
+    g2a_counts = defaultdict(int)
+    total_c2t = 0
+    total_g2a = 0
+    for sample, kmer_counts in sample_3mer_counts.items():
+        if '7d' in sample or '3d' in sample:
+            continue
+        for kmer, count in kmer_counts.items():
+            if len(kmer) != 3:
+                continue
+            center = kmer[1]
+            if center == 'C':
+                c2t_counts[kmer] += count
+                total_c2t += count
+            elif center == 'G':
+                g2a_counts[kmer] += count
+                total_g2a += count
+    # Normalize
+    c2t_norm = {k: v / total_c2t for k, v in c2t_counts.items()} if total_c2t > 0 else {}
+    g2a_norm = {k: v / total_g2a for k, v in g2a_counts.items()} if total_g2a > 0 else {}
+    # Sort kmers alphabetically for consistent x-axis
+    c2t_kmers = sorted(c2t_norm.keys())
+    g2a_kmers = sorted(g2a_norm.keys())
+    # Plot
+    plt.figure(figsize=(max(12, 0.15*max(len(c2t_kmers), len(g2a_kmers))), 6))
+    x_c2t = np.arange(len(c2t_kmers))
+    x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
+    # Bar plots
+    plt.bar(x_c2t, [c2t_norm[k] for k in c2t_kmers], color='orange', label='C>T', width=0.8)
+    plt.bar(x_g2a, [g2a_norm[k] for k in g2a_kmers], color='blue', label='G>A', width=0.8)
+    # X-ticks
+    xticks = list(c2t_kmers) + list(g2a_kmers)
+    plt.xticks(np.concatenate([x_c2t, x_g2a]), xticks, rotation=90, fontsize=7)
+    plt.xlabel('3-mer Context')
+    plt.ylabel('Normalized Frequency')
+    plt.title('EMS 3-mer Mutation Signature (All Samples, Excl. 7d/3d)')
+    plt.legend()
+    plt.tight_layout()
+    outpath = os.path.join(output_dir, 'ems_3mer_signature_all_samples.png')
+    plt.savefig(outpath, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_ems_3mer_signature_multiplot(context_counts: dict, genome_kmer_counts: dict, output_dir: str):
+    """
+    Create a multi-panel plot of normalized 3-mer signatures for all EMS samples (excluding 3d/7d).
+    Each subplot shows the normalized 3-mer signature for one sample, with C>T and G>A colored differently.
+    X-axis is consistent across all subplots.
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    sample_3mer_counts, _ = _extract_3mer_counts_from_5mers(context_counts, genome_kmer_counts)
+    # Select EMS samples without 3d/7d
+    ems_samples = [s for s in sample_3mer_counts if 'EMS' in s and '3d' not in s and '7d' not in s]
+    if not ems_samples:
+        print("No EMS samples found for 3-mer multiplot.")
+        return
+
+    # Collect all 3-mers observed in any sample (for consistent x-axis)
+    all_c2t_kmers = set()
+    all_g2a_kmers = set()
+    for sample in ems_samples:
+        for kmer in sample_3mer_counts[sample]:
+            if len(kmer) == 3:
+                center = kmer[1]
+                if center == 'C':
+                    all_c2t_kmers.add(kmer)
+                elif center == 'G':
+                    all_g2a_kmers.add(kmer)
+    all_c2t_kmers = sorted(all_c2t_kmers)
+    all_g2a_kmers = sorted(all_g2a_kmers)
+    all_xticks = all_c2t_kmers + all_g2a_kmers
+    x_c2t = np.arange(len(all_c2t_kmers))
+    x_g2a = np.arange(len(all_g2a_kmers)) + len(all_c2t_kmers)
+    x_all = np.concatenate([x_c2t, x_g2a])
+
+    n_samples = len(ems_samples)
+    n_cols = 3
+    n_rows = int(np.ceil(n_samples / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(max(12, 4*n_cols), 3*n_rows), sharex=True, sharey=True)
+    axes = axes.flatten()
+
+    for idx, sample in enumerate(ems_samples):
+        ax = axes[idx]
+        kmer_counts = sample_3mer_counts[sample]
+        c2t_counts = {k: kmer_counts.get(k, 0) for k in all_c2t_kmers}
+        g2a_counts = {k: kmer_counts.get(k, 0) for k in all_g2a_kmers}
+        total_c2t = sum(c2t_counts.values())
+        total_g2a = sum(g2a_counts.values())
+        c2t_norm = [c2t_counts[k] / total_c2t if total_c2t > 0 else 0 for k in all_c2t_kmers]
+        g2a_norm = [g2a_counts[k] / total_g2a if total_g2a > 0 else 0 for k in all_g2a_kmers]
+        ax.bar(x_c2t, c2t_norm, color='orange', label='C>T', width=0.8)
+        ax.bar(x_g2a, g2a_norm, color='blue', label='G>A', width=0.8)
+        ax.set_title(sample)
+        if idx % n_cols == 0:
+            ax.set_ylabel('Normalized Frequency')
+        if idx >= (n_rows-1)*n_cols:
+            ax.set_xticks(x_all)
+            ax.set_xticklabels(all_xticks, rotation=90, fontsize=7)
+        else:
+            ax.set_xticks([])
+        if idx == 0:
+            ax.legend()
+    # Hide unused axes
+    for j in range(idx+1, len(axes)):
+        axes[j].axis('off')
+    plt.tight_layout()
+    outpath = os.path.join(output_dir, 'ems_3mer_signature_multiplot.png')
+    plt.savefig(outpath, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_ems_5mer_signature_multiplot(context_counts: dict, output_dir: str):
+    """
+    Create a multi-panel plot of normalized 5-mer signatures for all EMS samples (excluding 3d/7d).
+    Each subplot shows the normalized 5-mer signature for one sample, with C>T and G>A colored differently.
+    X-axis is consistent across all subplots. Sample names are shortened and x-axis labels are removed.
+    """
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+    from collections import defaultdict
+
+    # Select EMS samples without 3d/7d
+    ems_samples = [s for s in context_counts if 'EMS' in s and '3d' not in s and '7d' not in s]
+    if not ems_samples:
+        print("No EMS samples found for 5-mer multiplot.")
+        return
+
+    # Collect all 5-mers observed in any sample (for consistent x-axis)
+    all_c2t_kmers = set()
+    all_g2a_kmers = set()
+    for sample in ems_samples:
+        for kmer in context_counts[sample]:
+            if len(kmer) == 5:
+                center = kmer[2]
+                if center == 'C':
+                    all_c2t_kmers.add(kmer)
+                elif center == 'G':
+                    all_g2a_kmers.add(kmer)
+    all_c2t_kmers = sorted(all_c2t_kmers)
+    all_g2a_kmers = sorted(all_g2a_kmers)
+    all_xticks = all_c2t_kmers + all_g2a_kmers
+    x_c2t = np.arange(len(all_c2t_kmers))
+    x_g2a = np.arange(len(all_g2a_kmers)) + len(all_c2t_kmers)
+    x_all = np.concatenate([x_c2t, x_g2a])
+
+    n_samples = len(ems_samples)
+    n_cols = 3
+    n_rows = int(np.ceil(n_samples / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(max(12, 4*n_cols), 3*n_rows), sharex=True, sharey=True)
+    axes = axes.flatten()
+
+    for idx, sample in enumerate(ems_samples):
+        ax = axes[idx]
+        kmer_counts = context_counts[sample]
+        c2t_counts = {k: kmer_counts.get(k, 0) for k in all_c2t_kmers}
+        g2a_counts = {k: kmer_counts.get(k, 0) for k in all_g2a_kmers}
+        total_c2t = sum(c2t_counts.values())
+        total_g2a = sum(g2a_counts.values())
+        c2t_norm = [c2t_counts[k] / total_c2t if total_c2t > 0 else 0 for k in all_c2t_kmers]
+        g2a_norm = [g2a_counts[k] / total_g2a if total_g2a > 0 else 0 for k in all_g2a_kmers]
+        ax.bar(x_c2t, c2t_norm, color='orange', label='C>T', width=0.8)
+        ax.bar(x_g2a, g2a_norm, color='blue', label='G>A', width=0.8)
+        # Use shortened sample name
+        short_name = extract_sample_id(sample)
+        ax.set_title(short_name)
+        if idx % n_cols == 0:
+            ax.set_ylabel('Normalized Frequency')
+        else:
+            ax.set_ylabel('')
+        # Remove all x-axis tick labels
+        ax.set_xticks([])
+        if idx == 0:
+            ax.legend()
+    # Hide unused axes
+    for j in range(idx+1, len(axes)):
+        axes[j].axis('off')
+    plt.tight_layout()
+    outpath = os.path.join(output_dir, 'ems_5mer_signature_multiplot.png')
+    plt.savefig(outpath, dpi=300, bbox_inches='tight')
+    plt.close()
+
 def main():
     parser = argparse.ArgumentParser(description='Generate plots from analysis results')
     parser.add_argument('-r', '--results_dir', type=str, required=True,
@@ -782,11 +1897,39 @@ def main():
         if basecounts_file.exists():
             print("Generating mutation frequency plots...")
             with open(basecounts_file) as f:
-                base_counts = json.load(f)
+                base_counts = json.load(f)  # Now this is genome-wide base counts
             # Remove basecounts.json from jsons list
             jsons = [j for j in jsons if j.stem != 'basecounts']
             if jsons:  # Check if there are mutation JSONs after filtering
                 mutation_type_barplot(jsons, base_counts, args.output_dir)
+    
+    # Kmer context plots
+    contextcounts_file = results_dir / 'results' / 'contextcounts.json'
+    genome_kmer_counts_file = results_dir / 'results' / 'genome_kmer_counts.json'
+    if contextcounts_file.exists() and genome_kmer_counts_file.exists():
+        print("Generating kmer context plots...")
+        with open(contextcounts_file) as f:
+            context_counts = json.load(f)
+        with open(genome_kmer_counts_file) as f:
+            genome_kmer_counts = json.load(f)
+        
+        # Generate kmer plots
+        plot_kmer_context(context_counts, genome_kmer_counts, args.output_dir)
+        plot_normalized_kmer_context_per_sample(context_counts, genome_kmer_counts, args.output_dir)
+        analyze_ems_mutation_kmer_bias(context_counts, genome_kmer_counts, args.output_dir)
+        analyze_ems_cg_kmer_bias(context_counts, genome_kmer_counts, args.output_dir)
+        plot_consistently_enriched_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
+        plot_consistently_depleted_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
+        plot_consistently_enriched_3mer_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
+        plot_consistently_depleted_3mer_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
+        plot_ems_5mer_signature_per_sample(context_counts, args.output_dir)
+        plot_ems_5mer_signature_all_samples(context_counts, args.output_dir)
+        plot_ems_3mer_signature_per_sample(context_counts, genome_kmer_counts, args.output_dir)
+        plot_ems_3mer_signature_all_samples(context_counts, genome_kmer_counts, args.output_dir)
+        plot_ems_3mer_signature_multiplot(context_counts, genome_kmer_counts, args.output_dir)
+        plot_ems_5mer_signature_multiplot(context_counts, args.output_dir)
+    else:
+        print("Warning: contextcounts.json or genome_kmer_counts.json not found in results directory")
     
     # dN/dS ratio plots - only use plot_dnds_analysis
     if args.dnds_csv and os.path.exists(args.dnds_csv):
@@ -801,6 +1944,14 @@ def main():
     if args.results_dir:
         print("Generating per-gene dN/dS plots...")
         plot_per_gene_dnds(args.results_dir, args.output_dir)
+
+    # Add gene mutation statistics
+    gene_stats_path = os.path.join(args.results_dir, 'results', 'gene_statistics.json')
+    top_n = 30
+    print(gene_stats_path)
+    if os.path.exists(gene_stats_path):
+        print("Generating gene mutation statistics plots...")
+        plot_gene_mutation_statistics(gene_stats_path, args.output_dir, top_n)
 
 if __name__ == "__main__":
     main()
