@@ -1217,6 +1217,25 @@ def plot_ems_mutation_frequencies_heatmap(normalized_rates: dict, output_dir: st
     
     print(f"Mutation frequency heatmap saved to {output_path}")
 
+def clean_ems_sample_name(sample):
+    """Clean EMS sample name to just show EMS-1, EMS-2, etc."""
+    if 'EMS' not in sample or '7d' in sample or '3d' in sample:
+        return sample
+    
+    # Extract the number after EMS
+    if 'EMS-' in sample:
+        sample_id = sample.split('EMS-')[1]
+    elif 'EMS' in sample:
+        sample_id = sample.split('EMS')[1]
+    else:
+        return sample
+    
+    # Extract just the number
+    number = re.match(r'\d+', sample_id)
+    if number:
+        return f"EMS-{number.group()}"
+    return sample
+
 def plot_consistently_enriched_kmers_heatmap(context_counts: dict, genome_kmer_counts: dict, output_dir: str, min_enrichment: float = 1.5, top_n: int = 30):
     """
     Plot a heatmap of raw enrichment ratios for 7-mers that are consistently enriched across all EMS samples.
@@ -1243,6 +1262,8 @@ def plot_consistently_enriched_kmers_heatmap(context_counts: dict, genome_kmer_c
             enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else np.nan
             enrichment_data[sample][kmer] = enrichment_ratio
     df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    # Clean sample names
+    df.index = [clean_ems_sample_name(sample) for sample in df.index]
     consistently_enriched_kmers = df.columns[(df.min(axis=0) > min_enrichment)]
     if len(consistently_enriched_kmers) == 0:
         print(f"No 7-mers found with minimum enrichment > {min_enrichment} across all samples.")
@@ -1290,6 +1311,8 @@ def plot_consistently_depleted_kmers_heatmap(
             enrichment_ratio = (observed_count / expected_count) if expected_count > 0 else np.nan
             enrichment_data[sample][kmer] = enrichment_ratio
     df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    # Clean sample names
+    df.index = [clean_ems_sample_name(sample) for sample in df.index]
     consistently_depleted_kmers = df.columns[(df.max(axis=0) < max_enrichment)]
     if len(consistently_depleted_kmers) == 0:
         print(f"No 7-mers found with maximum enrichment < {max_enrichment} across all samples.")
@@ -1455,6 +1478,8 @@ def plot_consistently_enriched_3mer_kmers_heatmap(context_counts, genome_kmer_co
             enrichment_data[sample][kmer] = enrichment_ratio
 
     df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    # Clean sample names
+    df.index = [clean_ems_sample_name(sample) for sample in df.index]
     consistently_enriched_kmers = df.columns[(df.min(axis=0) > min_enrichment)]
     if len(consistently_enriched_kmers) == 0:
         print(f"No 3-mers found with minimum enrichment > {min_enrichment} across all samples.")
@@ -1498,6 +1523,8 @@ def plot_consistently_depleted_3mer_kmers_heatmap(context_counts, genome_kmer_co
             enrichment_data[sample][kmer] = enrichment_ratio
 
     df = pd.DataFrame.from_dict(enrichment_data, orient='index')
+    # Clean sample names
+    df.index = [clean_ems_sample_name(sample) for sample in df.index]
     consistently_depleted_kmers = df.columns[(df.max(axis=0) < max_enrichment)]
     if len(consistently_depleted_kmers) == 0:
         print(f"No 3-mers found with maximum enrichment < {max_enrichment} across all samples.")
@@ -1907,19 +1934,13 @@ def main():
     contextcounts_file = results_dir / 'results' / 'contextcounts.json'
     genome_kmer_counts_file = results_dir / 'results' / 'genome_kmer_counts.json'
     if contextcounts_file.exists() and genome_kmer_counts_file.exists():
-        print("Generating kmer context plots...")
+        print("Generating kmer context plots (5-mer and 3-mer only)...")
         with open(contextcounts_file) as f:
             context_counts = json.load(f)
         with open(genome_kmer_counts_file) as f:
             genome_kmer_counts = json.load(f)
         
-        # Generate kmer plots
-        plot_kmer_context(context_counts, genome_kmer_counts, args.output_dir)
-        plot_normalized_kmer_context_per_sample(context_counts, genome_kmer_counts, args.output_dir)
-        analyze_ems_mutation_kmer_bias(context_counts, genome_kmer_counts, args.output_dir)
-        analyze_ems_cg_kmer_bias(context_counts, genome_kmer_counts, args.output_dir)
-        plot_consistently_enriched_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
-        plot_consistently_depleted_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
+        # Generate 5-mer and 3-mer plots only (no 7-mer)
         plot_consistently_enriched_3mer_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
         plot_consistently_depleted_3mer_kmers_heatmap(context_counts, genome_kmer_counts, args.output_dir)
         plot_ems_5mer_signature_per_sample(context_counts, args.output_dir)

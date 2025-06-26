@@ -18,6 +18,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import shutil
 from collections import defaultdict
 import time
+import copy
+import logging
+import multiprocessing
 
 # Add src to path 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -249,7 +252,8 @@ def nuc_to_provean_score(
     features: Dict[str, Any],
     wolgenome: SeqContext,
     codon_table: str,
-    aa_mutations_dict: Optional[Dict] = None
+    aa_mutations_dict: Optional[Dict] = None,
+    collect_new_scores: Optional[dict] = None
 ) -> Tuple[float, float, Dict[str, Any]]:
     """Convert nucleotide mutations to amino acid mutations and calculate PROVEAN score."""
     DELETERIOUS_THRESHOLD = -2.5
@@ -315,10 +319,10 @@ def nuc_to_provean_score(
                     deleterious_count += 1
                     deleterious_count_with_nonsense += 1
         else:
-            # Mutation not in database, need to calculate score
             new_mutations.append(hgvs_mut)
     
     # Calculate new scores if needed
+    new_scores = {}
     if new_mutations:
         # Write new variants to file
         var_file = os.path.join(paths['provpath'], f"{gene_id}.new.var")
@@ -378,7 +382,6 @@ def nuc_to_provean_score(
             if new_mutations:
                 # Read and process new scores
                 csv_file = os.path.join(paths['provpath'], f"{gene_id}.csv")
-                new_scores = {}
                 if os.path.exists(csv_file):
                     with open(csv_file, 'r') as scores:
                         for line in scores:
@@ -400,18 +403,13 @@ def nuc_to_provean_score(
                                         deleterious_count += 1
                                         deleterious_count_with_nonsense += 1
                 
-                # Add successful scores to database
-                if new_scores:
-                    score_db.add_scores_batch(gene_id, new_scores)
-                
+                # Do not write to DB here; collect for batch write
                 # Any mutations that didn't get scores are failed
                 scored_mutations = set(new_scores.keys())
                 failed_mutations.extend(set(new_mutations) - scored_mutations)
-                
-                # Add failed mutations to database as None
                 failed_scores = {mut: None for mut in failed_mutations}
                 if failed_scores:
-                    score_db.add_scores_batch(gene_id, failed_scores)
+                    new_scores.update(failed_scores)
             
         except Exception as e:
             logger.error(f"Error running PROVEAN for gene {gene_id}: {e}")
@@ -425,333 +423,16 @@ def nuc_to_provean_score(
                     except:
                         pass
     
+    # If collecting, add new_scores to the collector
+    if collect_new_scores is not None and new_scores:
+        collect_new_scores.update(new_scores)
     stats = {
         'deleterious_count': deleterious_count,
         'total_mutations': total_mutations,
         'failed_mutations': len(failed_mutations),
         'nonsense_count': nonsense_count
     }
-    
     return total_score, total_score_with_nonsense, stats
-
-def permute_mutations(
-    nuc_mutations: Dict[str, Any],
-    gene_id: str, 
-    filtered_positions: List[int],
-    score_db: ProveanScoreDB,
-    provean_config: Dict[str, Any],
-    paths: Dict[str, str],
-    features: Dict[str, Any],
-    wolgenome: SeqContext,
-    codon_table: str,
-    n_permutations: int = 1000,
-    pbar: Optional[tqdm] = None
-) -> Dict[str, Any]:
-    """Randomly place nucleotide mutations and calculate PROVEAN scores."""
-    
-    permuted_scores = []
-    permuted_deleterious_counts = []
-    
-    gene_length = nuc_mutations['gene_len']
-    nuc_muts = list(nuc_mutations['mutations'].keys())
-    n_mutations = len(nuc_muts)
-    
-    # Get gene sequence
-    gene_seq = str(wolgenome.genome[features[gene_id].start:features[gene_id].end])
-    is_reverse = features[gene_id].strand == -1
-    if is_reverse:
-        gene_seq = str(Seq(gene_seq).reverse_complement())
-    
-    # Store original valid positions for each base type
-    original_valid_positions = {'C': [], 'G': []}
-    for pos in range(gene_length):
-        if pos not in filtered_positions:  # Skip filtered positions
-            if pos < len(gene_seq):  # Ensure position is within gene sequence
-                base = gene_seq[pos]
-                if base in original_valid_positions:
-                    original_valid_positions[base].append(pos)
-    
-    for _ in range(n_permutations):
-        # Reset valid positions from original for each permutation
-        valid_positions = {
-            'C': original_valid_positions['C'][:],  # Make copy
-            'G': original_valid_positions['G'][:]
-        }
-        
-        permuted_muts = {
-            'mutations': {},
-            'gene_len': nuc_mutations['gene_len'],
-            'avg_cov': nuc_mutations['avg_cov']
-        }
-        
-        # Place each mutation at a valid position for its type
-        for orig_mut in nuc_muts:
-            ref_base = orig_mut.split('_')[1].split('>')[0]
-            if valid_positions[ref_base]:  # If we have valid positions for this base
-                pos_idx = random.randrange(len(valid_positions[ref_base]))
-                new_pos = valid_positions[ref_base].pop(pos_idx)
-                mut_type = orig_mut.split('_')[1]
-                
-                # Verify the reference base at this position
-                if new_pos < len(gene_seq) and gene_seq[new_pos] == ref_base:
-                    # For reverse strand genes, we need to adjust the mutation type
-                    if is_reverse:
-                        if mut_type == 'C>T':
-                            mut_type = 'G>A'
-                        elif mut_type == 'G>A':
-                            mut_type = 'C>T'
-                    
-                    # Use 1-based position for mutation key
-                    # For reverse strand, we need to convert the position
-                    if is_reverse:
-                        # Convert position to genomic coordinates
-                        genomic_pos = len(gene_seq) - new_pos
-                    else:
-                        genomic_pos = new_pos + 1
-                    
-                    permuted_muts['mutations'][f"{genomic_pos}_{mut_type}"] = 1
-                else:
-                    # Skip this mutation if reference base doesn't match
-                    logger.debug(f"Reference mismatch at position {new_pos}: expected {ref_base}, found {gene_seq[new_pos] if new_pos < len(gene_seq) else 'out of bounds'}")
-                    continue
-        
-        if permuted_muts['mutations']:
-            score, score_with_nonsense, mutation_stats = nuc_to_provean_score(
-                permuted_muts,
-                gene_id,
-                score_db,
-                provean_config,
-                paths,
-                features,
-                wolgenome,
-                codon_table,
-                None
-            )
-            permuted_scores.append(score)
-            permuted_deleterious_counts.append(mutation_stats['deleterious_count'])
-        
-        if pbar is not None:
-            pbar.update(1)
-    
-    return {
-        'scores': permuted_scores,
-        'deleterious_counts': permuted_deleterious_counts,
-        'mean': np.mean(permuted_scores) if permuted_scores else 0,
-        'std': np.std(permuted_scores) if permuted_scores else 0,
-        'mean_deleterious': np.mean(permuted_deleterious_counts) if permuted_deleterious_counts else 0,
-        'std_deleterious': np.std(permuted_deleterious_counts) if permuted_deleterious_counts else 0
-    }
-
-def process_gene_permutations(
-    gene_id: str,
-    sample_mutations: Dict[str, Dict[str, Any]],
-    sample_filtered_positions: Dict[str, List[int]],
-    score_db_path: str,
-    provean_config: Dict[str, Any],
-    paths: Dict[str, str],
-    features: Dict[str, Any],
-    wolgenome: SeqContext,
-    codon_table: str,
-    n_permutations: int = 1000,
-    min_mutations: int = 3
-) -> Tuple[str, Dict[str, Any]]:
-    """Process permutations for a single gene across all samples."""
-    # Re-initialize DB in each process
-    score_db = ProveanScoreDB(score_db_path)
-    try:
-        total_mutations = sum(
-            len(mutations['mutations']) 
-            for mutations in sample_mutations.values()
-        )
-        
-        if total_mutations < min_mutations:
-            return gene_id, create_empty_result(sample_mutations, total_mutations)
-        
-        process_id = os.getpid()
-        gene_temp_dir = os.path.join(paths['provpath'], f"{gene_id}_{process_id}")
-        os.makedirs(gene_temp_dir, exist_ok=True)
-        gene_paths = paths.copy()
-        gene_paths['provpath'] = gene_temp_dir
-
-        # --- Timing: Original score calculation ---
-        t0 = time.time()
-        original_total_score = 0
-        original_total_score_with_nonsense = 0
-        original_sample_scores = {}
-        original_total_stats = {'deleterious_count': 0, 'total_mutations': 0, 'nonsense_count': 0}
-        
-        for sample, mutations in sample_mutations.items():
-            score, score_with_nonsense, stats = nuc_to_provean_score(
-                mutations,
-                gene_id,
-                score_db,
-                provean_config,
-                gene_paths,
-                features,
-                wolgenome,
-                codon_table
-            )
-            original_sample_scores[sample] = (score, score_with_nonsense, stats)
-            original_total_score += score
-            original_total_score_with_nonsense += score_with_nonsense
-            original_total_stats['deleterious_count'] += stats['deleterious_count']
-            original_total_stats['total_mutations'] += stats['total_mutations']
-            original_total_stats['nonsense_count'] += stats.get('nonsense_count', 0)
-        t1 = time.time()
-        logger.info(f"[{gene_id}] Original score calculation took {t1-t0:.2f} seconds.")
-
-        # --- Timing: Permutation loop ---
-        permuted_total_scores = []
-        permuted_total_scores_with_nonsense = []
-        permuted_total_deleterious = []
-        t2 = time.time()
-        for perm_idx in range(n_permutations):
-            perm_start = time.time()
-            perm_total_score = 0
-            perm_total_score_with_nonsense = 0
-            perm_total_deleterious = 0
-            
-            for sample, mutations in sample_mutations.items():
-                filtered_pos = sample_filtered_positions.get(sample, [])
-                permuted_muts = permute_single_sample(
-                    mutations,
-                    gene_id,
-                    filtered_pos,
-                    features,
-                    wolgenome
-                )
-                # --- Timing: Score calculation for permutation ---
-                score_start = time.time()
-                if permuted_muts['mutations']:
-                    score, score_with_nonsense, stats = nuc_to_provean_score(
-                        permuted_muts,
-                        gene_id,
-                        score_db,
-                        provean_config,
-                        gene_paths,
-                        features,
-                        wolgenome,
-                        codon_table
-                    )
-                    perm_total_score += score
-                    perm_total_score_with_nonsense += score_with_nonsense
-                    perm_total_deleterious += stats['deleterious_count']
-                score_end = time.time()
-                # Optional: log per-sample score time
-                # logger.debug(f"[{gene_id}] Perm {perm_idx} sample {sample} score: {score_end-score_start:.4f}s")
-            permuted_total_scores.append(perm_total_score)
-            permuted_total_scores_with_nonsense.append(perm_total_score_with_nonsense)
-            permuted_total_deleterious.append(perm_total_deleterious)
-            perm_end = time.time()
-            if perm_idx % 100 == 0:
-                logger.info(f"[{gene_id}] Permutation {perm_idx} took {perm_end-perm_start:.3f}s")
-        t3 = time.time()
-        logger.info(f"[{gene_id}] All {n_permutations} permutations took {t3-t2:.2f} seconds.")
-
-        # Calculate p-value based on summed scores
-        p_value = sum(s <= original_total_score for s in permuted_total_scores) / len(permuted_total_scores)
-        p_value_with_nonsense = sum(s <= original_total_score_with_nonsense for s in permuted_total_scores_with_nonsense) / len(permuted_total_scores_with_nonsense)
-        
-        # Get gene length from first sample (should be same for all)
-        first_sample = next(iter(sample_mutations.values()))
-        gene_len = first_sample['gene_len']
-
-        result = {
-            'effect': original_total_score,
-            'effect_with_nonsense': original_total_score_with_nonsense,
-            'total_mutations': total_mutations,
-            'gene_len': gene_len,  # Keep gene length
-            'mutation_stats': {
-                'deleterious_count': original_total_stats['deleterious_count'],
-                'total_mutations': original_total_stats['total_mutations'],
-                'nonsense_count': original_total_stats['nonsense_count']
-            },
-            'permutation': {
-                'scores': permuted_total_scores,
-                'scores_with_nonsense': permuted_total_scores_with_nonsense,
-                'deleterious_counts': permuted_total_deleterious,
-                'mean': np.mean(permuted_total_scores) if permuted_total_scores else 0,
-                'mean_with_nonsense': np.mean(permuted_total_scores_with_nonsense) if permuted_total_scores_with_nonsense else 0,
-                'std': np.std(permuted_total_scores) if permuted_total_scores else 0,
-                'std_with_nonsense': np.std(permuted_total_scores_with_nonsense) if permuted_total_scores_with_nonsense else 0,
-                'mean_deleterious': np.mean(permuted_total_deleterious) if permuted_total_deleterious else 0,
-                'std_deleterious': np.std(permuted_total_deleterious) if permuted_total_deleterious else 0,
-                'pvalue': p_value,
-                'pvalue_with_nonsense': p_value_with_nonsense
-            }
-        }
-        
-        return gene_id, result
-        
-    finally:
-        # Clean up
-        try:
-            shutil.rmtree(gene_temp_dir)
-        except:
-            pass
-
-def permute_single_sample(
-    nuc_mutations: Dict[str, Any],
-    gene_id: str,
-    filtered_positions: List[int],
-    features: Dict[str, Any],
-    wolgenome: SeqContext
-) -> Dict[str, Any]:
-    """Randomly place mutations for a single sample."""
-    
-    gene_length = nuc_mutations['gene_len']
-    nuc_muts = list(nuc_mutations['mutations'].keys())
-    
-    # Get gene sequence
-    gene_seq = str(wolgenome.genome[features[gene_id].start:features[gene_id].end])
-    is_reverse = features[gene_id].strand == -1
-    if is_reverse:
-        gene_seq = str(Seq(gene_seq).reverse_complement())
-    
-    # Store original valid positions for each base type
-    original_valid_positions = {'C': [], 'G': []}
-    for pos in range(gene_length):
-        if pos not in filtered_positions:
-            if pos < len(gene_seq):
-                base = gene_seq[pos]
-                if base in original_valid_positions:
-                    original_valid_positions[base].append(pos)
-    
-    # Reset valid positions
-    valid_positions = {
-        'C': original_valid_positions['C'][:],
-        'G': original_valid_positions['G'][:]
-    }
-    
-    permuted_muts = {
-        'mutations': {},
-        'gene_len': nuc_mutations['gene_len'],
-        'avg_cov': nuc_mutations['avg_cov']
-    }
-    
-    # Place each mutation
-    for orig_mut in nuc_muts:
-        ref_base = orig_mut.split('_')[1].split('>')[0]
-        if valid_positions[ref_base]:
-            pos_idx = random.randrange(len(valid_positions[ref_base]))
-            new_pos = valid_positions[ref_base].pop(pos_idx)
-            mut_type = orig_mut.split('_')[1]
-            
-            if new_pos < len(gene_seq) and gene_seq[new_pos] == ref_base:
-                if is_reverse:
-                    if mut_type == 'C>T':
-                        mut_type = 'G>A'
-                    elif mut_type == 'G>A':
-                        mut_type = 'C>T'
-                
-                if is_reverse:
-                    genomic_pos = len(gene_seq) - new_pos
-                else:
-                    genomic_pos = new_pos + 1
-                
-                permuted_muts['mutations'][f"{genomic_pos}_{mut_type}"] = 1
-    
-    return permuted_muts
 
 def is_ems_sample(sample_name: str) -> bool:
     """Determine if a sample is a valid EMS treated sample.
@@ -763,139 +444,6 @@ def is_ems_sample(sample_name: str) -> bool:
 def is_control_sample(sample_name: str) -> bool:
     """Determine if a sample is a control sample."""
     return 'EMS' not in sample_name
-
-def calculate_provean_scores_parallel(
-    mutation_jsons: List[str],
-    score_db: ProveanScoreDB,
-    paths: Dict[str, str],
-    provean_config: Dict[str, Any],
-    features: Dict[str, Any],
-    wolgenome: SeqContext,
-    codon_table: str,
-    mpileup_dir: str,
-    max_workers: int = None,
-    min_mutations: int = 3
-) -> None:
-    '''Calculate PROVEAN scores and perform permutation tests in parallel.'''
-    
-    # Separate EMS and control samples
-    ems_jsons = []
-    control_jsons = []
-    
-    for js in mutation_jsons:
-        sample = js.split('/')[-1].split('.')[0]
-        if is_ems_sample(sample):
-            ems_jsons.append(js)
-        elif is_control_sample(sample):
-            control_jsons.append(js)
-    
-    logger.info(f"Found {len(ems_jsons)} EMS samples and {len(control_jsons)} control samples")
-    
-    # Process EMS samples
-    if ems_jsons:
-        logger.info("Processing EMS samples...")
-        process_sample_group(
-            ems_jsons,
-            score_db,
-            paths,
-            provean_config,
-            features,
-            wolgenome,
-            codon_table,
-            mpileup_dir,
-            max_workers,
-            min_mutations,
-            "ems_merged_results.json"
-        )
-    
-    # Process control samples
-    if control_jsons:
-        logger.info("Processing control samples...")
-        process_sample_group(
-            control_jsons,
-            score_db,
-            paths,
-            provean_config,
-            features,
-            wolgenome,
-            codon_table,
-            mpileup_dir,
-            max_workers,
-            min_mutations,
-            "control_merged_results.json"
-        )
-
-def process_sample_group(
-    sample_jsons: List[str],
-    score_db: ProveanScoreDB,
-    paths: Dict[str, str],
-    provean_config: Dict[str, Any],
-    features: Dict[str, Any],
-    wolgenome: SeqContext,
-    codon_table: str,
-    mpileup_dir: str,
-    max_workers: int,
-    min_mutations: int,
-    output_filename: str
-) -> None:
-    """Process a group of samples (either EMS or control) together."""
-    
-    # First, collect all mutations and filtered positions by gene
-    gene_mutations = defaultdict(dict)  # gene -> sample -> mutations
-    gene_filtered = defaultdict(dict)   # gene -> sample -> filtered positions
-    
-    # Process each sample
-    for js in tqdm(sample_jsons, desc="Loading samples"):
-        sample = js.split('/')[-1].split('.')[0]
-        
-        # Load filtered positions
-        filtered_positions = load_filtered_positions(sample, paths, mpileup_dir)
-        
-        # Load mutations
-        with open(js) as f:
-            nuc_mutations = json.load(f)
-            
-        # Group by gene
-        for gene, mutations in nuc_mutations.items():
-            gene_mutations[gene][sample] = mutations
-            gene_filtered[gene][sample] = filtered_positions.get(gene, [])
-    
-    logger.info(f"Processing {len(gene_mutations)} genes for {len(sample_jsons)} samples")
-    
-    # Process genes in parallel
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        for gene in gene_mutations:
-            future = executor.submit(
-                process_gene_permutations,
-                gene,
-                gene_mutations[gene],
-                gene_filtered[gene],
-                score_db.db_path,
-                provean_config,
-                paths,
-                features,
-                wolgenome,
-                codon_table,
-                1000,
-                min_mutations
-            )
-            futures[future] = gene
-        
-        # Collect results
-        merged_results = {}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing genes"):
-            gene = futures[future]
-            try:
-                gene_id, result = future.result()
-                merged_results[gene_id] = result
-            except Exception as e:
-                logger.error(f"Error processing gene {gene}: {e}")
-        
-        # Save merged results
-        merged_results_file = os.path.join(paths['results'], output_filename)
-        with open(merged_results_file, 'w') as f:
-            json.dump(merged_results, f, indent=2)
 
 def normalize_scores(sample: str, results: Dict[str, Dict[str, Any]]) -> None:
     '''Normalize effect scores for each gene.
@@ -1016,6 +564,265 @@ def calculate_genome_base_counts(wolgenome: SeqContext) -> Dict[str, int]:
     
     return base_counts
 
+def collect_observed_5mer_contexts(
+    mutation_jsons: List[str],
+    wolgenome: SeqContext,
+    features: Dict[str, Any],
+    kmer_size: int = 5
+) -> Dict[str, int]:
+    """Collect the 5-mer context of all observed genic mutations across all samples.
+    Only considers mutations within genes and with a C or G as the center base.
+    Returns a dictionary of {5mer: count}.
+    """
+    kmer_counts = {}
+    flank = kmer_size // 2
+    genome_seq = str(wolgenome.genome).upper()
+    
+    for js in mutation_jsons:
+        with open(js) as jf:
+            mut_dict = json.load(jf)
+            for gene_id, gene_data in mut_dict.items():
+                if gene_id not in features:
+                    continue
+                gene_start = features[gene_id].start
+                gene_end = features[gene_id].end
+                gene_strand = features[gene_id].strand
+                for mut_key in gene_data['mutations']:
+                    # Extract position and ref>alt
+                    pos_str, mut_type = mut_key.split('_')
+                    ref_base = mut_type.split('>')[0]
+                    # Only C or G mutations
+                    if ref_base not in ('C', 'G'):
+                        continue
+                    # 1-based position in gene
+                    gene_pos = int(pos_str)
+                    # Convert to genomic position (0-based)
+                    if gene_strand == 1:
+                        genome_pos = gene_start + gene_pos - 1
+                    else:
+                        genome_pos = gene_end - gene_pos
+                    # Extract k-mer context
+                    if genome_pos - flank < 0 or genome_pos + flank >= len(genome_seq):
+                        continue  # skip if k-mer would go out of bounds
+                    kmer = genome_seq[genome_pos - flank: genome_pos + flank + 1]
+                    if len(kmer) != kmer_size:
+                        continue
+                    # For reverse strand, reverse complement the kmer
+                    if gene_strand == -1:
+                        kmer = str(Seq(kmer).reverse_complement())
+                    # Only count k-mers with C or G at center
+                    if kmer[flank] not in ('C', 'G'):
+                        continue
+                    kmer_counts[kmer] = kmer_counts.get(kmer, 0) + 1
+    logger.info(f"Collected {len(kmer_counts)} unique 5-mer contexts from observed genic mutations.")
+    total_mutations = sum(kmer_counts.values())
+    logger.info(f"Total observed genic mutations (C/G center): {total_mutations}")
+    return kmer_counts
+
+# --- New: Collect all 5-mer sites with C/G center base within genes ---
+def collect_genic_5mer_sites(
+    wolgenome: SeqContext,
+    features: Dict[str, Any],
+    kmer_size: int = 5
+) -> Dict[str, list]:
+    """Collect all 5-mer sites with a C or G center base within genes.
+    Returns a dictionary mapping each 5-mer to a list of (gene_id, gene_pos, genome_pos, strand).
+    """
+    kmer_sites = {}
+    flank = kmer_size // 2
+    genome_seq = str(wolgenome.genome).upper()
+    for gene_id, feat in features.items():
+        gene_start = feat.start
+        gene_end = feat.end
+        gene_strand = feat.strand
+        gene_len = gene_end - gene_start
+        for i in range(gene_len):
+            if gene_strand == 1:
+                genome_pos = gene_start + i
+                gene_pos = i + 1
+            else:
+                genome_pos = gene_end - 1 - i
+                gene_pos = gene_end - genome_pos  # 1-based, from 3' end
+            # Check k-mer bounds
+            if genome_pos - flank < 0 or genome_pos + flank >= len(genome_seq):
+                continue
+            kmer = genome_seq[genome_pos - flank: genome_pos + flank + 1]
+            if len(kmer) != kmer_size:
+                continue
+            kmer_for_dict = kmer
+            if gene_strand == -1:
+                kmer_for_dict = str(Seq(kmer).reverse_complement())
+            if kmer_for_dict[flank] not in ('C', 'G'):
+                continue
+            kmer_sites.setdefault(kmer_for_dict, []).append((gene_id, gene_pos, genome_pos, gene_strand))
+    total_sites = sum(len(v) for v in kmer_sites.values())
+    logger.info(f"Collected {len(kmer_sites)} unique 5-mer contexts with C/G center in genes.")
+    logger.info(f"Total genic 5-mer positions (C/G center): {total_sites}")
+    return kmer_sites
+
+# --- New: Generate a random mutation profile for a single permutation ---
+def generate_random_mutation_profile(
+    observed_kmer_counts: Dict[str, int],
+    kmer_site_pool: Dict[str, list],
+    rng: random.Random = random
+) -> Dict[str, dict]:
+    """
+    For a single permutation, randomly place observed mutations at matching 5-mer sites.
+    Args:
+        observed_kmer_counts: {kmer: count} for observed mutations
+        kmer_site_pool: {kmer: [(gene_id, gene_pos, genome_pos, strand), ...]}
+        rng: random number generator (for reproducibility)
+    Returns:
+        Dict[gene_id, dict]: per-gene mutation profile in the format expected by the pipeline
+    """
+    # Make a copy of the pool so we can exhaust it for this permutation
+    pool = {k: v[:] for k, v in kmer_site_pool.items()}
+    per_gene_mutations = {}
+    for kmer, count in observed_kmer_counts.items():
+        if kmer not in pool or len(pool[kmer]) < count:
+            # Not enough sites to place all mutations of this kmer
+            continue
+        # Randomly select 'count' positions without replacement
+        selected_sites = rng.sample(pool[kmer], count)
+        # Remove selected sites from pool
+        for site in selected_sites:
+            pool[kmer].remove(site)
+            gene_id, gene_pos, genome_pos, strand = site
+            # Infer mutation type from center base of k-mer
+            center_base = kmer[2]  # 5-mer center is at index 2
+            if center_base == 'C':
+                mut_type = 'C>T'
+            elif center_base == 'G':
+                mut_type = 'G>A'
+            else:
+                continue  # Skip if center base is not C or G
+            # Build mutation key as in original code: f"{gene_pos}_{mut_type}"
+            mut_key = f"{gene_pos}_{mut_type}"
+            if gene_id not in per_gene_mutations:
+                per_gene_mutations[gene_id] = {
+                    'mutations': {},
+                    'gene_len': abs(gene_pos) if 'gene_len' not in per_gene_mutations else 0,  # will be set later
+                    'avg_cov': 0  # can be set to 0 or ignored for permutations
+                }
+            per_gene_mutations[gene_id]['mutations'][mut_key] = 1
+    # Set gene_len for each gene (use the max gene_pos seen for that gene)
+    for gene_id in per_gene_mutations:
+        gene_lens = [int(k.split('_')[0]) for k in per_gene_mutations[gene_id]['mutations']]
+        per_gene_mutations[gene_id]['gene_len'] = max(gene_lens) if gene_lens else 0
+    return per_gene_mutations
+
+# Move _single_perm outside of generate_permutation_profiles to avoid the AttributeError when pickling the local function
+def _single_perm(seed, observed_kmer_counts, kmer_site_pool):
+    rng = random.Random(seed)
+    return generate_random_mutation_profile(observed_kmer_counts, kmer_site_pool, rng=rng)
+
+def generate_permutation_profiles(
+    observed_kmer_counts: Dict[str, int],
+    kmer_site_pool: Dict[str, list],
+    n_permutations: int = 20,
+    random_seed: int = None,
+    max_workers: int = None
+) -> list:
+    """
+    Generate N random mutation profiles in parallel.
+    Args:
+        observed_kmer_counts: {kmer: count} for observed mutations
+        kmer_site_pool: {kmer: [(gene_id, gene_pos, genome_pos, strand), ...]}
+        n_permutations: number of permutations to generate
+        random_seed: seed for reproducibility
+        max_workers: number of parallel workers
+    Returns:
+        List[Dict[gene_id, dict]]: one per permutation
+    """
+    logger.info(f"Generating {n_permutations} random mutation profiles for permutation test.")
+    # Use different seeds for each permutation for reproducibility
+    seeds = [(random_seed + i) if random_seed is not None else None for i in range(n_permutations)]
+    profiles = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        results = executor.map(_single_perm, seeds, [observed_kmer_counts] * n_permutations, [kmer_site_pool] * n_permutations)
+        for idx, profile in enumerate(results, 1):
+            profiles.append(profile)
+            if idx % 50 == 0 or idx == n_permutations:
+                logger.info(f"Random mutation profile generation progress: {idx}/{n_permutations} permutations generated.")
+    logger.info("Random mutation profile generation complete.")
+    return profiles
+
+def _process_gene(gene_id, shared_profiles, score_db_path, provean_config, paths, features, genomic_fna, annotation, codon_table, db_lock):
+    from modules import parse
+    from modules.provean_db import ProveanScoreDB
+    score_db = ProveanScoreDB(score_db_path)
+    wolgenome = parse.SeqContext(genomic_fna, annotation)
+    gene_mut_profiles = [profile.get(gene_id, None) for profile in shared_profiles]
+    gene_mut_profiles = [m for m in gene_mut_profiles if m is not None]
+    perm_scores = []
+    all_new_scores = {}
+    for mut_profile in gene_mut_profiles:
+        score, score_with_nonsense, stats = nuc_to_provean_score(
+            mut_profile,
+            gene_id,
+            score_db,
+            provean_config,
+            paths,
+            features,
+            wolgenome,
+            codon_table,
+            collect_new_scores=all_new_scores
+        )
+        perm_scores.append({
+            'effect': score,
+            'effect_with_nonsense': score_with_nonsense,
+            'mutation_stats': stats
+        })
+    # After all permutations, write all new scores for this gene in one batch
+    if all_new_scores:
+        with db_lock:
+            score_db.add_scores_batch(gene_id, all_new_scores)
+    effects = [s['effect'] for s in perm_scores]
+    effects_with_nonsense = [s['effect_with_nonsense'] for s in perm_scores]
+    result = {
+        'permutation_effects': effects,
+        'permutation_effects_with_nonsense': effects_with_nonsense,
+        'mean': np.mean(effects) if effects else 0,
+        'std': np.std(effects) if effects else 0,
+        'mean_with_nonsense': np.mean(effects_with_nonsense) if effects_with_nonsense else 0,
+        'std_with_nonsense': np.std(effects_with_nonsense) if effects_with_nonsense else 0,
+    }
+    return gene_id, result
+
+def process_permuted_provean_scores(
+    permutation_profiles: list,
+    score_db: ProveanScoreDB,
+    provean_config: dict,
+    paths: dict,
+    features: dict,
+    genomic_fna: str,
+    annotation: str,
+    codon_table: str,
+    max_workers: int = None
+) -> dict:
+    gene_ids = set()
+    for profile in permutation_profiles:
+        gene_ids.update(profile.keys())
+    gene_ids = list(gene_ids)
+    logger.info(f"Starting permutation test scoring for {len(gene_ids)} genes.")
+    results = {}
+    processed = 0
+    with multiprocessing.Manager() as manager:
+        shared_profiles = manager.list(permutation_profiles)
+        db_lock = manager.Lock()
+        with multiprocessing.Pool(processes=max_workers) as pool:
+            args = [
+                (gene_id, shared_profiles, score_db.db_path, provean_config, paths, features, genomic_fna, annotation, codon_table, db_lock)
+                for gene_id in gene_ids
+            ]
+            for gene_id, result in pool.starmap(_process_gene, args):
+                results[gene_id] = result
+                processed += 1
+                if processed % 10 == 0 or processed == len(gene_ids):
+                    logger.info(f"Permutation test progress: {processed}/{len(gene_ids)} genes processed.")
+    logger.info("Permutation test scoring complete.")
+    return results
+
 def main() -> None:
     '''Main function to run the PROVEAN effect score calculation pipeline.
     
@@ -1093,21 +900,51 @@ def main() -> None:
     # Calculate PROVEAN scores with permutation testing
     mutation_jsons = glob(paths['mutpath'] + '/*.json')
     
-    # Limit max_workers to avoid "too many open files" error
-    # A reasonable default is 20-30 workers depending on the system
-    max_workers = min(1, os.cpu_count())
-    min_mutations = 3
-    calculate_provean_scores_parallel(
+    # Set max_workers for parallelization
+    max_workers = min(20, os.cpu_count())
+    
+    # Collect 5-mer context of all observed genic mutations
+    collect_observed_5mer_contexts(
         mutation_jsons,
-        score_db,
-        paths,
-        provean_config,
-        features,
         wolgenome,
+        features,
+        kmer_size=5
+    )
+
+    # Collect all 5-mer sites with C/G center base within genes
+    collect_genic_5mer_sites(
+        wolgenome,
+        features,
+        kmer_size=5
+    )
+
+    # Calculate permuted PROVEAN scores
+    permutation_profiles = generate_permutation_profiles(
+        collect_observed_5mer_contexts(
+            mutation_jsons,
+            wolgenome,
+            features,
+            kmer_size=5
+        ),
+        collect_genic_5mer_sites(
+            wolgenome,
+            features,
+            kmer_size=5
+        ),
+        n_permutations=1000,
+        random_seed=None,
+        max_workers=max_workers
+    )
+    permuted_results = process_permuted_provean_scores(
+        permutation_profiles,
+        score_db,
+        provean_config,
+        paths,
+        features,
+        refs['genomic_fna'],
+        refs['annotation'],
         refs['codon_table'],
-        args.mpileups,
-        max_workers=max_workers,  # Use limited number of workers
-        min_mutations=min_mutations  # Add minimum mutation parameter
+        max_workers=max_workers
     )
 
     logger.success("Pipeline completed successfully")

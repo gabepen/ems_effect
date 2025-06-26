@@ -291,7 +291,6 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
             print(f"Sequence around position: {seq[max(0, pos-5):min(len(seq), pos+6)]}")
             print(f"Position in sequence: {pos - max(0, pos-5)}")
             print(f"=== END MISMATCH DETAILS ===\n")
-            input()
             continue
             
         # Create mutated codon
