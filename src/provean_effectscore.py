@@ -900,43 +900,41 @@ def main() -> None:
     # Calculate PROVEAN scores with permutation testing
     mutation_jsons = glob(paths['mutpath'] + '/*.json')
     
+    # Separate control and treated sample mutation files
+    control_jsons = []
+    treated_jsons = []
+    for js in mutation_jsons:
+        sample_name = os.path.basename(js).replace('.json', '')
+        if is_control_sample(sample_name):
+            control_jsons.append(js)
+        elif is_ems_sample(sample_name):
+            treated_jsons.append(js)
+
     # Set max_workers for parallelization
     max_workers = min(20, os.cpu_count())
     
-    # Collect 5-mer context of all observed genic mutations
-    collect_observed_5mer_contexts(
-        mutation_jsons,
+    # --- Controls ---
+    logger.info(f"Running permutation test for pooled control samples: {len(control_jsons)} files.")
+    observed_kmers_control = collect_observed_5mer_contexts(
+        control_jsons,
         wolgenome,
         features,
         kmer_size=5
     )
-
-    # Collect all 5-mer sites with C/G center base within genes
-    collect_genic_5mer_sites(
+    kmer_sites_control = collect_genic_5mer_sites(
         wolgenome,
         features,
         kmer_size=5
     )
-
-    # Calculate permuted PROVEAN scores
-    permutation_profiles = generate_permutation_profiles(
-        collect_observed_5mer_contexts(
-            mutation_jsons,
-            wolgenome,
-            features,
-            kmer_size=5
-        ),
-        collect_genic_5mer_sites(
-            wolgenome,
-            features,
-            kmer_size=5
-        ),
+    permutation_profiles_control = generate_permutation_profiles(
+        observed_kmers_control,
+        kmer_sites_control,
         n_permutations=1000,
         random_seed=None,
         max_workers=max_workers
     )
-    permuted_results = process_permuted_provean_scores(
-        permutation_profiles,
+    permuted_results_control = process_permuted_provean_scores(
+        permutation_profiles_control,
         score_db,
         provean_config,
         paths,
@@ -946,6 +944,148 @@ def main() -> None:
         refs['codon_table'],
         max_workers=max_workers
     )
+    # --- Merge all observed mutations for controls ---
+    merged_control_mutations = {}
+    for js in control_jsons:
+        with open(js) as jf:
+            mut_dict = json.load(jf)
+            for gene_id, gene_data in mut_dict.items():
+                if gene_id not in merged_control_mutations:
+                    merged_control_mutations[gene_id] = {
+                        'mutations': {},
+                        'gene_len': gene_data['gene_len'],
+                        'avg_cov': 0,
+                        'sample_count': 0
+                    }
+                # Merge mutations
+                for mut_key, count in gene_data['mutations'].items():
+                    merged_control_mutations[gene_id]['mutations'][mut_key] = merged_control_mutations[gene_id]['mutations'].get(mut_key, 0) + count
+                merged_control_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
+                merged_control_mutations[gene_id]['sample_count'] += 1
+    # Average coverage
+    for gene_id in merged_control_mutations:
+        sc = merged_control_mutations[gene_id]['sample_count']
+        if sc > 0:
+            merged_control_mutations[gene_id]['avg_cov'] /= sc
+    # Calculate observed effect and stats for merged controls
+    observed_control_results = {}
+    for gene_id, gene_data in merged_control_mutations.items():
+        effect, effect_with_nonsense, stats = nuc_to_provean_score(
+            {'mutations': gene_data['mutations']},
+            gene_id,
+            score_db,
+            provean_config,
+            paths,
+            features,
+            wolgenome,
+            refs['codon_table']
+        )
+        # Compose output in original format
+        perm = permuted_results_control.get(gene_id, {})
+        observed_control_results[gene_id] = {
+            'effect': effect,
+            'effect_with_nonsense': effect_with_nonsense,
+            'total_mutations': sum(gene_data['mutations'].values()),
+            'gene_len': gene_data['gene_len'],
+            'mutation_stats': stats,
+            'permutation': {
+                'scores': perm.get('permutation_effects', []),
+                'scores_with_nonsense': perm.get('permutation_effects_with_nonsense', []),
+                'mean': perm.get('mean', 0),
+                'std': perm.get('std', 0),
+                'mean_with_nonsense': perm.get('mean_with_nonsense', 0),
+                'std_with_nonsense': perm.get('std_with_nonsense', 0)
+            }
+        }
+    with open(f"{paths['results']}/permuted_provean_results_controls.json", "w") as f:
+        json.dump(observed_control_results, f, indent=2)
+
+    # --- Treated ---
+    logger.info(f"Running permutation test for pooled treated samples: {len(treated_jsons)} files.")
+    observed_kmers_treated = collect_observed_5mer_contexts(
+        treated_jsons,
+            wolgenome,
+            features,
+            kmer_size=5
+    )
+    kmer_sites_treated = collect_genic_5mer_sites(
+            wolgenome,
+            features,
+            kmer_size=5
+    )
+    permutation_profiles_treated = generate_permutation_profiles(
+        observed_kmers_treated,
+        kmer_sites_treated,
+        n_permutations=1000,
+        random_seed=None,
+        max_workers=max_workers
+    )
+    permuted_results_treated = process_permuted_provean_scores(
+        permutation_profiles_treated,
+        score_db,
+        provean_config,
+        paths,
+        features,
+        refs['genomic_fna'],
+        refs['annotation'],
+        refs['codon_table'],
+        max_workers=max_workers
+    )
+    # --- Merge all observed mutations for treated ---
+    merged_treated_mutations = {}
+    for js in treated_jsons:
+        with open(js) as jf:
+            mut_dict = json.load(jf)
+            for gene_id, gene_data in mut_dict.items():
+                if gene_id not in merged_treated_mutations:
+                    merged_treated_mutations[gene_id] = {
+                        'mutations': {},
+                        'gene_len': gene_data['gene_len'],
+                        'avg_cov': 0,
+                        'sample_count': 0
+                    }
+                # Merge mutations
+                for mut_key, count in gene_data['mutations'].items():
+                    merged_treated_mutations[gene_id]['mutations'][mut_key] = merged_treated_mutations[gene_id]['mutations'].get(mut_key, 0) + count
+                merged_treated_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
+                merged_treated_mutations[gene_id]['sample_count'] += 1
+    # Average coverage
+    for gene_id in merged_treated_mutations:
+        sc = merged_treated_mutations[gene_id]['sample_count']
+        if sc > 0:
+            merged_treated_mutations[gene_id]['avg_cov'] /= sc
+    # Calculate observed effect and stats for merged treated
+    observed_treated_results = {}
+    for gene_id, gene_data in merged_treated_mutations.items():
+        effect, effect_with_nonsense, stats = nuc_to_provean_score(
+            {'mutations': gene_data['mutations']},
+            gene_id,
+            score_db,
+            provean_config,
+            paths,
+            features,
+            wolgenome,
+            refs['codon_table']
+        )
+        # Compose output in original format
+        perm = permuted_results_treated.get(gene_id, {})
+        observed_treated_results[gene_id] = {
+            'effect': effect,
+            'effect_with_nonsense': effect_with_nonsense,
+            'total_mutations': sum(gene_data['mutations'].values()),
+            'gene_len': gene_data['gene_len'],
+            'mutation_stats': stats,
+            'permutation': {
+                'scores': perm.get('permutation_effects', []),
+                'scores_with_nonsense': perm.get('permutation_effects_with_nonsense', []),
+                'mean': perm.get('mean', 0),
+                'std': perm.get('std', 0),
+                'mean_with_nonsense': perm.get('mean_with_nonsense', 0),
+                'std_with_nonsense': perm.get('std_with_nonsense', 0)
+            }
+        }
+    with open(f"{paths['results']}/permuted_provean_results_treated.json", "w") as f:
+        json.dump(observed_treated_results, f, indent=2)
 
     logger.success("Pipeline completed successfully")
 
