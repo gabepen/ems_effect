@@ -7,9 +7,11 @@ from functools import partial
 from mimetypes import guess_type 
 import numpy as np
 from Bio import SeqIO
+from Bio.Seq import Seq
 from BCBio import GFF
 from modules.parse import SeqContext
 from typing import Dict, List, Tuple, Optional, Any
+from loguru import logger
 
 def table_lookup(codon: str, debug_info: Optional[Dict] = None) -> str:
     '''Look up amino acid for a given codon using global codon table.
@@ -90,8 +92,9 @@ def ems_immune_codons(codon_table: Dict[str, List[str]]) -> List[str]:
 def hgvs_notation(mut):
     '''
     Converts mutations from mut_jsons to hgvs notation
+    Mutation positions are 0-based relative to gene start, need to convert to 1-based for HGVS
     '''
-    pos = int(mut.split('_')[0]) + 1
+    pos = int(mut.split('_')[0]) + 1  # Convert 0-based to 1-based
     residues = mut.split('_')[1]
     ref = residues.split('>')[0]
     alt = residues.split('>')[1]
@@ -199,7 +202,7 @@ def count_ems_sites(seq: str, immune_codons: List[str], start_pos: int = 0, mask
                 
     return non_syn_sites, syn_sites
 
-def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune_codons: List[str], start_pos: int = 0, mask: List[bool] = None):
+def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune_codons: List[str], start_pos: int = 0, mask: List[bool] = None, features=None, seqobject=None):
     '''Convert nucleotide mutations to amino acid mutations and calculate dN/dS ratios.'''
     
     # Initialize empty rates dictionary with all required keys
@@ -214,6 +217,15 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
         'syn_muts': 0
     }
     
+    # Reverse complement sequence if needed
+    original_seq = seq
+    # Don't reverse complement - mutations are already saved for the correct sequence orientation
+    # if rc:
+    #     seq = str(Seq(seq).reverse_complement())
+    
+    # Track mismatches for this gene
+    mismatch_count = 0
+    
     # Count potential mutation sites
     non_syn_sites, syn_sites = count_ems_sites(seq, immune_codons, start_pos, mask)
     
@@ -226,108 +238,96 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
     nonsyn = 0  # Total non-synonymous mutations
     aa_mutations = {}
     
-    # Find start codon first
-    start = -1
-    for i in range(len(seq)-2):
-        if seq[i:i+3] in table['starts']:
-            start = i
-            break
+    # Use gene start as coding start (positions are gene-relative already)
+    start = 0
+
             
-    if start == -1:
-        return None, 1, empty_rates
-    
     for mut_key, count in mutations.items():
         # Parse mutation
         pos_str, mut_type = mut_key.split('_')
-        pos = int(pos_str) - 1  # Convert to 0-based immediately
-        
-        # Handle reverse strand
-        if rc:
-            pos = len(seq) - pos - 1
-            ref_base_key, alt_base_key = mut_type.split('>')
-            if mut_type == 'C>T':
-                mut_type = 'G>A'
-                ref_base_key = 'G'
-                alt_base_key = 'A'
-            elif mut_type == 'G>A':
-                mut_type = 'C>T'
-                ref_base_key = 'C'
-                alt_base_key = 'T'
-        else:
-            ref_base_key, alt_base_key = mut_type.split('>')
-        
-        # Skip positions before start codon
+        ref_base_key, alt_base_key = mut_type.split('>')
+
+        # Expect 0-based positions from parse.py
+        pos = int(pos_str)
+
+        # Skip positions before coding start
         if pos < start:
-            print(f"Skipping - position before start codon")
             continue
-            
-        # Calculate codon position relative to start
+
+        # Calculate codon and base positions relative to start
         codon_pos = (pos - start) // 3 * 3 + start
         base_pos = (pos - start) % 3
 
-        if codon_pos + 2 >= len(seq):
-            print(f"Skipping - position beyond sequence end")
+        # Bounds check
+        if codon_pos < 0 or codon_pos + 2 >= len(seq):
             continue
-            
+
         codon = seq[codon_pos:codon_pos+3]
-        
-        # Make mutation
         ref_base = codon[base_pos]
         alt_base = alt_base_key
-        
-        # Verify reference base matches
+
+        # Verify reference base matches expected from mutation key
         if ref_base != ref_base_key:
-            print(f"\n=== REFERENCE MISMATCH DETAILS ===")
-            print(f"Gene ID: {seq_id}")
-            print(f"Position: {pos} (0-based)")
-            print(f"Original position: {int(pos_str) - 1} (0-based)")
-            print(f"Mutation: {mut_key} ({mut_type})")
-            print(f"Expected ref base: {ref_base_key}")
-            print(f"Actual ref base: {ref_base}")
-            print(f"Codon: {codon} at position {codon_pos}")
-            print(f"Codon position in gene: {codon_pos//3}")
-            print(f"Base position in codon: {base_pos}")
-            print(f"Reverse complement: {rc}")
-            print(f"Sequence around position: {seq[max(0, pos-5):min(len(seq), pos+6)]}")
-            print(f"Position in sequence: {pos - max(0, pos-5)}")
-            print(f"=== END MISMATCH DETAILS ===\n")
+            mismatch_count += 1
+            # Add richer diagnostic without altering behavior
+            classification = "unknown"
+            base0 = None
+            base1 = None
+            gpos0 = None
+            gpos1 = None
+            try:
+                genome_seq = str(seqobject.genome).upper() if seqobject is not None else None
+                feat = features[seq_id] if features is not None and seq_id in features else None
+                if genome_seq and feat is not None:
+                    gene_start = feat.start
+                    gene_end = feat.end
+                    strand = feat.strand
+                    comp = {'A':'T','T':'A','C':'G','G':'C'}
+                    def oriented_base(genome_pos: int) -> str:
+                        b = genome_seq[genome_pos]
+                        return comp.get(b, b) if strand == -1 else b
+                    pos0 = int(pos_str)
+                    gpos0 = (gene_start + pos0) if strand == 1 else (gene_end - 1 - pos0)
+                    base0 = oriented_base(gpos0)
+                    pos1 = max(0, int(pos_str) - 1)
+                    gpos1 = (gene_start + pos1) if strand == 1 else (gene_end - 1 - pos1)
+                    base1 = oriented_base(gpos1)
+                    if base0 == ref_base_key and base1 != ref_base_key:
+                        classification = "keys_0based_converter_ok"
+                    elif base1 == ref_base_key and base0 != ref_base_key:
+                        classification = "keys_1based_upstream"
+                    elif base0 == ref_base_key and base1 == ref_base_key:
+                        classification = "both_match"
+                    else:
+                        classification = "orientation_mismatch"
+            except Exception:
+                classification = "diagnostic_error"
+            debug_msg = (
+                f"REFERENCE MISMATCH - Gene:{seq_id} Strand:{features[seq_id].strand if features and seq_id in features else 'NA'} "
+                f"Mut:{mut_key} Expect:{ref_base_key} Found:{ref_base} Codon:{codon} Pos:{pos} CodonPos:{codon_pos} BasePos:{base_pos} "
+                f"gpos0:{gpos0} base0:{base0} gpos1:{gpos1} base1:{base1} class:{classification}"
+            )
+            print(debug_msg)
+            logger.info(debug_msg)
             continue
-            
+
         # Create mutated codon
         mutated = list(codon)
         mutated[base_pos] = alt_base
         mutated = ''.join(mutated)
-        
+
         # Check translation
         ref_aa = table_lookup(codon)
         mut_aa = table_lookup(mutated)
-        
-        # Verify reference base matches
-        if ref_base != ref_base_key:
-            continue
-            
-        # Check if synonymous with debug info
-        debug_info = {
-            'gene_id': seq_id,
-            'mutation': mut_key,
-            'position': pos,
-            'original_codon': codon,
-            'ref_aa': table_lookup(codon),
-            'sequence': seq[max(0, codon_pos-6):min(len(seq), codon_pos+9)]  # Show 2 codons before/after
-        }
-        ref_aa = table_lookup(codon, debug_info)
-        mut_aa = table_lookup(mutated, debug_info)
-        
+
         # Check if synonymous
         is_synonymous = (ref_aa == mut_aa)
-        
         # Track mutation
         site_key = f"{seq_id}_{codon_pos}_{base_pos}"
-        
+
         if is_synonymous:
             syn += count
             syn_sites_mutated.add(site_key)
-            
             # Add to amino acid mutations if it's a synonymous change
             aa_key = f"{codon_pos//3}_{ref_aa}>{ref_aa}"
             if aa_key not in aa_mutations:
@@ -336,7 +336,6 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
         else:
             nonsyn += count
             non_syn_sites_mutated.add(site_key)
-            
             # Add to amino acid mutations
             aa_key = f"{codon_pos//3}_{ref_aa}>{mut_aa}"
             if aa_key not in aa_mutations:
@@ -346,9 +345,9 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
     # Check for genes with no synonymous sites (shouldn't happen)
     if syn_sites == 0:  # Check potential sites, not observed mutations
         print(f"WARNING: Found gene with no potential synonymous sites.")
-        print(f"Sequence length: {len(seq)}")
-        print(f"Number of C/G sites: {sum(1 for base in seq if base in ['C', 'G'])}")
-        print(f"Immune codons found: {sum(1 for i in range(0, len(seq)-2, 3) if seq[i:i+3] in immune_codons)}")
+        print(f"Sequence length: {len(original_seq)}")
+        print(f"Number of C/G sites: {sum(1 for base in original_seq if base in ['C', 'G'])}")
+        print(f"Immune codons found: {sum(1 for i in range(0, len(original_seq)-2, 3) if original_seq[i:i+3] in immune_codons)}")
     
     dnds_rates = {
         'raw': 0, 
@@ -376,7 +375,7 @@ def convertor(seq: str, seq_id: str, mutations: Dict[str, int], rc: bool, immune
         print(f"non_syn_sites: {non_syn_sites}, syn_sites: {syn_sites}")
 
     
-    return aa_mutations, 0, dnds_rates
+    return aa_mutations, 0, dnds_rates, mismatch_count
 
 def count_shared(jsons):
     '''
@@ -408,16 +407,16 @@ def prep_provean(mut_dict, seqobject, sample, output, features):
     as input for getting aa_seqs.
     '''
 
-    refseq = seqobject.genome
-
     provean_json = {}
     for gene in mut_dict:
-        #get nuc sequence for gene
-        seq = refseq[features[gene].start:features[gene].end]
-        if features[gene].strand == -1:
-            #get reverse comp of gene seq 
-            seq = seq.reverse_complement()
-        #convert to aa sequence without fasta_bool
+        # Get nuc sequence for gene - use the already-processed sequences that handle reverse complementing
+        gene_seqs = seqobject.gene_seqs()
+        if gene not in gene_seqs:
+            print(f"Gene {gene} not found in gene_seqs")
+            continue
+        seq = gene_seqs[gene]
+        
+        # Convert to aa sequence without fasta_bool
         aa_seq, aa_len = translate(seq, False)
         #structure for storing mutations 
         provean_json[gene] = {'mutations':{},
@@ -429,7 +428,9 @@ def prep_provean(mut_dict, seqobject, sample, output, features):
         variants = open(path+gene+'.var','w')
         
         for mut in mut_dict[gene]['mutations']:
+            # Positions are now correctly calculated in parse module
             hgvs_mut = hgvs_notation(mut)
+            
             if '*' not in hgvs_mut[1:]:
                 # Regular mutation, no stop codon
                 provean_json[gene]['mutations'][hgvs_mut] = mut_dict[gene]['mutations'][mut]
@@ -493,6 +494,11 @@ def convert_mutations(
         'non_syn_sites_mutated': 0
     }
     
+    # Track mismatches for original data
+    total_mismatches = 0
+    genes_with_mismatches = 0
+    mismatch_details = {}  # Store per-gene mismatch info
+    
     # Process each gene
     for key in nuc_mutations.keys():
         # Skip genes not in features
@@ -500,27 +506,45 @@ def convert_mutations(
             print(f"Gene {key} not found in features")
             continue
             
-        # Get gene sequence
-        seq = seqobject.genome[features[key].start:features[key].end]
+        # Get gene sequence - use the already-processed sequences that handle reverse complementing
+        gene_seqs = seqobject.gene_seqs()
+        if key not in gene_seqs:
+            print(f"Gene {key} not found in gene_seqs")
+            continue
+        seq = gene_seqs[key]
         
-        # Check if reverse complement
-        rc = features[key].strand == -1
-        if rc:
-            seq = seq.reverse_complement()
-            
+        # No need to check strand - mutation keys are already in correct coordinate system
+        
         # Get immune codons
         immune_codons = []
         
         # Convert mutations
-        aa_muts, err, dnds_rates = convertor(
+        aa_muts, err, dnds_rates, mismatch_count = convertor(
             str(seq),
             key,  # Pass the correct gene ID
             nuc_mutations[key]['mutations'], 
-            rc, 
+            False,  # No reverse strand handling needed
             immune_codons,
             start_pos=features[key].start,
-            mask=seqobject.overlap_mask
+            mask=seqobject.overlap_mask,
+            features=features,
+            seqobject=seqobject
         )
+        
+        # Track mismatches
+        if mismatch_count > 0:
+            total_mismatches += mismatch_count
+            genes_with_mismatches += 1
+            
+            # Store detailed mismatch info
+            is_reverse_strand = features[key].strand == -1
+            mismatch_details[key] = {
+                'gene_id': key,
+                'mismatch_count': mismatch_count,
+                'total_mutations': len(nuc_mutations[key]['mutations']),
+                'is_reverse_strand': is_reverse_strand,
+                'strand': 'reverse' if is_reverse_strand else 'forward'
+            }
             
         if err != 0:
             if err == 1:
@@ -546,4 +570,15 @@ def convert_mutations(
         genome_stats['syn_sites_mutated'] += dnds_rates['syn_sites_mutated']
         genome_stats['non_syn_sites_mutated'] += dnds_rates['non_syn_sites_mutated']
     
-    return aa_mutations, genome_stats
+    # Return mismatch info for collection at pipeline level
+    mismatch_info = {
+        'summary': {
+            'total_genes_with_mismatches': genes_with_mismatches,
+            'total_mismatches': total_mismatches
+        },
+        'genes_with_mismatches': mismatch_details,
+        'reverse_strand_genes': [gene_id for gene_id, info in mismatch_details.items() if info['is_reverse_strand']],
+        'forward_strand_genes': [gene_id for gene_id, info in mismatch_details.items() if not info['is_reverse_strand']]
+    }
+    
+    return aa_mutations, genome_stats, mismatch_info

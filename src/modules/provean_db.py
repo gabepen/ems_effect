@@ -41,8 +41,8 @@ class ProveanScoreDB:
                 if not tables:
                     # Create new table if database is empty
                     c.execute('''CREATE TABLE IF NOT EXISTS provean_scores
-                               (gene_id TEXT, mutation TEXT, score REAL,
-                                PRIMARY KEY (gene_id, mutation))''')
+                               (gene TEXT, mutation TEXT, score REAL,
+                                PRIMARY KEY (gene, mutation))''')
                     conn.commit()
                 else:
                     # Get column info for existing table
@@ -72,15 +72,15 @@ class ProveanScoreDB:
                 
                 # Adapt query based on existing columns
                 if hasattr(self, 'columns'):
-                    # Map old column names to new ones if needed
-                    gene_col = 'gene_id' if 'gene_id' in self.columns else 'gene'
+                    # Map column names based on what's available
+                    gene_col = 'gene' if 'gene' in self.columns else 'gene_id'
                     mut_col = 'mutation' if 'mutation' in self.columns else 'variant'
                     score_col = 'score' if 'score' in self.columns else 'provean_score'
                     
                     query = f"SELECT {gene_col}, {mut_col}, {score_col} FROM {table_name}"
                 else:
                     # Use default column names
-                    query = "SELECT gene_id, mutation, score FROM provean_scores"
+                    query = "SELECT gene, mutation, score FROM provean_scores"
                 
                 c.execute(query)
                 for gene_id, mutation, score in c.fetchall():
@@ -139,7 +139,7 @@ class ProveanScoreDB:
             with sqlite3.connect(self.db_path) as conn:
                 c = conn.cursor()
                 c.executemany(
-                    "INSERT OR REPLACE INTO provean_scores (gene_id, mutation, score) VALUES (?, ?, ?)",
+                    "INSERT OR REPLACE INTO provean_scores (gene, mutation, score) VALUES (?, ?, ?)",
                     [(gene_id, mutation, score) for mutation, score in new_scores.items()]
                 )
                 conn.commit()

@@ -105,7 +105,7 @@ def setup_logging(outdir: str) -> None:
     # Remove any existing handlers
     logger.remove()
     
-    # Add console handler with DEBUG level
+    # Add console handler with INFO level
     logger.add(sys.stderr, level="INFO")
     
     # Add file handler with DEBUG level
@@ -266,7 +266,7 @@ def nuc_to_provean_score(
         return 0.0, 0.0, {'deleterious_count': 0, 'total_mutations': 0}
     
     # Convert nucleotide mutations to amino acid mutations
-    aa_muts, _ = translate.convert_mutations(
+    aa_muts, genome_stats, mismatch_info = translate.convert_mutations(
         {gene_id: nuc_mutations},
         wolgenome,
         codon_table,
@@ -299,7 +299,7 @@ def nuc_to_provean_score(
     
     for hgvs_mut in hgvs_dict[gene_id]['mutations']:
         if gene_id in score_db.db and hgvs_mut in score_db.db[gene_id]:
-            score = score_db.get_score(gene_id, hgvs_mut)
+            score = score_db.get_score(gene_id, hgvs_mut)  # This is in-memory, but for SQLite, the key is 'gene'
             
             if score is None:
                 failed_mutations.append(hgvs_mut)
@@ -422,7 +422,6 @@ def nuc_to_provean_score(
                         os.remove(file)
                     except:
                         pass
-    
     # If collecting, add new_scores to the collector
     if collect_new_scores is not None and new_scores:
         collect_new_scores.update(new_scores)
@@ -430,9 +429,11 @@ def nuc_to_provean_score(
         'deleterious_count': deleterious_count,
         'total_mutations': total_mutations,
         'failed_mutations': len(failed_mutations),
-        'nonsense_count': nonsense_count
+        'nonsense_count': nonsense_count,
+        'non_syn_muts': genome_stats.get('non_syn_muts', 0),
+        'syn_muts': genome_stats.get('syn_muts', 0)
     }
-    return total_score, total_score_with_nonsense, stats
+    return total_score, total_score_with_nonsense, stats, mismatch_info
 
 def is_ems_sample(sample_name: str) -> bool:
     """Determine if a sample is a valid EMS treated sample.
@@ -696,8 +697,8 @@ def generate_random_mutation_profile(
                 mut_type = 'G>A'
             else:
                 continue  # Skip if center base is not C or G
-            # Build mutation key as in original code: f"{gene_pos}_{mut_type}"
-            mut_key = f"{gene_pos}_{mut_type}"
+            # Build 0-based mutation key to match translate.convertor expectations
+            mut_key = f"{gene_pos - 1}_{mut_type}"
             if gene_id not in per_gene_mutations:
                 per_gene_mutations[gene_id] = {
                     'mutations': {},
@@ -757,7 +758,7 @@ def _process_gene(gene_id, shared_profiles, score_db_path, provean_config, paths
     perm_scores = []
     all_new_scores = {}
     for mut_profile in gene_mut_profiles:
-        score, score_with_nonsense, stats = nuc_to_provean_score(
+        score, score_with_nonsense, stats, _ = nuc_to_provean_score(
             mut_profile,
             gene_id,
             score_db,
@@ -779,9 +780,13 @@ def _process_gene(gene_id, shared_profiles, score_db_path, provean_config, paths
             score_db.add_scores_batch(gene_id, all_new_scores)
     effects = [s['effect'] for s in perm_scores]
     effects_with_nonsense = [s['effect_with_nonsense'] for s in perm_scores]
+    deleterious_counts = [s['mutation_stats']['deleterious_count'] for s in perm_scores]
+    total_mutations = [s['mutation_stats']['total_mutations'] for s in perm_scores]
     result = {
         'permutation_effects': effects,
         'permutation_effects_with_nonsense': effects_with_nonsense,
+        'deleterious_counts': deleterious_counts,
+        'total_mutations': total_mutations,
         'mean': np.mean(effects) if effects else 0,
         'std': np.std(effects) if effects else 0,
         'mean_with_nonsense': np.mean(effects_with_nonsense) if effects_with_nonsense else 0,
@@ -851,8 +856,8 @@ def main() -> None:
     refs, provean_config = load_config(args.config)
     
     # Initialize PROVEAN score database once
-    logger.info("Initializing PROVEAN score database")
-    score_db = ProveanScoreDB(refs['prov_score_json_db'])
+    logger.info("Initializing PROVEAN score database (SQLite3)")
+    score_db = ProveanScoreDB(refs['prov_score_sql_db'])
     
     # Log configuration settings
     logger.info("Configuration settings:")
@@ -860,7 +865,7 @@ def main() -> None:
     logger.info(f"  Genome: {refs['genomic_fna']}")
     logger.info(f"  Annotation: {refs['annotation']}")
     logger.info(f"  Codon table: {refs['codon_table']}")
-    logger.info(f"  PROVEAN score database: {refs['prov_score_json_db']}")
+    logger.info(f"  PROVEAN score database: {refs['prov_score_sql_db']}")
     logger.info(f"PROVEAN settings:")
     logger.info(f"  Data directory: {provean_config['data_dir']}")
     logger.info(f"  Executable: {provean_config['executable']}")
@@ -913,7 +918,190 @@ def main() -> None:
     # Set max_workers for parallelization
     max_workers = min(20, os.cpu_count())
     
-    # --- Controls ---
+    # --- Original mutation data processing for controls AND treated ---
+    logger.info("=== STARTING ORIGINAL MUTATION DATA PROCESSING ===")
+    print("=== STARTING ORIGINAL MUTATION DATA PROCESSING ===")
+    
+    # --- Process controls ---
+    logger.info("Processing original mutation data for controls...")
+    
+    # Collect all mismatch info
+    all_mismatch_info = {
+        'summary': {
+            'total_genes_with_mismatches': 0,
+            'total_mismatches': 0
+        },
+        'genes_with_mismatches': {},
+        'reverse_strand_genes': [],
+        'forward_strand_genes': []
+    }
+    
+    # --- Merge all observed mutations for controls ---
+    merged_control_mutations = {}
+    for js in control_jsons:
+        with open(js) as jf:
+            mut_dict = json.load(jf)
+            for gene_id, gene_data in mut_dict.items():
+                if gene_id not in merged_control_mutations:
+                    merged_control_mutations[gene_id] = {
+                        'mutations': {},
+                        'gene_len': gene_data['gene_len'],
+                        'avg_cov': 0,
+                        'sample_count': 0
+                    }
+                # Merge mutations
+                for mut_key, count in gene_data['mutations'].items():
+                    merged_control_mutations[gene_id]['mutations'][mut_key] = merged_control_mutations[gene_id]['mutations'].get(mut_key, 0) + count
+                merged_control_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
+                merged_control_mutations[gene_id]['sample_count'] += 1
+    # Average coverage
+    for gene_id in merged_control_mutations:
+        sc = merged_control_mutations[gene_id]['sample_count']
+        if sc > 0:
+            merged_control_mutations[gene_id]['avg_cov'] /= sc
+    # Calculate observed effect and stats for merged controls
+    observed_control_results = {}
+    for gene_id, gene_data in merged_control_mutations.items():
+        effect, effect_with_nonsense, stats, gene_mismatch_info = nuc_to_provean_score(
+            gene_data,
+            gene_id,
+            score_db,
+            provean_config,
+            paths,
+            features,
+            wolgenome,
+            refs['codon_table']
+        )
+        
+        # Collect mismatch info
+        if gene_mismatch_info and gene_mismatch_info['summary']['total_mismatches'] > 0:
+            all_mismatch_info['genes_with_mismatches'].update(gene_mismatch_info['genes_with_mismatches'])
+            all_mismatch_info['summary']['total_genes_with_mismatches'] += gene_mismatch_info['summary']['total_genes_with_mismatches']
+            all_mismatch_info['summary']['total_mismatches'] += gene_mismatch_info['summary']['total_mismatches']
+            all_mismatch_info['reverse_strand_genes'].extend(gene_mismatch_info['reverse_strand_genes'])
+            all_mismatch_info['forward_strand_genes'].extend(gene_mismatch_info['forward_strand_genes'])
+        # Compose output in original format (permutation data will be added later)
+        observed_control_results[gene_id] = {
+            'effect': effect,
+            'effect_with_nonsense': effect_with_nonsense,
+            'total_mutations': sum(gene_data['mutations'].values()),
+            'gene_len': gene_data['gene_len'],
+            'mutation_stats': stats,
+            'permutation': {
+                'scores': [],
+                'scores_with_nonsense': [],
+                'deleterious_counts': [],
+                'total_mutations': [],
+                'mean': 0,
+                'std': 0,
+                'mean_with_nonsense': 0,
+                'std_with_nonsense': 0
+            }
+        }
+    
+    # --- Process treated ---
+    logger.info("Processing original mutation data for treated...")
+    
+    # --- Merge all observed mutations for treated ---
+    merged_treated_mutations = {}
+    for js in treated_jsons:
+        with open(js) as jf:
+            mut_dict = json.load(jf)
+            for gene_id, gene_data in mut_dict.items():
+                if gene_id not in merged_treated_mutations:
+                    merged_treated_mutations[gene_id] = {
+                        'mutations': {},
+                        'gene_len': gene_data['gene_len'],
+                        'avg_cov': 0,
+                        'sample_count': 0
+                    }
+                # Merge mutations
+                for mut_key, count in gene_data['mutations'].items():
+                    merged_treated_mutations[gene_id]['mutations'][mut_key] = merged_treated_mutations[gene_id]['mutations'].get(mut_key, 0) + count
+                merged_treated_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
+                merged_treated_mutations[gene_id]['sample_count'] += 1
+    # Average coverage
+    for gene_id in merged_treated_mutations:
+        sc = merged_treated_mutations[gene_id]['sample_count']
+        if sc > 0:
+            merged_treated_mutations[gene_id]['avg_cov'] /= sc
+    # Calculate observed effect and stats for merged treated
+    observed_treated_results = {}
+    for gene_id, gene_data in merged_treated_mutations.items():
+        effect, effect_with_nonsense, stats, gene_mismatch_info = nuc_to_provean_score(
+            gene_data,
+            gene_id,
+            score_db,
+            provean_config,
+            paths,
+            features,
+            wolgenome,
+            refs['codon_table']
+        )
+        
+        # Collect mismatch info
+        if gene_mismatch_info and gene_mismatch_info['summary']['total_mismatches'] > 0:
+            all_mismatch_info['genes_with_mismatches'].update(gene_mismatch_info['genes_with_mismatches'])
+            all_mismatch_info['summary']['total_genes_with_mismatches'] += gene_mismatch_info['summary']['total_genes_with_mismatches']
+            all_mismatch_info['summary']['total_mismatches'] += gene_mismatch_info['summary']['total_mismatches']
+            all_mismatch_info['reverse_strand_genes'].extend(gene_mismatch_info['reverse_strand_genes'])
+            all_mismatch_info['forward_strand_genes'].extend(gene_mismatch_info['forward_strand_genes'])
+        # Compose output in original format (permutation data will be added later)
+        observed_treated_results[gene_id] = {
+            'effect': effect,
+            'effect_with_nonsense': effect_with_nonsense,
+            'total_mutations': sum(gene_data['mutations'].values()),
+            'gene_len': gene_data['gene_len'],
+            'mutation_stats': stats,
+            'permutation': {
+                'scores': [],
+                'scores_with_nonsense': [],
+                'deleterious_counts': [],
+                'total_mutations': [],
+                'mean': 0,
+                'std': 0,
+                'mean_with_nonsense': 0,
+                'std_with_nonsense': 0
+            }
+        }
+    
+    logger.info("=== FINISHED ORIGINAL MUTATION DATA PROCESSING ===")
+    print("=== FINISHED ORIGINAL MUTATION DATA PROCESSING ===")
+    
+    # Write final mismatch debug file
+    if all_mismatch_info['summary']['total_mismatches'] > 0:
+        # Remove duplicates from gene lists
+        all_mismatch_info['reverse_strand_genes'] = list(set(all_mismatch_info['reverse_strand_genes']))
+        all_mismatch_info['forward_strand_genes'] = list(set(all_mismatch_info['forward_strand_genes']))
+        
+        # Save to debug file
+        debug_file = "mismatch_debug.json"
+        with open(debug_file, 'w') as f:
+            json.dump(all_mismatch_info, f, indent=2)
+        
+        print(f"Detailed mismatch info saved to {debug_file}")
+        logger.info(f"Detailed mismatch info saved to {debug_file}")
+        
+        # Print final summary
+        print(f"FINAL MISMATCH SUMMARY: {all_mismatch_info['summary']['total_genes_with_mismatches']} genes with mismatches, {all_mismatch_info['summary']['total_mismatches']} total mismatches")
+        logger.info(f"FINAL MISMATCH SUMMARY: {all_mismatch_info['summary']['total_genes_with_mismatches']} genes with mismatches, {all_mismatch_info['summary']['total_mismatches']} total mismatches")
+        
+        # Print summary by strand
+        reverse_count = len(all_mismatch_info['reverse_strand_genes'])
+        forward_count = len(all_mismatch_info['forward_strand_genes'])
+        print(f"  Reverse strand genes with mismatches: {reverse_count}")
+        print(f"  Forward strand genes with mismatches: {forward_count}")
+        logger.info(f"  Reverse strand genes with mismatches: {reverse_count}")
+        logger.info(f"  Forward strand genes with mismatches: {forward_count}")
+    else:
+        print("No mismatches found in original data")
+        logger.info("No mismatches found in original data")
+    
+    # --- Permutation processing for controls AND treated ---
+    logger.info("=== STARTING PERMUTATION PROCESSING ===")
+    print("=== STARTING PERMUTATION PROCESSING ===")
+    
+    # --- Generate permutation profiles for controls ---
     logger.info(f"Running permutation test for pooled control samples: {len(control_jsons)} files.")
     observed_kmers_control = collect_observed_5mer_contexts(
         control_jsons,
@@ -944,63 +1132,8 @@ def main() -> None:
         refs['codon_table'],
         max_workers=max_workers
     )
-    # --- Merge all observed mutations for controls ---
-    merged_control_mutations = {}
-    for js in control_jsons:
-        with open(js) as jf:
-            mut_dict = json.load(jf)
-            for gene_id, gene_data in mut_dict.items():
-                if gene_id not in merged_control_mutations:
-                    merged_control_mutations[gene_id] = {
-                        'mutations': {},
-                        'gene_len': gene_data['gene_len'],
-                        'avg_cov': 0,
-                        'sample_count': 0
-                    }
-                # Merge mutations
-                for mut_key, count in gene_data['mutations'].items():
-                    merged_control_mutations[gene_id]['mutations'][mut_key] = merged_control_mutations[gene_id]['mutations'].get(mut_key, 0) + count
-                merged_control_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
-                merged_control_mutations[gene_id]['sample_count'] += 1
-    # Average coverage
-    for gene_id in merged_control_mutations:
-        sc = merged_control_mutations[gene_id]['sample_count']
-        if sc > 0:
-            merged_control_mutations[gene_id]['avg_cov'] /= sc
-    # Calculate observed effect and stats for merged controls
-    observed_control_results = {}
-    for gene_id, gene_data in merged_control_mutations.items():
-        effect, effect_with_nonsense, stats = nuc_to_provean_score(
-            {'mutations': gene_data['mutations']},
-            gene_id,
-            score_db,
-            provean_config,
-            paths,
-            features,
-            wolgenome,
-            refs['codon_table']
-        )
-        # Compose output in original format
-        perm = permuted_results_control.get(gene_id, {})
-        observed_control_results[gene_id] = {
-            'effect': effect,
-            'effect_with_nonsense': effect_with_nonsense,
-            'total_mutations': sum(gene_data['mutations'].values()),
-            'gene_len': gene_data['gene_len'],
-            'mutation_stats': stats,
-            'permutation': {
-                'scores': perm.get('permutation_effects', []),
-                'scores_with_nonsense': perm.get('permutation_effects_with_nonsense', []),
-                'mean': perm.get('mean', 0),
-                'std': perm.get('std', 0),
-                'mean_with_nonsense': perm.get('mean_with_nonsense', 0),
-                'std_with_nonsense': perm.get('std_with_nonsense', 0)
-            }
-        }
-    with open(f"{paths['results']}/permuted_provean_results_controls.json", "w") as f:
-        json.dump(observed_control_results, f, indent=2)
-
-    # --- Treated ---
+    
+    # --- Generate permutation profiles for treated ---
     logger.info(f"Running permutation test for pooled treated samples: {len(treated_jsons)} files.")
     observed_kmers_treated = collect_observed_5mer_contexts(
         treated_jsons,
@@ -1031,59 +1164,45 @@ def main() -> None:
         refs['codon_table'],
         max_workers=max_workers
     )
-    # --- Merge all observed mutations for treated ---
-    merged_treated_mutations = {}
-    for js in treated_jsons:
-        with open(js) as jf:
-            mut_dict = json.load(jf)
-            for gene_id, gene_data in mut_dict.items():
-                if gene_id not in merged_treated_mutations:
-                    merged_treated_mutations[gene_id] = {
-                        'mutations': {},
-                        'gene_len': gene_data['gene_len'],
-                        'avg_cov': 0,
-                        'sample_count': 0
-                    }
-                # Merge mutations
-                for mut_key, count in gene_data['mutations'].items():
-                    merged_treated_mutations[gene_id]['mutations'][mut_key] = merged_treated_mutations[gene_id]['mutations'].get(mut_key, 0) + count
-                merged_treated_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
-                merged_treated_mutations[gene_id]['sample_count'] += 1
-    # Average coverage
-    for gene_id in merged_treated_mutations:
-        sc = merged_treated_mutations[gene_id]['sample_count']
-        if sc > 0:
-            merged_treated_mutations[gene_id]['avg_cov'] /= sc
-    # Calculate observed effect and stats for merged treated
-    observed_treated_results = {}
-    for gene_id, gene_data in merged_treated_mutations.items():
-        effect, effect_with_nonsense, stats = nuc_to_provean_score(
-            {'mutations': gene_data['mutations']},
-            gene_id,
-            score_db,
-            provean_config,
-            paths,
-            features,
-            wolgenome,
-            refs['codon_table']
-        )
-        # Compose output in original format
-        perm = permuted_results_treated.get(gene_id, {})
-        observed_treated_results[gene_id] = {
-            'effect': effect,
-            'effect_with_nonsense': effect_with_nonsense,
-            'total_mutations': sum(gene_data['mutations'].values()),
-            'gene_len': gene_data['gene_len'],
-            'mutation_stats': stats,
-            'permutation': {
-                'scores': perm.get('permutation_effects', []),
-                'scores_with_nonsense': perm.get('permutation_effects_with_nonsense', []),
-                'mean': perm.get('mean', 0),
-                'std': perm.get('std', 0),
-                'mean_with_nonsense': perm.get('mean_with_nonsense', 0),
-                'std_with_nonsense': perm.get('std_with_nonsense', 0)
-            }
+    
+    logger.info("=== FINISHED PERMUTATION PROCESSING ===")
+    print("=== FINISHED PERMUTATION PROCESSING ===")
+    
+    # --- Combine results ---
+    logger.info("=== COMBINING RESULTS ===")
+    print("=== COMBINING RESULTS ===")
+    
+    # --- Add permutation results to observed control results ---
+    for gene_id, gene_data in observed_control_results.items():
+        perm = permuted_results_control.get(gene_id, {})
+        observed_control_results[gene_id]['permutation'] = {
+            'scores': perm.get('permutation_effects', []),
+            'scores_with_nonsense': perm.get('permutation_effects_with_nonsense', []),
+            'deleterious_counts': perm.get('deleterious_counts', []),
+            'total_mutations': perm.get('total_mutations', []),
+            'mean': perm.get('mean', 0),
+            'std': perm.get('std', 0),
+            'mean_with_nonsense': perm.get('mean_with_nonsense', 0),
+            'std_with_nonsense': perm.get('std_with_nonsense', 0)
         }
+    
+    with open(f"{paths['results']}/permuted_provean_results_controls.json", "w") as f:
+        json.dump(observed_control_results, f, indent=2)
+    
+    # --- Add permutation results to observed treated results ---
+    for gene_id, gene_data in observed_treated_results.items():
+        perm = permuted_results_treated.get(gene_id, {})
+        observed_treated_results[gene_id]['permutation'] = {
+            'scores': perm.get('permutation_effects', []),
+            'scores_with_nonsense': perm.get('permutation_effects_with_nonsense', []),
+            'deleterious_counts': perm.get('deleterious_counts', []),
+            'total_mutations': perm.get('total_mutations', []),
+            'mean': perm.get('mean', 0),
+            'std': perm.get('std', 0),
+            'mean_with_nonsense': perm.get('mean_with_nonsense', 0),
+            'std_with_nonsense': perm.get('std_with_nonsense', 0)
+        }
+    
     with open(f"{paths['results']}/permuted_provean_results_treated.json", "w") as f:
         json.dump(observed_treated_results, f, indent=2)
 
