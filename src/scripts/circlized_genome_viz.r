@@ -119,7 +119,7 @@ print(summary(coverage_data$coverage))
 # Initialize plot
 # Use a more standard figure size for publication
 # (8x8 inches at 300 dpi)
-png(args$output, height=8*300, width=8*300, res=300)
+png(args$output, height=8*300, width=8*300, res=600)
 circos.clear()
 circos.par(gap.after=10)
 
@@ -161,14 +161,26 @@ circos.genomicTrackPlotRegion(
     circos.lines(c(region$start[1], region$end[length(region$end)]),
                  c(avg_coverage, avg_coverage),
                  col="red", lwd=2, lty=2)
+    # Add label for average coverage line at the end of the track
+    cell.xlim = get.cell.meta.data("cell.xlim")
+    circos.text(
+      x = cell.xlim[2] - 10000,
+      y = avg_coverage,
+      labels = as.integer(round(avg_coverage)),
+      facing = "clockwise",
+      adj = c(0, 0.5),
+      col = "red",
+      cex = 0.7
+    )
     # Add coverage axis with fixed ticks
     circos.yaxis(side="left",
                  at=c(0, 25000, 50000),
                  labels.cex=0.8)  # Slightly smaller axis labels
   }
 )
+
 # Add annotation for average coverage
-text(0, -0.1 * max_coverage, paste0("Avg coverage: ", round(avg_coverage, 1)), col="red", cex=0.9, xpd=NA)
+text(0, -0.1 * max_coverage, paste0("Avg coverage: ", as.integer(round(avg_coverage))), col="red", cex=0.9, xpd=NA)
 
 # Plot gene track (no low-mutation gene labels)
 circos.genomicTrackPlotRegion(
@@ -220,11 +232,12 @@ circos.genomicTrackPlotRegion(
   }
 )
 
-# Add y-axis labels
-y_axis_labels <- c(0, ylimit)
+# Add y-axis labels as whole numbers
+y_axis_labels <- c(0, 2000)
 if(max_count > ylimit) {
-  y_axis_labels <- c(0, ylimit, max_count)
+  y_axis_labels <- c(0, 2000, as.integer(round(max_count)))
 }
+y_axis_labels <- as.integer(round(y_axis_labels))
 
 circos.yaxis(
   side="left",

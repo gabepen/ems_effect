@@ -21,6 +21,8 @@ import time
 import copy
 import logging
 import multiprocessing
+from Bio.Data import CodonTable
+import pandas as pd
 
 # Add src to path 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -225,23 +227,78 @@ def load_filtered_positions(sample: str, paths: Dict[str, str], mpileup_dir: str
     """Load filtered positions for a sample from JSON file.
     
     Args:
-        sample (str): Sample name
+        sample (str): Sample name (usually stem of nuc_muts JSON)
         paths (Dict[str, str]): Dictionary containing output paths
         mpileup_dir (str): Directory containing mpileup files and filtered positions
         
     Returns:
         Dict[str, List[int]]: Dictionary mapping gene IDs to 0-based relative filtered positions
     """
-    filtered_file = os.path.join(mpileup_dir, f"{sample}_filtered_positions.json")
-    if os.path.exists(filtered_file):
-        with open(filtered_file) as f:
-            raw_positions = json.load(f)
+    # Support both naming schemes to avoid double "_filtered" in filenames
+    candidates = []
+    # Common expected names
+    candidates.append(os.path.join(mpileup_dir, f"{sample}_filtered_positions.json"))
+    candidates.append(os.path.join(mpileup_dir, f"{sample}_positions.json"))
+    # If sample already ends with _filtered, prefer *_positions.json and also try base without trailing _filtered
+    if sample.endswith('_filtered'):
+        base = sample[:-9]
+        candidates.insert(0, os.path.join(mpileup_dir, f"{sample}_positions.json"))
+        candidates.append(os.path.join(mpileup_dir, f"{base}_filtered_positions.json"))
+    for filtered_file in candidates:
+        if os.path.exists(filtered_file):
+            with open(filtered_file) as f:
+                raw_positions = json.load(f)
             # Convert from 1-based relative to 0-based relative positions
             corrected_positions = {}
             for gene_id, positions in raw_positions.items():
                 corrected_positions[gene_id] = [pos - 1 for pos in positions]
             return corrected_positions
     return {}
+
+# Helper: build union of callable positions per gene for a set of samples
+
+def build_union_callable_positions(sample_jsons: List[str], paths: Dict[str, str], mpileup_dir: str) -> Dict[str, set]:
+    """Given sample mutation JSON paths, load each sample's filtered positions and
+    return a dict mapping gene_id -> set of 0-based relative positions that are callable
+    in any of the samples (union)."""
+    union_map: Dict[str, set] = {}
+    for js in sample_jsons:
+        sample_name = os.path.basename(js).replace('.json', '')
+        filtered = load_filtered_positions(sample_name, paths, mpileup_dir)
+        for gene_id, pos_list in filtered.items():
+            if gene_id not in union_map:
+                union_map[gene_id] = set()
+            union_map[gene_id].update(pos_list)
+    return union_map
+
+# New: build intersection of callable positions across samples
+
+def build_intersection_callable_positions(sample_jsons: List[str], paths: Dict[str, str], mpileup_dir: str) -> Dict[str, set]:
+    """Return gene_id -> set of 0-based positions callable in all provided samples (intersection).
+    If a gene is missing in any sample's filtered map, its intersection becomes empty and is dropped."""
+    inter_map: Dict[str, set] = {}
+    first = True
+    for js in sample_jsons:
+        sample_name = os.path.basename(js).replace('.json', '')
+        filtered = load_filtered_positions(sample_name, paths, mpileup_dir)
+        if first:
+            # seed with first sample's callable positions
+            inter_map = {g: set(pos_list) for g, pos_list in filtered.items()}
+            first = False
+        else:
+            # intersect existing genes; genes absent in this sample become empty
+            current_genes = set(inter_map.keys())
+            for gene_id in list(current_genes):
+                if gene_id in filtered:
+                    inter_map[gene_id] &= set(filtered[gene_id])
+                else:
+                    inter_map[gene_id] = set()
+        # Early stop if everything empty
+        if not any(len(s) for s in inter_map.values()):
+            break
+    # Drop empty entries
+    inter_map = {g: s for g, s in inter_map.items() if len(s) > 0}
+    return inter_map
 
 def nuc_to_provean_score(
     nuc_mutations: Dict[str, Any],
@@ -573,11 +630,14 @@ def collect_observed_5mer_contexts(
 ) -> Dict[str, int]:
     """Collect the 5-mer context of all observed genic mutations across all samples.
     Only considers mutations within genes and with a C or G as the center base.
+    Deduplicates strictly by site (gene_id, 0-based gene-relative position).
     Returns a dictionary of {5mer: count}.
     """
     kmer_counts = {}
     flank = kmer_size // 2
     genome_seq = str(wolgenome.genome).upper()
+    # Deduplicate by site only (gene_id, rel0)
+    seen_sites_global: set = set()
     
     for js in mutation_jsons:
         with open(js) as jf:
@@ -595,41 +655,118 @@ def collect_observed_5mer_contexts(
                     # Only C or G mutations
                     if ref_base not in ('C', 'G'):
                         continue
-                    # 1-based position in gene
-                    gene_pos = int(pos_str)
+                    # 0-based position in gene
+                    rel0 = int(pos_str)
+                    # De-duplicate by site only
+                    site_id = (gene_id, rel0)
+                    if site_id in seen_sites_global:
+                        continue
+                    seen_sites_global.add(site_id)
                     # Convert to genomic position (0-based)
                     if gene_strand == 1:
-                        genome_pos = gene_start + gene_pos - 1
+                        genome_pos = gene_start + rel0
                     else:
-                        genome_pos = gene_end - gene_pos
+                        genome_pos = gene_end - 1 - rel0
                     # Extract k-mer context
                     if genome_pos - flank < 0 or genome_pos + flank >= len(genome_seq):
                         continue  # skip if k-mer would go out of bounds
                     kmer = genome_seq[genome_pos - flank: genome_pos + flank + 1]
                     if len(kmer) != kmer_size:
                         continue
-                    # For reverse strand, reverse complement the kmer
+                    # For reverse strand, reverse complement the kmer to coding orientation
                     if gene_strand == -1:
                         kmer = str(Seq(kmer).reverse_complement())
                     # Only count k-mers with C or G at center
                     if kmer[flank] not in ('C', 'G'):
                         continue
                     kmer_counts[kmer] = kmer_counts.get(kmer, 0) + 1
-    logger.info(f"Collected {len(kmer_counts)} unique 5-mer contexts from observed genic mutations.")
+    logger.info(f"Collected {len(kmer_counts)} unique 5-mer contexts from observed genic mutations (site-deduped).")
     total_mutations = sum(kmer_counts.values())
-    logger.info(f"Total observed genic mutations (C/G center): {total_mutations}")
+    logger.info(f"Total observed genic unique mutated sites (C/G center): {total_mutations}")
     return kmer_counts
 
-# --- New: Collect all 5-mer sites with C/G center base within genes ---
-def collect_genic_5mer_sites(
+# --- New: Collect observed 5-mer + codon triplet strata counts ---
+
+def collect_observed_5mer_codon_contexts(
+    mutation_jsons: List[str],
     wolgenome: SeqContext,
     features: Dict[str, Any],
     kmer_size: int = 5
-) -> Dict[str, list]:
-    """Collect all 5-mer sites with a C or G center base within genes.
-    Returns a dictionary mapping each 5-mer to a list of (gene_id, gene_pos, genome_pos, strand).
+) -> Dict[tuple, int]:
+    """Collect observed counts per (5-mer, codon_triplet) for C/G-centered genic mutations.
+    Deduplicates strictly by site (gene_id, 0-based gene-relative position).
+    Returns {(kmer, codon_triplet): count} in coding orientation.
     """
-    kmer_sites = {}
+    kmer_codon_counts: Dict[tuple, int] = {}
+    flank = kmer_size // 2
+    genome_seq = str(wolgenome.genome).upper()
+    # Deduplicate by site only
+    seen_sites_global: set = set()
+    for js in mutation_jsons:
+        with open(js) as jf:
+            mut_dict = json.load(jf)
+        for gene_id, gene_data in mut_dict.items():
+            if gene_id not in features:
+                continue
+            feat = features[gene_id]
+            gene_start = feat.start
+            gene_end = feat.end
+            strand = feat.strand
+            for mut_key in gene_data['mutations']:
+                pos_str, mut_type = mut_key.split('_')
+                ref_base = mut_type.split('>')[0]
+                if ref_base not in ('C', 'G'):
+                    continue
+                # 0-based gene-relative position
+                rel0 = int(pos_str)
+                # Deduplicate by site only
+                site_id = (gene_id, rel0)
+                if site_id in seen_sites_global:
+                    continue
+                seen_sites_global.add(site_id)
+                # Genomic coordinate (0-based)
+                if strand == 1:
+                    genome_pos = gene_start + rel0
+                else:
+                    genome_pos = gene_end - 1 - rel0
+                if genome_pos - flank < 0 or genome_pos + flank >= len(genome_seq):
+                    continue
+                kmer = genome_seq[genome_pos - flank: genome_pos + flank + 1]
+                # Determine coding-orientation 5-mer and codon
+                frame = rel0 % 3  # (gene_pos_1b - 1) % 3
+                if strand == -1:
+                    kmer = str(Seq(kmer).reverse_complement())
+                    codon_start = genome_pos - (2 - frame)
+                    if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                        continue
+                    codon_genomic = genome_seq[codon_start: codon_start + 3]
+                    codon_coding = str(Seq(codon_genomic).reverse_complement())
+                else:
+                    # Forward strand: keep kmer as is (coding orientation)
+                    codon_start = genome_pos - frame
+                    if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                        continue
+                    codon_coding = genome_seq[codon_start: codon_start + 3]
+                if kmer[flank] not in ('C', 'G'):
+                    continue
+                key = (kmer, codon_coding)
+                kmer_codon_counts[key] = kmer_codon_counts.get(key, 0) + 1
+    logger.info(f"Collected {len(kmer_codon_counts)} unique (5-mer, codon) strata from observed mutations (site-deduped).")
+    return kmer_codon_counts
+
+# --- New: Collect all 5-mer sites with C/G center base within genes, stratified by codon triplet and optional callable restriction ---
+
+def collect_genic_5mer_sites(
+    wolgenome: SeqContext,
+    features: Dict[str, Any],
+    kmer_size: int = 5,
+    callable_positions: Dict[str, set] = None
+) -> Dict[tuple, list]:
+    """Collect all 5-mer sites with a C or G center base within genes.
+    Returns a dictionary mapping (5-mer, codon_triplet) -> list of (gene_id, gene_pos, genome_pos, strand).
+    If callable_positions is provided, restricts to positions present in callable_positions[gene_id] (0-based relative to gene).
+    """
+    kmer_sites: Dict[tuple, list] = {}
     flank = kmer_size // 2
     genome_seq = str(wolgenome.genome).upper()
     for gene_id, feat in features.items():
@@ -637,110 +774,114 @@ def collect_genic_5mer_sites(
         gene_end = feat.end
         gene_strand = feat.strand
         gene_len = gene_end - gene_start
+        allowed = None
+        if callable_positions and gene_id in callable_positions:
+            allowed = callable_positions[gene_id]
         for i in range(gene_len):
             if gene_strand == 1:
                 genome_pos = gene_start + i
-                gene_pos = i + 1
+                gene_pos = i + 1  # 1-based
             else:
                 genome_pos = gene_end - 1 - i
-                gene_pos = gene_end - genome_pos  # 1-based, from 3' end
-            # Check k-mer bounds
+                gene_pos = gene_end - genome_pos  # 1-based from 3' end but consistent with frame calc
+            if allowed is not None and (gene_pos - 1) not in allowed:
+                continue
             if genome_pos - flank < 0 or genome_pos + flank >= len(genome_seq):
                 continue
             kmer = genome_seq[genome_pos - flank: genome_pos + flank + 1]
             if len(kmer) != kmer_size:
                 continue
-            kmer_for_dict = kmer
+            frame = (gene_pos - 1) % 3
             if gene_strand == -1:
-                kmer_for_dict = str(Seq(kmer).reverse_complement())
-            if kmer_for_dict[flank] not in ('C', 'G'):
+                kmer_key = str(Seq(kmer).reverse_complement())
+                codon_start = genome_pos - (2 - frame)
+                if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                    continue
+                codon_genomic = genome_seq[codon_start: codon_start + 3]
+                codon_coding = str(Seq(codon_genomic).reverse_complement())
+            else:
+                kmer_key = kmer
+                codon_start = genome_pos - frame
+                if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                    continue
+                codon_coding = genome_seq[codon_start: codon_start + 3]
+            if kmer_key[flank] not in ('C', 'G'):
                 continue
-            kmer_sites.setdefault(kmer_for_dict, []).append((gene_id, gene_pos, genome_pos, gene_strand))
+            kmer_sites.setdefault((kmer_key, codon_coding), []).append((gene_id, gene_pos, genome_pos, gene_strand))
     total_sites = sum(len(v) for v in kmer_sites.values())
-    logger.info(f"Collected {len(kmer_sites)} unique 5-mer contexts with C/G center in genes.")
+    logger.info(f"Collected {len(kmer_sites)} unique (5-mer, codon) strata with C/G center in genes.")
     logger.info(f"Total genic 5-mer positions (C/G center): {total_sites}")
     return kmer_sites
 
-# --- New: Generate a random mutation profile for a single permutation ---
+# --- New: Generate a random mutation profile for a single permutation (with replacement, stratified) ---
+
 def generate_random_mutation_profile(
-    observed_kmer_counts: Dict[str, int],
-    kmer_site_pool: Dict[str, list],
+    observed_kmer_codon_counts: Dict[tuple, int],
+    kmer_site_pool: Dict[tuple, list],
     rng: random.Random = random
 ) -> Dict[str, dict]:
     """
-    For a single permutation, randomly place observed mutations at matching 5-mer sites.
-    Args:
-        observed_kmer_counts: {kmer: count} for observed mutations
-        kmer_site_pool: {kmer: [(gene_id, gene_pos, genome_pos, strand), ...]}
-        rng: random number generator (for reproducibility)
-    Returns:
-        Dict[gene_id, dict]: per-gene mutation profile in the format expected by the pipeline
+    For a single permutation, randomly place observed mutations at matching (5-mer, codon) sites.
+    Sampling is without replacement per site to avoid multiple placements on the same site.
+    Returns per-gene mutation profile.
     """
-    # Make a copy of the pool so we can exhaust it for this permutation
-    pool = {k: v[:] for k, v in kmer_site_pool.items()}
-    per_gene_mutations = {}
-    for kmer, count in observed_kmer_counts.items():
-        if kmer not in pool or len(pool[kmer]) < count:
-            # Not enough sites to place all mutations of this kmer
+    per_gene_mutations: Dict[str, dict] = {}
+    for key, count in observed_kmer_codon_counts.items():
+        if key not in kmer_site_pool or len(kmer_site_pool[key]) == 0 or count <= 0:
             continue
-        # Randomly select 'count' positions without replacement
-        selected_sites = rng.sample(pool[kmer], count)
-        # Remove selected sites from pool
+        sites = kmer_site_pool[key]
+        # Sample without replacement per site; cap by available unique sites
+        if count >= len(sites):
+            selected_sites = list(sites)
+        else:
+            selected_sites = rng.sample(sites, k=count)
         for site in selected_sites:
-            pool[kmer].remove(site)
             gene_id, gene_pos, genome_pos, strand = site
-            # Infer mutation type from center base of k-mer
-            center_base = kmer[2]  # 5-mer center is at index 2
+            center_base = key[0][2]  # kmer center in coding orientation
             if center_base == 'C':
                 mut_type = 'C>T'
             elif center_base == 'G':
                 mut_type = 'G>A'
             else:
-                continue  # Skip if center base is not C or G
-            # Build 0-based mutation key to match translate.convertor expectations
+                continue
             mut_key = f"{gene_pos - 1}_{mut_type}"
             if gene_id not in per_gene_mutations:
                 per_gene_mutations[gene_id] = {
                     'mutations': {},
-                    'gene_len': abs(gene_pos) if 'gene_len' not in per_gene_mutations else 0,  # will be set later
-                    'avg_cov': 0  # can be set to 0 or ignored for permutations
+                    'gene_len': 0,
+                    'avg_cov': 0
                 }
-            per_gene_mutations[gene_id]['mutations'][mut_key] = 1
+            # Place at most one hit per site (no duplicate placements)
+            if mut_key not in per_gene_mutations[gene_id]['mutations']:
+                per_gene_mutations[gene_id]['mutations'][mut_key] = 1
     # Set gene_len for each gene (use the max gene_pos seen for that gene)
     for gene_id in per_gene_mutations:
         gene_lens = [int(k.split('_')[0]) for k in per_gene_mutations[gene_id]['mutations']]
         per_gene_mutations[gene_id]['gene_len'] = max(gene_lens) if gene_lens else 0
     return per_gene_mutations
 
-# Move _single_perm outside of generate_permutation_profiles to avoid the AttributeError when pickling the local function
-def _single_perm(seed, observed_kmer_counts, kmer_site_pool):
+# Update helper for ProcessPool
+
+def _single_perm(seed, observed_kmer_codon_counts, kmer_site_pool):
     rng = random.Random(seed)
-    return generate_random_mutation_profile(observed_kmer_counts, kmer_site_pool, rng=rng)
+    return generate_random_mutation_profile(observed_kmer_codon_counts, kmer_site_pool, rng=rng)
 
 def generate_permutation_profiles(
-    observed_kmer_counts: Dict[str, int],
-    kmer_site_pool: Dict[str, list],
+    observed_kmer_codon_counts: Dict[tuple, int],
+    kmer_site_pool: Dict[tuple, list],
     n_permutations: int = 20,
     random_seed: int = None,
     max_workers: int = None
 ) -> list:
     """
-    Generate N random mutation profiles in parallel.
-    Args:
-        observed_kmer_counts: {kmer: count} for observed mutations
-        kmer_site_pool: {kmer: [(gene_id, gene_pos, genome_pos, strand), ...]}
-        n_permutations: number of permutations to generate
-        random_seed: seed for reproducibility
-        max_workers: number of parallel workers
-    Returns:
-        List[Dict[gene_id, dict]]: one per permutation
+    Generate N random mutation profiles in parallel using with-replacement sampling
+    stratified by (5-mer, codon) to better match observed deleteriousness potential.
     """
-    logger.info(f"Generating {n_permutations} random mutation profiles for permutation test.")
-    # Use different seeds for each permutation for reproducibility
+    logger.info(f"Generating {n_permutations} random mutation profiles for permutation test (with replacement, stratified).")
     seeds = [(random_seed + i) if random_seed is not None else None for i in range(n_permutations)]
     profiles = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        results = executor.map(_single_perm, seeds, [observed_kmer_counts] * n_permutations, [kmer_site_pool] * n_permutations)
+        results = executor.map(_single_perm, seeds, [observed_kmer_codon_counts] * n_permutations, [kmer_site_pool] * n_permutations)
         for idx, profile in enumerate(results, 1):
             profiles.append(profile)
             if idx % 50 == 0 or idx == n_permutations:
@@ -753,12 +894,27 @@ def _process_gene(gene_id, shared_profiles, score_db_path, provean_config, paths
     from modules.provean_db import ProveanScoreDB
     score_db = ProveanScoreDB(score_db_path)
     wolgenome = parse.SeqContext(genomic_fna, annotation)
-    gene_mut_profiles = [profile.get(gene_id, None) for profile in shared_profiles]
-    gene_mut_profiles = [m for m in gene_mut_profiles if m is not None]
+    # Ensure we preserve the global permutation index for this gene by filling
+    # permutations with no placements with an empty profile (0 mutations)
+    num_perms = len(shared_profiles)
+    gene_len = (features[gene_id].end - features[gene_id].start) if gene_id in features else 0
+    gene_mut_profiles = []
+    for idx in range(num_perms):
+        prof = shared_profiles[idx].get(gene_id)
+        if prof is None:
+            prof = {
+                'mutations': {},
+                'gene_len': gene_len,
+                'avg_cov': 0
+            }
+        gene_mut_profiles.append(prof)
     perm_scores = []
     all_new_scores = {}
-    for mut_profile in gene_mut_profiles:
-        score, score_with_nonsense, stats, _ = nuc_to_provean_score(
+    placed_counts = []
+    counted_counts = []
+    mismatch_counts = []
+    for idx, mut_profile in enumerate(gene_mut_profiles):
+        score, score_with_nonsense, stats, mismatch_info = nuc_to_provean_score(
             mut_profile,
             gene_id,
             score_db,
@@ -774,6 +930,10 @@ def _process_gene(gene_id, shared_profiles, score_db_path, provean_config, paths
             'effect_with_nonsense': score_with_nonsense,
             'mutation_stats': stats
         })
+        # Diagnostics: placed vs counted and mismatch tally
+        placed_counts.append(len(mut_profile.get('mutations', {})))
+        counted_counts.append((stats.get('non_syn_muts', 0) or 0) + (stats.get('syn_muts', 0) or 0))
+        mismatch_counts.append(mismatch_info['summary']['total_mismatches'] if mismatch_info and 'summary' in mismatch_info else 0)
     # After all permutations, write all new scores for this gene in one batch
     if all_new_scores:
         with db_lock:
@@ -782,11 +942,18 @@ def _process_gene(gene_id, shared_profiles, score_db_path, provean_config, paths
     effects_with_nonsense = [s['effect_with_nonsense'] for s in perm_scores]
     deleterious_counts = [s['mutation_stats']['deleterious_count'] for s in perm_scores]
     total_mutations = [s['mutation_stats']['total_mutations'] for s in perm_scores]
+    non_syn_counts = [s['mutation_stats'].get('non_syn_muts', 0) for s in perm_scores]
+    syn_counts = [s['mutation_stats'].get('syn_muts', 0) for s in perm_scores]
     result = {
         'permutation_effects': effects,
         'permutation_effects_with_nonsense': effects_with_nonsense,
         'deleterious_counts': deleterious_counts,
         'total_mutations': total_mutations,
+        'non_syn_counts': non_syn_counts,
+        'syn_counts': syn_counts,
+        'placed_counts': placed_counts,
+        'counted_counts': counted_counts,
+        'mismatch_counts': mismatch_counts,
         'mean': np.mean(effects) if effects else 0,
         'std': np.std(effects) if effects else 0,
         'mean_with_nonsense': np.mean(effects_with_nonsense) if effects_with_nonsense else 0,
@@ -827,6 +994,393 @@ def process_permuted_provean_scores(
                     logger.info(f"Permutation test progress: {processed}/{len(gene_ids)} genes processed.")
     logger.info("Permutation test scoring complete.")
     return results
+
+def compute_potential_synonymous_sites(
+    features: Dict[str, Any],
+    wolgenome: SeqContext,
+    callable_positions: Dict[str, set]
+) -> Dict[str, Dict[str, int]]:
+    """For each gene, count potential synonymous C/G->T/A sites among callable positions.
+    Returns {gene_id: {'potential_syn_sites': int}}.
+    """
+    result: Dict[str, Dict[str, int]] = {}
+    genome_seq = str(wolgenome.genome).upper()
+    for gene_id, feat in features.items():
+        allowed = callable_positions.get(gene_id, None)
+        if allowed is None or len(allowed) == 0:
+            continue
+        gene_start = feat.start
+        gene_end = feat.end
+        strand = feat.strand
+        potential = 0
+        for rel0 in allowed:  # 0-based relative within gene
+            # Map to genomic position
+            if strand == 1:
+                genome_pos = gene_start + rel0
+                gene_pos_1b = rel0 + 1
+            else:
+                genome_pos = gene_end - 1 - rel0
+                gene_pos_1b = gene_end - genome_pos
+            # Determine coding base
+            base = genome_seq[genome_pos]
+            if base not in ('C', 'G'):
+                continue
+            # Build codon
+            frame = (gene_pos_1b - 1) % 3
+            if strand == 1:
+                codon_start = genome_pos - frame
+                if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                    continue
+                codon = genome_seq[codon_start: codon_start + 3]
+            else:
+                codon_start = genome_pos - (2 - frame)
+                if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                    continue
+                codon_genomic = genome_seq[codon_start: codon_start + 3]
+                codon = str(Seq(codon_genomic).reverse_complement())
+            # Simulate C/G->T/A at the codon position
+            pos_in_codon = (gene_pos_1b - 1) % 3
+            codon_list = list(codon)
+            if base == 'C':
+                mutated = 'T'
+            elif base == 'G':
+                mutated = 'A'
+            else:
+                continue
+            # Only proceed if codon center base in coding orientation matches
+            if codon_list[pos_in_codon] != base:
+                continue
+            codon_list[pos_in_codon] = mutated
+            mutated_codon = ''.join(codon_list)
+            try:
+                std_table = CodonTable.unambiguous_dna_by_id[11]  # bacterial/archaea standard
+            except KeyError:
+                std_table = CodonTable.unambiguous_dna_by_name['Bacterial, Archaeal and Plant Plastid']
+            # Translate codons (simple map via table)
+            def aa_of(c):
+                return '*' if c in std_table.stop_codons else std_table.forward_table.get(c, 'X')
+            if aa_of(codon) == aa_of(mutated_codon):
+                potential += 1
+        result[gene_id] = {'potential_syn_sites': potential}
+    return result
+
+# Helper: fallback to all genic positions per gene when callable sets are unavailable
+
+def build_all_genic_positions(features: Dict[str, Any]) -> Dict[str, set]:
+    """Return all 0-based relative positions per gene as callable."""
+    all_pos: Dict[str, set] = {}
+    for gene_id, feat in features.items():
+        gene_len = feat.end - feat.start
+        if gene_len > 0:
+            all_pos[gene_id] = set(range(gene_len))
+    return all_pos
+
+# Update: count truly synonymous EMS-type observed hits (unique sites)
+
+def compute_observed_synonymous_hits(
+    mutation_jsons: List[str],
+    features: Dict[str, Any] = None,
+    wolgenome: SeqContext = None,
+    callable_positions: Dict[str, set] = None
+) -> Dict[str, Dict[str, int]]:
+    """For each gene, count unique callable positions that had a synonymous EMS-type (C>T/G>A) hit.
+    Returns {gene_id: {'observed_syn_sites': int}}. If features/wolgenome provided, verifies synonymous by translation.
+    """
+    if features is None or wolgenome is None:
+        # Backward-compat: count EMS-type sites without verifying synonymous (not preferred)
+        observed_syn_sites: Dict[str, set] = defaultdict(set)
+        for js in mutation_jsons:
+            with open(js) as jf:
+                mut_dict = json.load(jf)
+            for gene_id, gene_data in mut_dict.items():
+                for mut_key in gene_data.get('mutations', {}).keys():
+                    pos_str, mut_type = mut_key.split('_')
+                    if mut_type not in ('C>T', 'G>A'):
+                        continue
+                    rel0 = int(pos_str)
+                    if callable_positions and rel0 not in callable_positions.get(gene_id, set()):
+                        continue
+                    observed_syn_sites[gene_id].add(rel0)
+        return {g: {'observed_syn_sites': len(pos_set)} for g, pos_set in observed_syn_sites.items()}
+
+    genome_seq = str(wolgenome.genome).upper()
+    try:
+        std_table = CodonTable.unambiguous_dna_by_id[11]
+    except KeyError:
+        std_table = CodonTable.unambiguous_dna_by_name['Bacterial, Archaeal and Plant Plastid']
+    def aa_of(c: str) -> str:
+        return '*' if c in std_table.stop_codons else std_table.forward_table.get(c, 'X')
+
+    observed_syn_sites: Dict[str, set] = defaultdict(set)
+    for js in mutation_jsons:
+        with open(js) as jf:
+            mut_dict = json.load(jf)
+        for gene_id, gene_data in mut_dict.items():
+            feat = features.get(gene_id)
+            if feat is None:
+                continue
+            allowed = callable_positions.get(gene_id, None) if callable_positions else None
+            gene_start = feat.start
+            gene_end = feat.end
+            strand = feat.strand
+            for mut_key in gene_data.get('mutations', {}).keys():
+                pos_str, mut_type = mut_key.split('_')
+                if mut_type not in ('C>T', 'G>A'):
+                    continue
+                rel0 = int(pos_str)
+                if allowed is not None and rel0 not in allowed:
+                    continue
+                if strand == 1:
+                    genome_pos = gene_start + rel0
+                    gene_pos_1b = rel0 + 1
+                else:
+                    genome_pos = gene_end - 1 - rel0
+                    gene_pos_1b = gene_end - genome_pos
+                base = genome_seq[genome_pos]
+                if base not in ('C', 'G'):
+                    continue
+                frame = (gene_pos_1b - 1) % 3
+                if strand == 1:
+                    codon_start = genome_pos - frame
+                    if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                        continue
+                    codon = genome_seq[codon_start: codon_start + 3]
+                else:
+                    codon_start = genome_pos - (2 - frame)
+                    if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                        continue
+                    codon_genomic = genome_seq[codon_start: codon_start + 3]
+                    codon = str(Seq(codon_genomic).reverse_complement())
+                pos_in_codon = (gene_pos_1b - 1) % 3
+                codon_list = list(codon)
+                if codon_list[pos_in_codon] != base:
+                    continue
+                mutated = 'T' if base == 'C' else 'A'
+                codon_list[pos_in_codon] = mutated
+                mutated_codon = ''.join(codon_list)
+                if aa_of(codon) == aa_of(mutated_codon):
+                    observed_syn_sites[gene_id].add(rel0)
+    return {g: {'observed_syn_sites': len(pos_set)} for g, pos_set in observed_syn_sites.items()}
+
+def write_syn_site_fraction_csv(
+    label: str,
+    output_results_dir: str,
+    potential_syn: Dict[str, Dict[str, int]],
+    observed_syn: Dict[str, Dict[str, int]]
+) -> None:
+    rows = []
+    for gene_id, pot in potential_syn.items():
+        pot_n = pot.get('potential_syn_sites', 0)
+        obs_n = observed_syn.get(gene_id, {}).get('observed_syn_sites', 0)
+        frac = (obs_n / pot_n) if pot_n > 0 else np.nan
+        rows.append({
+            'gene_id': gene_id,
+            'potential_syn_sites': pot_n,
+            'observed_syn_sites': obs_n,
+            'observed_fraction_of_potential_syn': frac
+        })
+    columns = ['gene_id', 'potential_syn_sites', 'observed_syn_sites', 'observed_fraction_of_potential_syn']
+    df = pd.DataFrame(rows, columns=columns)
+    out_path = os.path.join(output_results_dir, f'{label}_observed_vs_potential_syn_sites.csv')
+    df.to_csv(out_path, index=False)
+    logger.info(f'Wrote per-gene observed vs potential synonymous site fractions: {out_path} ({len(df)} rows)')
+
+def compute_expected_nonsyn_fraction(
+    features: Dict[str, Any],
+    wolgenome: SeqContext,
+    callable_positions: Dict[str, set]
+) -> Dict[str, Dict[str, float]]:
+    """For each gene, compute counts of callable C/G sites that would be non-syn vs syn under C->T/G->A,
+    and the expected non-syn fraction = non_syn_sites / (syn + non_syn).
+    Returns {gene_id: {'expected_nonsyn_sites': int, 'expected_syn_sites': int, 'expected_nonsyn_fraction': float}}.
+    """
+    result: Dict[str, Dict[str, float]] = {}
+    genome_seq = str(wolgenome.genome).upper()
+    try:
+        std_table = CodonTable.unambiguous_dna_by_id[11]
+    except KeyError:
+        std_table = CodonTable.unambiguous_dna_by_name['Bacterial, Archaeal and Plant Plastid']
+    def aa_of(c: str) -> str:
+        return '*' if c in std_table.stop_codons else std_table.forward_table.get(c, 'X')
+    for gene_id, feat in features.items():
+        allowed = callable_positions.get(gene_id, None)
+        if not allowed:
+            continue
+        gene_start = feat.start
+        gene_end = feat.end
+        strand = feat.strand
+        non_syn = 0
+        syn = 0
+        for rel0 in allowed:
+            if strand == 1:
+                genome_pos = gene_start + rel0
+                gene_pos_1b = rel0 + 1
+            else:
+                genome_pos = gene_end - 1 - rel0
+                gene_pos_1b = gene_end - genome_pos
+            base = genome_seq[genome_pos]
+            if base not in ('C', 'G'):
+                continue
+            frame = (gene_pos_1b - 1) % 3
+            if strand == 1:
+                codon_start = genome_pos - frame
+                if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                    continue
+                codon = genome_seq[codon_start: codon_start + 3]
+            else:
+                codon_start = genome_pos - (2 - frame)
+                if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                    continue
+                codon_genomic = genome_seq[codon_start: codon_start + 3]
+                codon = str(Seq(codon_genomic).reverse_complement())
+            pos_in_codon = (gene_pos_1b - 1) % 3
+            codon_list = list(codon)
+            if codon_list[pos_in_codon] != base:
+                continue
+            mutated = 'T' if base == 'C' else 'A'
+            codon_list[pos_in_codon] = mutated
+            mutated_codon = ''.join(codon_list)
+            if aa_of(codon) == aa_of(mutated_codon):
+                syn += 1
+            else:
+                non_syn += 1
+        total = syn + non_syn
+        frac = (non_syn / total) if total > 0 else float('nan')
+        result[gene_id] = {
+            'expected_nonsyn_sites': non_syn,
+            'expected_syn_sites': syn,
+            'expected_nonsyn_fraction': frac
+        }
+    return result
+
+
+def compute_observed_nonsyn_fraction(
+    mutation_jsons: List[str],
+    features: Dict[str, Any],
+    wolgenome: SeqContext,
+    callable_positions: Dict[str, set]
+) -> Dict[str, Dict[str, float]]:
+    """For each gene, compute observed counts of mutated callable C/G sites that would be non-syn vs syn under C->T/G->A.
+    Restrict to EMS-type (C->T/G->A) and deduplicate sites across samples. Returns
+    {gene_id: {'observed_nonsyn_sites': int, 'observed_syn_sites': int, 'observed_nonsyn_fraction': float, 'observed_total_cg_sites': int}}.
+    """
+    genome_seq = str(wolgenome.genome).upper()
+    try:
+        std_table = CodonTable.unambiguous_dna_by_id[11]
+    except KeyError:
+        std_table = CodonTable.unambiguous_dna_by_name['Bacterial, Archaeal and Plant Plastid']
+    def aa_of(c: str) -> str:
+        return '*' if c in std_table.stop_codons else std_table.forward_table.get(c, 'X')
+    # Collect unique mutated positions per gene, restricted to callable and EMS-types
+    mutated_positions: Dict[str, set] = defaultdict(set)
+    for js in mutation_jsons:
+        with open(js) as jf:
+            mut_dict = json.load(jf)
+        for gene_id, gene_data in mut_dict.items():
+            allowed = callable_positions.get(gene_id, None)
+            if allowed is None or len(allowed) == 0:
+                continue
+            for mut_key in gene_data.get('mutations', {}).keys():
+                pos_str, mut_type = mut_key.split('_')
+                if mut_type not in ('C>T', 'G>A'):
+                    continue
+                rel0 = int(pos_str)
+                if rel0 in allowed:
+                    mutated_positions[gene_id].add(rel0)
+    # Classify mutated sites as syn / non-syn
+    result: Dict[str, Dict[str, float]] = {}
+    for gene_id, pos_set in mutated_positions.items():
+        feat = features.get(gene_id)
+        if feat is None:
+            continue
+        gene_start = feat.start
+        gene_end = feat.end
+        strand = feat.strand
+        non_syn = 0
+        syn = 0
+        for rel0 in pos_set:
+            if strand == 1:
+                genome_pos = gene_start + rel0
+                gene_pos_1b = rel0 + 1
+            else:
+                genome_pos = gene_end - 1 - rel0
+                gene_pos_1b = gene_end - genome_pos
+            base = genome_seq[genome_pos]
+            if base not in ('C', 'G'):
+                continue
+            frame = (gene_pos_1b - 1) % 3
+            if strand == 1:
+                codon_start = genome_pos - frame
+                if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                    continue
+                codon = genome_seq[codon_start: codon_start + 3]
+            else:
+                codon_start = genome_pos - (2 - frame)
+                if codon_start < 0 or codon_start + 3 > len(genome_seq):
+                    continue
+                codon_genomic = genome_seq[codon_start: codon_start + 3]
+                codon = str(Seq(codon_genomic).reverse_complement())
+            pos_in_codon = (gene_pos_1b - 1) % 3
+            codon_list = list(codon)
+            if codon_list[pos_in_codon] != base:
+                continue
+            mutated = 'T' if base == 'C' else 'A'
+            codon_list[pos_in_codon] = mutated
+            mutated_codon = ''.join(codon_list)
+            if aa_of(codon) == aa_of(mutated_codon):
+                syn += 1
+            else:
+                non_syn += 1
+        total_mut = syn + non_syn
+        frac = (non_syn / total_mut) if total_mut > 0 else float('nan')
+        result[gene_id] = {
+            'observed_nonsyn_sites': non_syn,
+            'observed_syn_sites': syn,
+            'observed_total_cg_sites': total_mut,
+            'observed_nonsyn_fraction': frac
+        }
+    return result
+
+
+def write_expected_vs_observed_nonsyn_csv(
+    label: str,
+    output_results_dir: str,
+    expected: Dict[str, Dict[str, float]],
+    observed: Dict[str, Dict[str, float]]
+) -> None:
+    rows = []
+    for gene_id, exp in expected.items():
+        e_non = exp.get('expected_nonsyn_sites', 0)
+        e_syn = exp.get('expected_syn_sites', 0)
+        e_frac = exp.get('expected_nonsyn_fraction', float('nan'))
+        obs = observed.get(gene_id, {})
+        o_non = obs.get('observed_nonsyn_sites', 0)
+        o_syn = obs.get('observed_syn_sites', 0)
+        o_frac = obs.get('observed_nonsyn_fraction', float('nan'))
+        rows.append({
+            'gene_id': gene_id,
+            'expected_nonsyn_sites': e_non,
+            'expected_syn_sites': e_syn,
+            'expected_nonsyn_fraction': e_frac,
+            'observed_nonsyn_sites': o_non,
+            'observed_syn_sites': o_syn,
+            'observed_nonsyn_fraction': o_frac,
+            'observed_minus_expected_fraction': (o_frac - e_frac) if (not np.isnan(o_frac) and not np.isnan(e_frac)) else float('nan')
+        })
+    columns = [
+        'gene_id',
+        'expected_nonsyn_sites',
+        'expected_syn_sites',
+        'expected_nonsyn_fraction',
+        'observed_nonsyn_sites',
+        'observed_syn_sites',
+        'observed_nonsyn_fraction',
+        'observed_minus_expected_fraction'
+    ]
+    df = pd.DataFrame(rows, columns=columns)
+    out_path = os.path.join(output_results_dir, f'{label}_expected_vs_observed_nonsyn_fraction.csv')
+    df.to_csv(out_path, index=False)
+    logger.info(f'Wrote per-gene expected vs observed non-syn fractions: {out_path} ({len(df)} rows)')
 
 def main() -> None:
     '''Main function to run the PROVEAN effect score calculation pipeline.
@@ -915,6 +1469,30 @@ def main() -> None:
         elif is_ems_sample(sample_name):
             treated_jsons.append(js)
 
+    # Build callable unions up-front so we can filter observed mutations with the SAME exposure as permutations
+    callable_union_ctrl = build_union_callable_positions(control_jsons, paths, args.mpileups)
+    callable_union_treat = build_union_callable_positions(treated_jsons, paths, args.mpileups)
+    callable_inter_ctrl = build_intersection_callable_positions(control_jsons, paths, args.mpileups)
+    callable_inter_treat = build_intersection_callable_positions(treated_jsons, paths, args.mpileups)
+    # Logging: site totals union vs intersection
+    def count_sites(pos_map: Dict[str, set]) -> int:
+        return sum(len(s) for s in pos_map.values())
+    union_ctrl_n = count_sites(callable_union_ctrl)
+    union_treat_n = count_sites(callable_union_treat)
+    inter_ctrl_n = count_sites(callable_inter_ctrl)
+    inter_treat_n = count_sites(callable_inter_treat)
+    logger.info(f"Callable sites (controls): union={union_ctrl_n:,} intersection={inter_ctrl_n:,}")
+    logger.info(f"Callable sites (treated): union={union_treat_n:,} intersection={inter_treat_n:,}")
+    # Choose intersection first; fallback to union; if both empty, all genic
+    callable_ctrl = callable_inter_ctrl if any(len(v) for v in callable_inter_ctrl.values()) else callable_union_ctrl
+    callable_treat = callable_inter_treat if any(len(v) for v in callable_inter_treat.values()) else callable_union_treat
+    if not any(len(v) for v in callable_ctrl.values()):
+        logger.warning("Callable (controls) union and intersection empty; falling back to all genic positions.")
+        callable_ctrl = build_all_genic_positions(features)
+    if not any(len(v) for v in callable_treat.values()):
+        logger.warning("Callable (treated) union and intersection empty; falling back to all genic positions.")
+        callable_treat = build_all_genic_positions(features)
+
     # Set max_workers for parallelization
     max_workers = min(20, os.cpu_count())
     
@@ -935,6 +1513,8 @@ def main() -> None:
         'reverse_strand_genes': [],
         'forward_strand_genes': []
     }
+    # Diagnostics: observed placed vs counted per gene
+    obs_dropout_rows: list[dict] = []
     
     # --- Merge all observed mutations for controls ---
     merged_control_mutations = {}
@@ -949,9 +1529,16 @@ def main() -> None:
                         'avg_cov': 0,
                         'sample_count': 0
                     }
-                # Merge mutations
-                for mut_key, count in gene_data['mutations'].items():
-                    merged_control_mutations[gene_id]['mutations'][mut_key] = merged_control_mutations[gene_id]['mutations'].get(mut_key, 0) + count
+                # Merge mutations (presence/absence per site), but restrict to EMS-type and callable-union
+                allowed = callable_union_ctrl.get(gene_id, None)
+                for mut_key in gene_data['mutations'].keys():
+                    pos_str, mut_type = mut_key.split('_')
+                    if mut_type not in ('C>T', 'G>A'):
+                        continue
+                    rel0 = int(pos_str)
+                    if allowed is not None and rel0 not in allowed:
+                        continue
+                    merged_control_mutations[gene_id]['mutations'][mut_key] = 1
                 merged_control_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
                 merged_control_mutations[gene_id]['sample_count'] += 1
     # Average coverage
@@ -980,11 +1567,19 @@ def main() -> None:
             all_mismatch_info['summary']['total_mismatches'] += gene_mismatch_info['summary']['total_mismatches']
             all_mismatch_info['reverse_strand_genes'].extend(gene_mismatch_info['reverse_strand_genes'])
             all_mismatch_info['forward_strand_genes'].extend(gene_mismatch_info['forward_strand_genes'])
+        # Diagnostics: observed placed vs counted for this gene
+        obs_dropout_rows.append({
+            'group': 'controls',
+            'gene_id': gene_id,
+            'observed_placed_sites': len(gene_data['mutations']),
+            'observed_counted_sites': (stats.get('non_syn_muts', 0) or 0) + (stats.get('syn_muts', 0) or 0),
+            'observed_mismatch_count': gene_mismatch_info['summary']['total_mismatches'] if gene_mismatch_info and 'summary' in gene_mismatch_info else 0
+        })
         # Compose output in original format (permutation data will be added later)
         observed_control_results[gene_id] = {
             'effect': effect,
             'effect_with_nonsense': effect_with_nonsense,
-            'total_mutations': sum(gene_data['mutations'].values()),
+            'total_mutations': len(gene_data['mutations']),
             'gene_len': gene_data['gene_len'],
             'mutation_stats': stats,
             'permutation': {
@@ -1015,9 +1610,16 @@ def main() -> None:
                         'avg_cov': 0,
                         'sample_count': 0
                     }
-                # Merge mutations
-                for mut_key, count in gene_data['mutations'].items():
-                    merged_treated_mutations[gene_id]['mutations'][mut_key] = merged_treated_mutations[gene_id]['mutations'].get(mut_key, 0) + count
+                # Merge mutations (presence/absence per site), but restrict to EMS-type and callable-union
+                allowed = callable_union_treat.get(gene_id, None)
+                for mut_key in gene_data['mutations'].keys():
+                    pos_str, mut_type = mut_key.split('_')
+                    if mut_type not in ('C>T', 'G>A'):
+                        continue
+                    rel0 = int(pos_str)
+                    if allowed is not None and rel0 not in allowed:
+                        continue
+                    merged_treated_mutations[gene_id]['mutations'][mut_key] = 1
                 merged_treated_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
                 merged_treated_mutations[gene_id]['sample_count'] += 1
     # Average coverage
@@ -1046,11 +1648,19 @@ def main() -> None:
             all_mismatch_info['summary']['total_mismatches'] += gene_mismatch_info['summary']['total_mismatches']
             all_mismatch_info['reverse_strand_genes'].extend(gene_mismatch_info['reverse_strand_genes'])
             all_mismatch_info['forward_strand_genes'].extend(gene_mismatch_info['forward_strand_genes'])
+        # Diagnostics: observed placed vs counted for this gene
+        obs_dropout_rows.append({
+            'group': 'treated',
+            'gene_id': gene_id,
+            'observed_placed_sites': len(gene_data['mutations']),
+            'observed_counted_sites': (stats.get('non_syn_muts', 0) or 0) + (stats.get('syn_muts', 0) or 0),
+            'observed_mismatch_count': gene_mismatch_info['summary']['total_mismatches'] if gene_mismatch_info and 'summary' in gene_mismatch_info else 0
+        })
         # Compose output in original format (permutation data will be added later)
         observed_treated_results[gene_id] = {
             'effect': effect,
             'effect_with_nonsense': effect_with_nonsense,
-            'total_mutations': sum(gene_data['mutations'].values()),
+            'total_mutations': len(gene_data['mutations']),
             'gene_len': gene_data['gene_len'],
             'mutation_stats': stats,
             'permutation': {
@@ -1098,24 +1708,35 @@ def main() -> None:
         logger.info("No mismatches found in original data")
     
     # --- Permutation processing for controls AND treated ---
+    # --- Compute expected vs observed non-syn fractions BEFORE permutations ---
+    # (callable_union_ctrl and callable_union_treat already computed above and reused here)
+    expected_nonsyn_control = compute_expected_nonsyn_fraction(features, wolgenome, callable_ctrl)
+    observed_nonsyn_control = compute_observed_nonsyn_fraction(control_jsons, features, wolgenome, callable_ctrl)
+    write_expected_vs_observed_nonsyn_csv("control", paths['results'], expected_nonsyn_control, observed_nonsyn_control)
+    expected_nonsyn_treated = compute_expected_nonsyn_fraction(features, wolgenome, callable_treat)
+    observed_nonsyn_treated = compute_observed_nonsyn_fraction(treated_jsons, features, wolgenome, callable_treat)
+    write_expected_vs_observed_nonsyn_csv("treated", paths['results'], expected_nonsyn_treated, observed_nonsyn_treated)
+
     logger.info("=== STARTING PERMUTATION PROCESSING ===")
     print("=== STARTING PERMUTATION PROCESSING ===")
     
     # --- Generate permutation profiles for controls ---
     logger.info(f"Running permutation test for pooled control samples: {len(control_jsons)} files.")
-    observed_kmers_control = collect_observed_5mer_contexts(
+    observed_kmers_codon_control = collect_observed_5mer_codon_contexts(
         control_jsons,
         wolgenome,
         features,
         kmer_size=5
     )
+    # reuse callable_union_ctrl built above
     kmer_sites_control = collect_genic_5mer_sites(
         wolgenome,
         features,
-        kmer_size=5
+        kmer_size=5,
+        callable_positions=callable_ctrl
     )
     permutation_profiles_control = generate_permutation_profiles(
-        observed_kmers_control,
+        observed_kmers_codon_control,
         kmer_sites_control,
         n_permutations=1000,
         random_seed=None,
@@ -1135,19 +1756,21 @@ def main() -> None:
     
     # --- Generate permutation profiles for treated ---
     logger.info(f"Running permutation test for pooled treated samples: {len(treated_jsons)} files.")
-    observed_kmers_treated = collect_observed_5mer_contexts(
+    observed_kmers_codon_treated = collect_observed_5mer_codon_contexts(
         treated_jsons,
-            wolgenome,
-            features,
-            kmer_size=5
+        wolgenome,
+        features,
+        kmer_size=5
     )
+    # reuse callable_union_treat built above
     kmer_sites_treated = collect_genic_5mer_sites(
-            wolgenome,
-            features,
-            kmer_size=5
+        wolgenome,
+        features,
+    kmer_size=5,
+    callable_positions=callable_treat
     )
     permutation_profiles_treated = generate_permutation_profiles(
-        observed_kmers_treated,
+        observed_kmers_codon_treated,
         kmer_sites_treated,
         n_permutations=1000,
         random_seed=None,
@@ -1180,6 +1803,8 @@ def main() -> None:
             'scores_with_nonsense': perm.get('permutation_effects_with_nonsense', []),
             'deleterious_counts': perm.get('deleterious_counts', []),
             'total_mutations': perm.get('total_mutations', []),
+            'non_syn_counts': perm.get('non_syn_counts', []),
+            'syn_counts': perm.get('syn_counts', []),
             'mean': perm.get('mean', 0),
             'std': perm.get('std', 0),
             'mean_with_nonsense': perm.get('mean_with_nonsense', 0),
@@ -1197,6 +1822,8 @@ def main() -> None:
             'scores_with_nonsense': perm.get('permutation_effects_with_nonsense', []),
             'deleterious_counts': perm.get('deleterious_counts', []),
             'total_mutations': perm.get('total_mutations', []),
+            'non_syn_counts': perm.get('non_syn_counts', []),
+            'syn_counts': perm.get('syn_counts', []),
             'mean': perm.get('mean', 0),
             'std': perm.get('std', 0),
             'mean_with_nonsense': perm.get('mean_with_nonsense', 0),
@@ -1205,8 +1832,66 @@ def main() -> None:
     
     with open(f"{paths['results']}/permuted_provean_results_treated.json", "w") as f:
         json.dump(observed_treated_results, f, indent=2)
+    
+    # --- Compute potential synonymous sites for controls ---
+    potential_syn_control = compute_potential_synonymous_sites(features, wolgenome, callable_ctrl)
+    observed_syn_hits_control = compute_observed_synonymous_hits(control_jsons, features=features, wolgenome=wolgenome, callable_positions=callable_ctrl)
+    write_syn_site_fraction_csv("control", paths['results'], potential_syn_control, observed_syn_hits_control)
+
+    # --- Compute potential synonymous sites for treated ---
+    potential_syn_treated = compute_potential_synonymous_sites(features, wolgenome, callable_treat)
+    observed_syn_hits_treated = compute_observed_synonymous_hits(treated_jsons, features=features, wolgenome=wolgenome, callable_positions=callable_treat)
+    write_syn_site_fraction_csv("treated", paths['results'], potential_syn_treated, observed_syn_hits_treated)
 
     logger.success("Pipeline completed successfully")
+
+    # Write observed diagnostics CSV (placed vs counted and mismatches per gene)
+    if obs_dropout_rows:
+        obs_df = pd.DataFrame(obs_dropout_rows)
+        obs_path = os.path.join(paths['results'], 'dropout_diagnostics_observed.csv')
+        obs_df.to_csv(obs_path, index=False)
+        logger.info(f"Wrote observed dropout diagnostics: {obs_path}")
+
+    # Write per-permutation placed vs counted diagnostics for controls and treated
+    def write_perm_dropout_diag(group_name: str, perm_results: dict):
+        if not perm_results:
+            return
+        # Determine number of permutations from the first gene present
+        first_gene = next(iter(perm_results.keys()), None)
+        if first_gene is None:
+            return
+        num_perms = len(perm_results[first_gene].get('placed_counts', []))
+        placed_totals = np.zeros(num_perms, dtype=int)
+        counted_totals = np.zeros(num_perms, dtype=int)
+        mismatch_totals = np.zeros(num_perms, dtype=int)
+        for gene_id, vals in perm_results.items():
+            pc = np.array(vals.get('placed_counts', []), dtype=int)
+            cc = np.array(vals.get('counted_counts', []), dtype=int)
+            mc = np.array(vals.get('mismatch_counts', []), dtype=int)
+            if pc.size != num_perms:
+                # pad if needed (should not happen due to alignment)
+                pc = np.pad(pc, (0, max(0, num_perms - pc.size)))
+            if cc.size != num_perms:
+                cc = np.pad(cc, (0, max(0, num_perms - cc.size)))
+            if mc.size != num_perms:
+                mc = np.pad(mc, (0, max(0, num_perms - mc.size)))
+            placed_totals += pc
+            counted_totals += cc
+            mismatch_totals += mc
+        dropped = placed_totals - counted_totals
+        df = pd.DataFrame({
+            'perm_index': np.arange(1, num_perms + 1),
+            'placed_total': placed_totals,
+            'counted_total': counted_totals,
+            'dropped_total': dropped,
+            'mismatch_total': mismatch_totals
+        })
+        outp = os.path.join(paths['results'], f'dropout_diagnostics_permutations_{group_name}.csv')
+        df.to_csv(outp, index=False)
+        logger.info(f"Wrote permutation dropout diagnostics: {outp}")
+
+    write_perm_dropout_diag('controls', permuted_results_control)
+    write_perm_dropout_diag('treated', permuted_results_treated)
 
 if __name__ == '__main__':
     main()
