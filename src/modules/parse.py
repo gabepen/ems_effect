@@ -148,12 +148,27 @@ def check_mutations(
     base_counts: Dict[str, int],
     genome_seq: str,
     context_counts: Dict[str, int],
-    context_size: int = 7
+    context_size: int = 7,
+    gene_feature: Optional[Any] = None
 ) -> Tuple[Dict[str, int], int, Dict[str, int]]:
     '''Analyze a mpileup entry to identify mutations and count contexts.'''
     muts: Dict[str, int] = {}    
-    bp = (int(entry[1]) - int(genestart))
-    bp = str(bp) + '_'
+    
+    # Calculate position relative to gene start, accounting for strand orientation
+    if gene_feature and gene_feature.strand == -1:
+        # For reverse strand genes, use BioPython's coordinate system
+        # This ensures positions match the reverse complemented sequence
+        genomic_pos = int(entry[1]) - 1  # 0-based genomic position
+        gene_length = gene_feature.location.end - gene_feature.location.start
+        # Calculate position from 5' end of reverse complemented sequence
+        # Original: 5' -> 3', Reverse complement: 3' -> 5'
+        # So position 0 in original becomes position gene_length-1 in reverse complement
+        gene_pos = gene_length - 1 - (genomic_pos - gene_feature.location.start)
+    else:
+        # For forward strand genes, use simple relative positioning
+        gene_pos = int(entry[1]) - 1 - int(genestart)  # 0-based
+    
+    bp = str(gene_pos) + '_'
     
     ref = entry[2]
     depth = int(entry[3])
@@ -208,10 +223,25 @@ def check_mutations(
         elif r in '$*Nn':  # End of read, deletion, or N
             continue
 
+    # For reverse strand genes, flip the mutation types to match the reverse complemented sequence
+    if gene_feature and gene_feature.strand == -1:
+        flipped_muts = {}
+        complement_map = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
+        for mut_key, count in muts.items():
+            pos_str, mut_type = mut_key.split('_')
+            ref_base, alt_base = mut_type.split('>')
+            # Flip the bases to match the reverse complemented sequence
+            flipped_ref = complement_map.get(ref_base, ref_base)
+            flipped_alt = complement_map.get(alt_base, alt_base)
+            flipped_mut_type = f"{flipped_ref}>{flipped_alt}"
+            flipped_key = f"{pos_str}_{flipped_mut_type}"
+            flipped_muts[flipped_key] = count
+        muts = flipped_muts
+
     # Return empty dict for local_base_counts since we're not using it
     return muts, depth, {}
 
-def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[Tuple], int, int, int]) -> Tuple[str, Dict, Dict, Dict, Dict]:
+def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[Any], int, int, int]) -> Tuple[str, Dict, Dict, Dict, Dict]:
     '''Process a chunk of mpileup lines.'''
     sample, lines, seqobject, ems_only, gff_features, context_size, start_idx, chunk_size = args
     
@@ -242,7 +272,7 @@ def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[T
             continue
             
         # Move to next gene if we're past the current one
-        while current_gene and pos > current_gene[1]:
+        while current_gene and pos > current_gene.location.end:
             current_gene_idx += 1
             if current_gene_idx < len(gff_features):
                 current_gene = gff_features[current_gene_idx]
@@ -252,24 +282,25 @@ def process_mpileup_chunk(args: Tuple[str, List[str], 'SeqContext', bool, List[T
         
         muts, depth, local_base_counts = check_mutations(
             entry,
-            current_gene[0] if current_gene and int(entry[1]) >= current_gene[0] else 0,
+            current_gene.location.start if current_gene else 0,
             sample,
             ems_only,
             {},  # No longer tracking base counts here
             str(seqobject.genome),
             context_counts,  # Total context counts
-            context_size
+            context_size,
+            current_gene  # Pass the current gene feature
         )
         
         # Add mutations to appropriate collection
-        if current_gene and current_gene[0] + 1 <= int(entry[1]) < current_gene[1] + 1:
+        if current_gene and current_gene.location.start + 1 <= int(entry[1]) < current_gene.location.end + 1:
             # Gene mutation handling remains the same
-            gene_id = current_gene[2]
+            gene_id = current_gene.qualifiers['Dbxref'][0].split(':')[-1]
             if gene_id not in mutations:
                 mutations[gene_id] = {
                     'mutations': {},
                     'avg_cov': 0,
-                    'gene_len': current_gene[1] - current_gene[0],
+                    'gene_len': current_gene.location.end - current_gene.location.start,
                     'depths': []
                 }
             mutations[gene_id]['mutations'].update(muts)
@@ -358,19 +389,13 @@ def parse_mpile(mpile: str, seqobject: 'SeqContext', ems_only: bool, base_counts
     '''Parse a single mpileup file to identify mutations.'''
     # Load and sort GFF features once, filtering for protein-coding genes only
     gff_features = []
-    with open(seqobject.annot) as gff_file:
-        for rec in GFF.parse(gff_file):
-            for feat in rec.features:
-                if (feat.type == 'gene' and
-                    'gene_biotype' in feat.qualifiers and 
-                    feat.qualifiers['gene_biotype'][0] == 'protein_coding'):
-                    gff_features.append((
-                        feat.location.start,
-                        feat.location.end,
-                        feat.qualifiers['Dbxref'][0].split(':')[-1],
-                        feat.location
-                    ))
-    gff_features.sort(key=lambda x: x[0])
+    for rec in GFF.parse(seqobject.annot):
+        for feat in rec.features:
+            if (feat.type == 'gene' and
+                'gene_biotype' in feat.qualifiers and 
+                feat.qualifiers['gene_biotype'][0] == 'protein_coding'):
+                gff_features.append(feat)  # Store the full feature object
+    gff_features.sort(key=lambda x: x.location.start)
 
     # Process single mpileup in chunks
     chunk_args = []

@@ -652,38 +652,53 @@ def process_sample(
     return results
 
 def write_summary_csv(results, output_path):
-    """Write summary of dN/dS analysis to CSV file."""
+    """
+    Write summary of dN/dS analysis to a publication-ready CSV file.
+
+    Output columns:
+        - Sample: Sample name
+        - Original_dNdS: Observed dN/dS ratio (float, rounded)
+        - Original_dNdS_Lower_CI: Lower 95% confidence interval for observed dN/dS (float, rounded)
+        - Original_dNdS_Upper_CI: Upper 95% confidence interval for observed dN/dS (float, rounded)
+        - Random_dNdS: Mean dN/dS from randomization (float, rounded)
+        - Random_dNdS_Lower_CI: Lower 95% confidence interval for random dN/dS (float, rounded)
+        - Random_dNdS_Upper_CI: Upper 95% confidence interval for random dN/dS (float, rounded)
+        - Ratio: Ratio of observed to random dN/dS (float, rounded)
+        - Significant: 'Yes' if significant, 'No' otherwise
+        - Syn_Mutations: Number of unique synonymous sites mutated (int)
+        - NonSyn_Mutations: Number of unique non-synonymous sites mutated (int)
+        - Total_Mutations: Total unique sites mutated (int)
+    """
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            'Sample', 
-            'Original_dNdS', 
-            'Original_dNdS_Lower', 
-            'Original_dNdS_Upper',
-            'Random_dNdS', 
-            'Random_dNdS_Lower', 
-            'Random_dNdS_Upper',
-            'Ratio', 
+            'Sample',
+            'Original_dNdS',
+            'Original_dNdS_Lower_CI',
+            'Original_dNdS_Upper_CI',
+            'Random_dNdS',
+            'Random_dNdS_Lower_CI',
+            'Random_dNdS_Upper_CI',
+            'Ratio',
             'Significant',
-            'Syn_Mutations',  # Changed from total to unique synonymous sites
-            'NonSyn_Mutations',  # Changed from total to unique non-synonymous sites
-            'Total_Mutations'  # Changed to sum of unique sites
+            'Syn_Mutations',
+            'NonSyn_Mutations',
+            'Total_Mutations'
         ])
-        
         for result in results:
             writer.writerow([
                 result['sample'],
-                result['original']['dnds_raw'],
-                result['original']['dnds_lower_ci'],
-                result['original']['dnds_upper_ci'],
-                result['random']['mean'],
-                result['random']['lower_ci'],
-                result['random']['upper_ci'],
-                result['ratio'],
-                result['significant'],
-                result['original']['unique_syn_sites'],  # Changed from syn_muts to unique_syn_sites
-                result['original']['unique_non_syn_sites'],  # Changed from non_syn_muts to unique_non_syn_sites
-                result['original']['unique_syn_sites'] + result['original']['unique_non_syn_sites']  # Sum of unique sites
+                round(result['original']['dnds_raw'], 3),
+                round(result['original']['dnds_lower_ci'], 3),
+                round(result['original']['dnds_upper_ci'], 3),
+                round(result['random']['mean'], 3),
+                round(result['random']['lower_ci'], 3),
+                round(result['random']['upper_ci'], 3),
+                round(result['ratio'], 3),
+                'Yes' if result['significant'] else 'No',
+                int(result['original']['unique_syn_sites']),
+                int(result['original']['unique_non_syn_sites']),
+                int(result['original']['unique_syn_sites'] + result['original']['unique_non_syn_sites'])
             ])
 
 def main():

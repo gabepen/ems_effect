@@ -22,8 +22,15 @@ parser$add_argument('--output', required=TRUE,
 args <- parser$parse_args()
 
 # Process variants file into windows
-variants <- read_tsv(args$variants, 
-                    col_names=c("seqname", "pos", "ref", "depth", "bases", "qual")) %>%
+variants_raw <- read_tsv(args$variants, 
+                    col_names=c("seqname", "pos", "ref", "depth", "bases", "qual"))
+
+# Filter for canonical EMS mutations (C>T and G>A)
+ems_variants <- variants_raw %>%
+  filter((ref == "C" & str_detect(bases, "T")) | (ref == "G" & str_detect(bases, "A")))
+
+# Count EMS mutations per window
+variants <- ems_variants %>%
   mutate(mut_count = as.numeric(str_count(bases, "[ACGT]"))) %>%
   mutate(window = floor(pos / args$window_size)) %>%
   group_by(window) %>%
@@ -31,18 +38,16 @@ variants <- read_tsv(args$variants,
     seqname = dplyr::first(seqname),
     start = min(pos),
     end = max(pos),
-    count = sum(mut_count),
-    p = ppois(count, mean(count), lower.tail=FALSE)
+    count = sum(mut_count)
   ) %>%
   mutate(
-    color = ifelse(p <= 0.05, "red", "black"),
     seqname = "NC_002978.6",
     count = as.numeric(count)
   ) %>%
-  select(seqname, start, end, count, color)
+  select(seqname, start, end, count)
 
 # Print data frame structure for debugging
-print("Variants data frame structure:")
+print("EMS Variants data frame structure:")
 str(variants)
 
 # Import gene annotations and calculate mutation rates per gene
@@ -74,47 +79,6 @@ print(summary(genes$start))
 print(summary(genes$end))
 print("Number of genes where start > end:")
 print(sum(genes$start > genes$end))
-
-# First fix the gene mutations calculation
-gene_mutations <- variants %>%
-  # Ensure numeric coordinates
-  mutate(
-    start = as.numeric(start),
-    end = as.numeric(end)
-  ) %>%
-  # For each variant window, find overlapping genes
-  rowwise() %>%
-  mutate(
-    gene_id = list(genes$gene_id[genes$start <= end & genes$end >= start])
-  ) %>%
-  unnest(gene_id) %>%
-  # Group by gene and calculate totals
-  group_by(gene_id) %>%
-  summarize(
-    total_mutations = sum(count),
-    gene_start = min(genes$start[genes$gene_id == dplyr::first(gene_id)]),
-    gene_end = max(genes$end[genes$gene_id == dplyr::first(gene_id)])
-  ) %>%
-  # Join with gene info
-  left_join(genes, by="gene_id") %>%
-  # Calculate mutation rate per base
-  mutate(
-    mutation_rate = total_mutations / length,
-    start = gene_start,
-    end = gene_end
-  ) %>%
-  # Identify low mutation genes (bottom 5%)
-  mutate(is_low = mutation_rate < quantile(mutation_rate, 0.05, na.rm=TRUE))
-
-# Print debugging info
-print("Gene mutation statistics:")
-print("Number of genes with mutations:")
-print(nrow(gene_mutations))
-print("Coordinate ranges in gene_mutations:")
-print(summary(gene_mutations$start))
-print(summary(gene_mutations$end))
-print("Number of invalid coordinates:")
-print(sum(gene_mutations$start > gene_mutations$end))
 
 # Calculate coverage from BAM file
 print("Reading coverage from BAM file...")
@@ -153,9 +117,14 @@ print("Coverage statistics:")
 print(summary(coverage_data$coverage))
 
 # Initialize plot
-png(args$output, height=37*350, width=40*350, res=600)
+# Use a more standard figure size for publication
+# (8x8 inches at 300 dpi)
+png(args$output, height=8*300, width=8*300, res=600)
 circos.clear()
 circos.par(gap.after=10)
+
+# Set base text size for the plot
+par(cex=1)  # Slightly smaller base text size
 
 # Create genome info
 genome_df <- data.frame(
@@ -172,22 +141,11 @@ genes_plot <- genes %>%
   select(seqname, start, end, color, gene_id) %>%
   as.data.frame()  # Convert to regular data frame
 
-# Prepare low mutation genes data
-low_mut_genes <- gene_mutations %>%
-  filter(is_low) %>%
-  select(seqname, start, end, gene_id) %>%
-  as.data.frame()
-
-print("Genes plot data structure:")
-str(genes_plot)
-print("Sample of genes_plot data:")
-print(head(genes_plot))
-
-# After initializing plot and before gene track, add coverage track
+# Plotting coverage track
 print("Plotting coverage track...")
-# Ensure valid y-limits
 max_coverage <- max(coverage_data$coverage, na.rm=TRUE)
 if(max_coverage == 0) max_coverage <- 1  # Prevent zero y-limit
+avg_coverage <- mean(coverage_data$coverage, na.rm=TRUE)
 
 circos.genomicTrackPlotRegion(
   coverage_data,
@@ -199,21 +157,37 @@ circos.genomicTrackPlotRegion(
                       ybottom=0,
                       col="#E6AB02",  # Golden yellow
                       border=NA)
-    
-    # Add coverage axis
+    # Add average coverage line
+    circos.lines(c(region$start[1], region$end[length(region$end)]),
+                 c(avg_coverage, avg_coverage),
+                 col="red", lwd=2, lty=2)
+    # Add label for average coverage line at the end of the track
+    cell.xlim = get.cell.meta.data("cell.xlim")
+    circos.text(
+      x = cell.xlim[2] - 10000,
+      y = avg_coverage,
+      labels = as.integer(round(avg_coverage)),
+      facing = "clockwise",
+      adj = c(0, 0.5),
+      col = "red",
+      cex = 0.7
+    )
+    # Add coverage axis with fixed ticks
     circos.yaxis(side="left",
-                 at=pretty(c(0, max_coverage)),
-                 labels.cex=0.4)
+                 at=c(0, 25000, 50000),
+                 labels.cex=0.8)  # Slightly smaller axis labels
   }
 )
 
-# Plot gene track
+# Add annotation for average coverage
+text(0, -0.1 * max_coverage, paste0("Avg coverage: ", as.integer(round(avg_coverage))), col="red", cex=0.9, xpd=NA)
+
+# Plot gene track (no low-mutation gene labels)
 circos.genomicTrackPlotRegion(
   genes_plot,
   track.height=0.1,
   ylim = c(0, 1),
   panel.fun=function(region, value, ...) {
-    # Plot gene rectangles
     circos.genomicRect(
       region,
       value,
@@ -222,37 +196,10 @@ circos.genomicTrackPlotRegion(
       col=value$color,
       border=NA
     )
-    
-    # Add labels for low mutation genes if they overlap with current region
-    if(nrow(low_mut_genes) > 0) {
-      # Get genes that overlap with current region
-      overlapping_genes <- low_mut_genes[
-        low_mut_genes$start >= region$start[1] & 
-        low_mut_genes$end <= region$end[length(region$end)],
-      ]
-      
-      # Add labels for overlapping genes
-      if(nrow(overlapping_genes) > 0) {
-        for(i in 1:nrow(overlapping_genes)) {
-          gene <- overlapping_genes[i,]
-          mid_point <- (gene$start + gene$end)/2
-          circos.text(
-            mid_point,
-            1.2,
-            gene$gene_id,
-            cex=0.4,
-            col="darkred",
-            facing="clockwise",  # Make text follow the circle
-            niceFacing=TRUE,     # Adjust text angle for readability
-            adj=c(0, 0.5)        # Center text vertically relative to point
-          )
-        }
-      }
-    }
   }
 )
 
-# Plot mutation density track with explicit numeric data and scaling
+# Plot mutation density track (EMS only)
 variants_plot <- variants %>%
   mutate(
     start = as.numeric(start),
@@ -260,7 +207,6 @@ variants_plot <- variants %>%
     count = as.numeric(count)
   )
 
-# Calculate reasonable y-limit using quantiles
 max_count <- max(variants_plot$count, na.rm=TRUE)
 q95 <- quantile(variants_plot$count, 0.95, na.rm=TRUE)
 ylimit <- min(max_count, q95 * 2)
@@ -270,47 +216,39 @@ print(paste("Max count:", max_count))
 print(paste("95th percentile:", q95))
 print(paste("Using y-limit:", ylimit))
 
-# Plot mutation density track
 circos.genomicTrackPlotRegion(
   variants_plot,
   track.height=0.2,
   ylim = c(0, ylimit),
   panel.fun=function(region, value, ...) {
-    # Split the counts into EMS and non-EMS
-    ems_count <- ifelse(grepl("C>T|G>A", value$color), value$count, 0)  # Adjust this condition based on your EMS criteria
-    non_ems_count <- value$count - ems_count
-    
-    # Plot EMS canonical mutations in dark orange
     circos.genomicRect(region, value,
                       col="darkorange",
-                      ytop=pmin(ems_count, ylimit),
+                      ytop=pmin(value$count, ylimit),
                       ybottom=0,
                       border=NA, ...)
-    
-    # Plot non-EMS mutations in dark grey
-    circos.genomicRect(region, value,
-                      col="darkgrey",
-                      ytop=pmin(non_ems_count, ylimit),
-                      ybottom=0,
-                      border=NA, ...)
-    
     # Add a line at the bottom of the track
     cell.xlim = get.cell.meta.data("cell.xlim")
     circos.lines(cell.xlim, c(0, 0), lty=1, col="#000000")
   }
 )
 
-# Add y-axis labels
-y_axis_labels <- c(0, ylimit)
+# Add y-axis labels as whole numbers
+y_axis_labels <- c(0, 2000)
 if(max_count > ylimit) {
-  y_axis_labels <- c(0, ylimit, max_count)
+  y_axis_labels <- c(0, 2000, as.integer(round(max_count)))
 }
+y_axis_labels <- as.integer(round(y_axis_labels))
 
 circos.yaxis(
   side="left",
   at=y_axis_labels,
   labels=y_axis_labels,
-  labels.cex=0.6*par("cex")
+  labels.cex=0.8  # Slightly smaller y-axis labels
 )
+
+# Add a legend, move to bottomright to avoid overlap
+legend("bottomright", legend=c("Coverage", "Gene", "EMS mutation density", "Avg coverage"), 
+       fill=c("#E6AB02", "#4292C6", "darkorange", NA), border=NA, lty=c(NA, NA, NA, 2), col=c(NA, NA, NA, "red"),
+       cex=0.9, bty="n", text.col="black", text.font=1, x.intersp=0.7, y.intersp=0.9, pt.cex=0.8, inset=0.01)
 
 dev.off()
