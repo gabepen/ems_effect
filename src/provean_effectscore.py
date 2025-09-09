@@ -813,6 +813,43 @@ def collect_genic_5mer_sites(
     logger.info(f"Total genic 5-mer positions (C/G center): {total_sites}")
     return kmer_sites
 
+# --- New: Summarize observed vs capacity per (5-mer, codon) stratum ---
+
+def summarize_strata_capacity(
+    observed_kmer_codon_counts: Dict[tuple, int],
+    kmer_site_pool: Dict[tuple, list],
+    group_label: str,
+    results_dir: str
+) -> None:
+    """Write a CSV summarizing, per (5-mer, codon) stratum, the observed unique sites used
+    to seed permutations vs the available site capacity in the pool.
+
+    Columns: stratum, observed, capacity, deficit (observed - capacity if > 0)
+    Safely no-ops if inputs are empty.
+    """
+    try:
+        if not observed_kmer_codon_counts or not kmer_site_pool:
+            logger.warning(f"summarize_strata_capacity: empty inputs for {group_label}; skipping summary")
+            return
+        rows = []
+        total_obs = 0
+        total_cap = 0
+        for key, obs in observed_kmer_codon_counts.items():
+            cap = len(kmer_site_pool.get(key, []))
+            total_obs += int(obs)
+            total_cap += int(cap)
+            rows.append({
+                'stratum': f"{key[0]}|{key[1]}",
+                'observed': int(obs),
+                'capacity': int(cap),
+                'deficit': max(0, int(obs) - int(cap))
+            })
+        outp = os.path.join(results_dir, f'strata_capacity_summary_{group_label}.csv')
+        pd.DataFrame(rows, columns=['stratum','observed','capacity','deficit']).to_csv(outp, index=False)
+        logger.info(f"Wrote strata capacity summary ({group_label}): {outp} (obs={total_obs} cap={total_cap})")
+    except Exception as e:
+        logger.warning(f"summarize_strata_capacity failed for {group_label}: {e}")
+
 # --- New: Generate a random mutation profile for a single permutation (with replacement, stratified) ---
 
 def generate_random_mutation_profile(
@@ -1483,14 +1520,14 @@ def main() -> None:
     inter_treat_n = count_sites(callable_inter_treat)
     logger.info(f"Callable sites (controls): union={union_ctrl_n:,} intersection={inter_ctrl_n:,}")
     logger.info(f"Callable sites (treated): union={union_treat_n:,} intersection={inter_treat_n:,}")
-    # Choose intersection first; fallback to union; if both empty, all genic
-    callable_ctrl = callable_inter_ctrl if any(len(v) for v in callable_inter_ctrl.values()) else callable_union_ctrl
-    callable_treat = callable_inter_treat if any(len(v) for v in callable_inter_treat.values()) else callable_union_treat
+    # Use union of callable positions for placement; fallback to all genic if union empty
+    callable_ctrl = callable_union_ctrl
+    callable_treat = callable_union_treat
     if not any(len(v) for v in callable_ctrl.values()):
-        logger.warning("Callable (controls) union and intersection empty; falling back to all genic positions.")
+        logger.warning("Callable (controls) union empty; falling back to all genic positions.")
         callable_ctrl = build_all_genic_positions(features)
     if not any(len(v) for v in callable_treat.values()):
-        logger.warning("Callable (treated) union and intersection empty; falling back to all genic positions.")
+        logger.warning("Callable (treated) union empty; falling back to all genic positions.")
         callable_treat = build_all_genic_positions(features)
 
     # Set max_workers for parallelization
@@ -1518,81 +1555,83 @@ def main() -> None:
     
     # --- Merge all observed mutations for controls ---
     merged_control_mutations = {}
-    for js in control_jsons:
-        with open(js) as jf:
-            mut_dict = json.load(jf)
-            for gene_id, gene_data in mut_dict.items():
-                if gene_id not in merged_control_mutations:
-                    merged_control_mutations[gene_id] = {
-                        'mutations': {},
-                        'gene_len': gene_data['gene_len'],
-                        'avg_cov': 0,
-                        'sample_count': 0
-                    }
-                # Merge mutations (presence/absence per site), but restrict to EMS-type and callable-union
-                allowed = callable_union_ctrl.get(gene_id, None)
-                for mut_key in gene_data['mutations'].keys():
-                    pos_str, mut_type = mut_key.split('_')
-                    if mut_type not in ('C>T', 'G>A'):
-                        continue
-                    rel0 = int(pos_str)
-                    if allowed is not None and rel0 not in allowed:
-                        continue
-                    merged_control_mutations[gene_id]['mutations'][mut_key] = 1
-                merged_control_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
-                merged_control_mutations[gene_id]['sample_count'] += 1
-    # Average coverage
+    if control_jsons:
+        for js in control_jsons:
+            with open(js) as jf:
+                mut_dict = json.load(jf)
+                for gene_id, gene_data in mut_dict.items():
+                    if gene_id not in merged_control_mutations:
+                        merged_control_mutations[gene_id] = {
+                            'mutations': {},
+                            'gene_len': gene_data['gene_len'],
+                            'avg_cov': 0,
+                            'sample_count': 0
+                        }
+                    # Merge mutations (presence/absence per site), restrict to EMS-type only (no callable filtering)
+                    for mut_key in gene_data['mutations'].keys():
+                        pos_str, mut_type = mut_key.split('_')
+                        if mut_type not in ('C>T', 'G>A'):
+                            continue
+                        merged_control_mutations[gene_id]['mutations'][mut_key] = 1
+                    merged_control_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
+                    merged_control_mutations[gene_id]['sample_count'] += 1
+     # Average coverage
     for gene_id in merged_control_mutations:
         sc = merged_control_mutations[gene_id]['sample_count']
         if sc > 0:
             merged_control_mutations[gene_id]['avg_cov'] /= sc
+    # Log observed pool size (unique mutated sites across genes) for controls
+    if merged_control_mutations:
+        observed_ctrl_total_sites = sum(len(g['mutations']) for g in merged_control_mutations.values())
+        logger.info(f"Observed unique sites (controls, EMS-only): {observed_ctrl_total_sites:,}")
     # Calculate observed effect and stats for merged controls
     observed_control_results = {}
-    for gene_id, gene_data in merged_control_mutations.items():
-        effect, effect_with_nonsense, stats, gene_mismatch_info = nuc_to_provean_score(
-            gene_data,
-            gene_id,
-            score_db,
-            provean_config,
-            paths,
-            features,
-            wolgenome,
-            refs['codon_table']
-        )
-        
-        # Collect mismatch info
-        if gene_mismatch_info and gene_mismatch_info['summary']['total_mismatches'] > 0:
-            all_mismatch_info['genes_with_mismatches'].update(gene_mismatch_info['genes_with_mismatches'])
-            all_mismatch_info['summary']['total_genes_with_mismatches'] += gene_mismatch_info['summary']['total_genes_with_mismatches']
-            all_mismatch_info['summary']['total_mismatches'] += gene_mismatch_info['summary']['total_mismatches']
-            all_mismatch_info['reverse_strand_genes'].extend(gene_mismatch_info['reverse_strand_genes'])
-            all_mismatch_info['forward_strand_genes'].extend(gene_mismatch_info['forward_strand_genes'])
-        # Diagnostics: observed placed vs counted for this gene
-        obs_dropout_rows.append({
-            'group': 'controls',
-            'gene_id': gene_id,
-            'observed_placed_sites': len(gene_data['mutations']),
-            'observed_counted_sites': (stats.get('non_syn_muts', 0) or 0) + (stats.get('syn_muts', 0) or 0),
-            'observed_mismatch_count': gene_mismatch_info['summary']['total_mismatches'] if gene_mismatch_info and 'summary' in gene_mismatch_info else 0
-        })
-        # Compose output in original format (permutation data will be added later)
-        observed_control_results[gene_id] = {
-            'effect': effect,
-            'effect_with_nonsense': effect_with_nonsense,
-            'total_mutations': len(gene_data['mutations']),
-            'gene_len': gene_data['gene_len'],
-            'mutation_stats': stats,
-            'permutation': {
-                'scores': [],
-                'scores_with_nonsense': [],
-                'deleterious_counts': [],
-                'total_mutations': [],
-                'mean': 0,
-                'std': 0,
-                'mean_with_nonsense': 0,
-                'std_with_nonsense': 0
+    if merged_control_mutations:
+        for gene_id, gene_data in merged_control_mutations.items():
+            effect, effect_with_nonsense, stats, gene_mismatch_info = nuc_to_provean_score(
+                gene_data,
+                gene_id,
+                score_db,
+                provean_config,
+                paths,
+                features,
+                wolgenome,
+                refs['codon_table']
+            )
+            
+            # Collect mismatch info
+            if gene_mismatch_info and gene_mismatch_info['summary']['total_mismatches'] > 0:
+                all_mismatch_info['genes_with_mismatches'].update(gene_mismatch_info['genes_with_mismatches'])
+                all_mismatch_info['summary']['total_genes_with_mismatches'] += gene_mismatch_info['summary']['total_genes_with_mismatches']
+                all_mismatch_info['summary']['total_mismatches'] += gene_mismatch_info['summary']['total_mismatches']
+                all_mismatch_info['reverse_strand_genes'].extend(gene_mismatch_info['reverse_strand_genes'])
+                all_mismatch_info['forward_strand_genes'].extend(gene_mismatch_info['forward_strand_genes'])
+            # Diagnostics: observed placed vs counted for this gene
+            obs_dropout_rows.append({
+                'group': 'controls',
+                'gene_id': gene_id,
+                'observed_placed_sites': len(gene_data['mutations']),
+                'observed_counted_sites': (stats.get('non_syn_muts', 0) or 0) + (stats.get('syn_muts', 0) or 0),
+                'observed_mismatch_count': gene_mismatch_info['summary']['total_mismatches'] if gene_mismatch_info and 'summary' in gene_mismatch_info else 0
+            })
+            # Compose output in original format (permutation data will be added later)
+            observed_control_results[gene_id] = {
+                'effect': effect,
+                'effect_with_nonsense': effect_with_nonsense,
+                'total_mutations': len(gene_data['mutations']),
+                'gene_len': gene_data['gene_len'],
+                'mutation_stats': stats,
+                'permutation': {
+                    'scores': [],
+                    'scores_with_nonsense': [],
+                    'deleterious_counts': [],
+                    'total_mutations': [],
+                    'mean': 0,
+                    'std': 0,
+                    'mean_with_nonsense': 0,
+                    'std_with_nonsense': 0
+                }
             }
-        }
     
     # --- Process treated ---
     logger.info("Processing original mutation data for treated...")
@@ -1610,14 +1649,10 @@ def main() -> None:
                         'avg_cov': 0,
                         'sample_count': 0
                     }
-                # Merge mutations (presence/absence per site), but restrict to EMS-type and callable-union
-                allowed = callable_union_treat.get(gene_id, None)
+                # Merge mutations (presence/absence per site), restrict to EMS-type only (no callable filtering)
                 for mut_key in gene_data['mutations'].keys():
                     pos_str, mut_type = mut_key.split('_')
                     if mut_type not in ('C>T', 'G>A'):
-                        continue
-                    rel0 = int(pos_str)
-                    if allowed is not None and rel0 not in allowed:
                         continue
                     merged_treated_mutations[gene_id]['mutations'][mut_key] = 1
                 merged_treated_mutations[gene_id]['avg_cov'] += gene_data.get('avg_cov', 0)
@@ -1627,6 +1662,9 @@ def main() -> None:
         sc = merged_treated_mutations[gene_id]['sample_count']
         if sc > 0:
             merged_treated_mutations[gene_id]['avg_cov'] /= sc
+    # Log observed pool size (unique mutated sites across genes) for treated
+    observed_treat_total_sites = sum(len(g['mutations']) for g in merged_treated_mutations.values())
+    logger.info(f"Observed unique sites (treated, EMS-only): {observed_treat_total_sites:,}")
     # Calculate observed effect and stats for merged treated
     observed_treated_results = {}
     for gene_id, gene_data in merged_treated_mutations.items():
@@ -1728,6 +1766,9 @@ def main() -> None:
         features,
         kmer_size=5
     )
+    # Log total observed sites feeding permutations (deduped by site)
+    obs_seed_ctrl_total = sum(observed_kmers_codon_control.values())
+    logger.info(f"[controls] observed EMS unique sites for permutation seeding: {obs_seed_ctrl_total:,}")
     # reuse callable_union_ctrl built above
     kmer_sites_control = collect_genic_5mer_sites(
         wolgenome,
@@ -1735,6 +1776,7 @@ def main() -> None:
         kmer_size=5,
         callable_positions=callable_ctrl
     )
+    summarize_strata_capacity(observed_kmers_codon_control, kmer_sites_control, 'controls', paths['results'])
     permutation_profiles_control = generate_permutation_profiles(
         observed_kmers_codon_control,
         kmer_sites_control,
@@ -1742,6 +1784,19 @@ def main() -> None:
         random_seed=None,
         max_workers=max_workers
     )
+    # Global placed totals per permutation (pre-scoring)
+    placed_totals_ctrl = [sum(len(g.get('mutations', {})) for g in prof.values()) for prof in permutation_profiles_control]
+    if placed_totals_ctrl:
+        logger.info(f"[controls] permutation placed totals: mean={np.mean(placed_totals_ctrl):.1f} min={np.min(placed_totals_ctrl)} max={np.max(placed_totals_ctrl)} n={len(placed_totals_ctrl)}")
+        try:
+            out_csv = os.path.join(paths['results'], 'placed_totals_permutation_controls.csv')
+            with open(out_csv, 'w') as f:
+                f.write('perm_index,placed_total\n')
+                for i, v in enumerate(placed_totals_ctrl, 1):
+                    f.write(f"{i},{v}\n")
+            logger.info(f"Wrote permutation placed totals: {out_csv}")
+        except Exception as e:
+            logger.warning(f"Failed writing placed totals CSV (controls): {e}")
     permuted_results_control = process_permuted_provean_scores(
         permutation_profiles_control,
         score_db,
@@ -1762,6 +1817,8 @@ def main() -> None:
         features,
         kmer_size=5
     )
+    obs_seed_treat_total = sum(observed_kmers_codon_treated.values())
+    logger.info(f"[treated] observed EMS unique sites for permutation seeding: {obs_seed_treat_total:,}")
     # reuse callable_union_treat built above
     kmer_sites_treated = collect_genic_5mer_sites(
         wolgenome,
@@ -1769,6 +1826,7 @@ def main() -> None:
     kmer_size=5,
     callable_positions=callable_treat
     )
+    summarize_strata_capacity(observed_kmers_codon_treated, kmer_sites_treated, 'treated', paths['results'])
     permutation_profiles_treated = generate_permutation_profiles(
         observed_kmers_codon_treated,
         kmer_sites_treated,
@@ -1776,6 +1834,19 @@ def main() -> None:
         random_seed=None,
         max_workers=max_workers
     )
+    # Global placed totals per permutation (pre-scoring)
+    placed_totals_treated = [sum(len(g.get('mutations', {})) for g in prof.values()) for prof in permutation_profiles_treated]
+    if placed_totals_treated:
+        logger.info(f"[treated] permutation placed totals: mean={np.mean(placed_totals_treated):.1f} min={np.min(placed_totals_treated)} max={np.max(placed_totals_treated)} n={len(placed_totals_treated)}")
+        try:
+            out_csv = os.path.join(paths['results'], 'placed_totals_permutation_treated.csv')
+            with open(out_csv, 'w') as f:
+                f.write('perm_index,placed_total\n')
+                for i, v in enumerate(placed_totals_treated, 1):
+                    f.write(f"{i},{v}\n")
+            logger.info(f"Wrote permutation placed totals: {out_csv}")
+        except Exception as e:
+            logger.warning(f"Failed writing placed totals CSV (treated): {e}")
     permuted_results_treated = process_permuted_provean_scores(
         permutation_profiles_treated,
         score_db,

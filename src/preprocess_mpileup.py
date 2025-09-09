@@ -14,6 +14,7 @@ import yaml
 from multiprocessing import Pool, cpu_count
 from typing import Set, Dict, List
 
+
 def analyze_read_position_bias(reads, alt):
     """
     Analyze positional bias using KS test to compare distributions of
@@ -95,6 +96,7 @@ def analyze_read_position_bias(reads, alt):
     # Not enough data points for meaningful test
     return 1.0, 0.0  # Return values indicating no significant bias
 
+
 def get_most_common_alt(reads, ref):
     """
     Find the most common alternate allele in the reads.
@@ -136,6 +138,7 @@ def get_most_common_alt(reads, ref):
     # Return the most common alternate allele and its count
     return max(counts.items(), key=lambda x: x[1])
 
+
 def get_depth_threshold(mpileup_file: str, percentile: float = 5.0) -> int:
     """
     Calculate depth threshold based on distribution of depths in mpileup file.
@@ -165,6 +168,7 @@ def get_depth_threshold(mpileup_file: str, percentile: float = 5.0) -> int:
     else:
         print("Warning: Could not calculate depth distribution, using default threshold of 1")
         return 1
+
 
 def count_bases(reads, ref):
     """
@@ -209,6 +213,7 @@ def count_bases(reads, ref):
     
     return counts, most_common_alt[0], total_alt_count
 
+
 def analyze_n_alt_ratios(plot_data):
     """
     Analyze the ratios between N and Alt frequencies to identify common patterns.
@@ -252,6 +257,7 @@ def analyze_n_alt_ratios(plot_data):
         'common_ratios': ratio_counts_dict,
         'ratio_quality': ratio_quality_dict
     }
+
 
 def plot_n_vs_alt_distributions(sample_data, output_dir):
     """
@@ -387,6 +393,7 @@ def plot_n_vs_alt_distributions(sample_data, output_dir):
             for sample, ratios in all_samples_ratios.items()
         }, f, indent=2)
 
+
 def load_config(config_path):
     """
     Load configuration file to get paths for genome FASTA and GFF.
@@ -403,6 +410,7 @@ def load_config(config_path):
     genome_fasta = config['references']['genomic_fna']
     genome_gff = config['references']['annotation']
     return genome_fasta, genome_gff
+
 
 def filter_genic_positions(filtered_positions: Set[int], seq_context: SeqContext) -> Dict[str, List[int]]:
     """
@@ -438,8 +446,9 @@ def filter_genic_positions(filtered_positions: Set[int], seq_context: SeqContext
     
     return genic_positions
 
-def process_line(line, depth_threshold, seq_context):
-    """Modified to return filtered positions with reasons"""
+
+def process_line(line, depth_threshold, seq_context, keep_low_alt=False):
+    """Modified to optionally retain low-alt sites (1-2 alt reads) that pass other filters."""
     fields = line.strip().split('\t')
     if len(fields) < 6:
         return None, (set(), set(), set()), None  # (depth_filtered, n_filtered, bias_filtered)
@@ -461,8 +470,22 @@ def process_line(line, depth_threshold, seq_context):
         return None, (set(), set(), set()), None
 
     if alt_base_count < 3:
-        n_filtered = set([pos])
-        return None, (set(), n_filtered, set()), None
+        if not keep_low_alt:
+            n_filtered = set([pos])
+            return None, (set(), n_filtered, set()), None
+        # Evaluate remaining filters and keep if pass (as non-mutation)
+        # N contamination filter
+        if base_counts['N'] > alt_base_count * 10:
+            n_filtered = set([pos])
+            return None, (set(), n_filtered, set()), None
+        # Position bias test
+        pvalue, statistic = analyze_read_position_bias(reads, alt)
+        if (pvalue == -1 and statistic == -1) or (statistic < 0.25 and pvalue > 0.01):
+            # Keep in filtered output, but no mutation_type
+            return (chrom, pos, ref, fields[3], reads, fields[5], None), (set(), set(), set()), None
+        else:
+            bias_filtered = set([pos])
+            return None, (set(), set(), bias_filtered), None
     
     # Initialize filter sets
     depth_filtered = set()
@@ -502,6 +525,7 @@ def process_line(line, depth_threshold, seq_context):
     else:
         bias_filtered.add(pos)
         return None, (depth_filtered, n_filtered, bias_filtered), measurement
+
 
 def analyze_high_n_ratios(sample_data, output_dir):
     """
@@ -589,7 +613,8 @@ def analyze_high_n_ratios(sample_data, output_dir):
     
     return stats
 
-def main(mpileup_dir, output_dir, config_path):
+
+def main(mpileup_dir, output_dir, config_path, keep_low_alt=False):
     """
     Process all mpileup files in a directory and detect sequence bias.
     
@@ -597,6 +622,7 @@ def main(mpileup_dir, output_dir, config_path):
         mpileup_dir (str): Path to directory containing mpileup files
         output_dir (str): Path to output directory
         config_path (str): Path to configuration file
+        keep_low_alt (bool): If True, keep sites with 1-2 alt reads that pass other filters in filtered output
     """
     # Load genome paths from config
     genome_fasta, genome_gff = load_config(config_path)
@@ -641,7 +667,7 @@ def main(mpileup_dir, output_dir, config_path):
             with Pool(cpu_count()) as pool:
                 results = pool.starmap(
                     process_line,
-                    [(line, depth_threshold, seq_context) for line in lines]
+                    [(line, depth_threshold, seq_context, keep_low_alt) for line in lines]
                 )
             
             # Counter for lines with mutations written to output
@@ -711,6 +737,7 @@ if __name__ == "__main__":
     parser.add_argument('mpileup_dir', help='Path to directory containing mpileup files')
     parser.add_argument('output_dir', help='Path to output directory')
     parser.add_argument('config_path', help='Path to configuration file')
+    parser.add_argument('--keep-low-alt', action='store_true', help='Keep sites with 1-2 alt reads that pass other filters in filtered output')
     args = parser.parse_args()
     
-    main(args.mpileup_dir, args.output_dir, args.config_path)
+    main(args.mpileup_dir, args.output_dir, args.config_path, keep_low_alt=args.keep_low_alt)

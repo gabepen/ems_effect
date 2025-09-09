@@ -19,6 +19,7 @@ import matplotlib.gridspec as gridspec
 from scipy.stats import percentileofscore
 import ast
 from modules import parse
+from matplotlib.ticker import ScalarFormatter
 
 
 def load_gene_info_cache(cache_file: str) -> Dict[str, Dict]:
@@ -208,6 +209,29 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int], output_d
                 pvalue_nonsyn_more = n_more / len(perm_non_syn)
                 pvalue_nonsyn_less = n_less / len(perm_non_syn)
             
+            # Derive syn_muts if present; else compute from total - non_syn if available
+            obs_syn = values.get('mutation_stats', {}).get('syn_muts', np.nan)
+            if (isinstance(obs_syn, (int, float)) and np.isnan(obs_syn)) and isinstance(obs_non_syn, (int, float)) and isinstance(tm, (int, float)):
+                obs_syn = (tm - obs_non_syn) if (tm is not None and obs_non_syn is not None) else np.nan
+            # dN/dS per gene when syn > 0
+            dn_ds = (obs_non_syn / obs_syn) if isinstance(obs_non_syn, (int, float)) and isinstance(obs_syn, (int, float)) and obs_syn not in (0, 0.0) else np.nan
+            # dN/dS permutation-based p-values from perm_non and perm_total
+            pvalue_dnds_more = None
+            pvalue_dnds_less = None
+            perm_total = values['permutation'].get('total_mutations', None)
+            if perm_non_syn and perm_total and len(perm_non_syn) == len(perm_total) and len(perm_non_syn) > 10 and isinstance(dn_ds, (int, float)) and not np.isnan(dn_ds):
+                _non = np.array(perm_non_syn, dtype=float)
+                _tot = np.array(perm_total, dtype=float)
+                _syn = _tot - _non
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    _dn = np.divide(_non, _syn)
+                _dn = _dn[np.isfinite(_dn)]
+                if _dn.size > 10:
+                    n_more = int(np.sum(_dn > dn_ds))
+                    n_less = int(np.sum(_dn < dn_ds))
+                    pvalue_dnds_more = n_more / _dn.size
+                    pvalue_dnds_less = n_less / _dn.size
+
             row = {
                 'gene_id': gene_id,
                 'effect_score': effect_score,
@@ -217,6 +241,8 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int], output_d
                 'pvalue_ratio_less': pvalue_ratio_less,
                 'pvalue_nonsyn_more': pvalue_nonsyn_more,
                 'pvalue_nonsyn_less': pvalue_nonsyn_less,
+                'pvalue_dnds_more': pvalue_dnds_more,
+                'pvalue_dnds_less': pvalue_dnds_less,
                 'permutation_mean': values['permutation'].get('mean', 0),
                 'permutation_std': values['permutation'].get('std', 0),
                 'n_permutations': len(perm_scores),
@@ -224,6 +250,8 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int], output_d
                 'total_mutations': tm,
                 'deleterious_ratio': deleterious_ratio,
                 'non_syn_muts': obs_non_syn,
+                'syn_muts': obs_syn,
+                'dn_ds': dn_ds,
                 'avg_cov': gene_coverage.get(gene_id, 0)  # Use average coverage from gene statistics
             }
             rows.append(row)
@@ -258,6 +286,16 @@ def load_sample_results(results_dir: str, gene_lengths: Dict[str, int], output_d
         valid_ns_less = df['pvalue_nonsyn_less'].notna()
         if valid_ns_less.any():
             df.loc[valid_ns_less, 'pvalue_nonsyn_less_fdr'] = multipletests(df.loc[valid_ns_less, 'pvalue_nonsyn_less'], method='fdr_bh')[1]
+        
+        # New: dN/dS FDR corrections
+        if 'pvalue_dnds_more' in df.columns:
+            valid_dnds_more = df['pvalue_dnds_more'].notna()
+            if valid_dnds_more.any():
+                df.loc[valid_dnds_more, 'pvalue_dnds_more_fdr'] = multipletests(df.loc[valid_dnds_more, 'pvalue_dnds_more'], method='fdr_bh')[1]
+        if 'pvalue_dnds_less' in df.columns:
+            valid_dnds_less = df['pvalue_dnds_less'].notna()
+            if valid_dnds_less.any():
+                df.loc[valid_dnds_less, 'pvalue_dnds_less_fdr'] = multipletests(df.loc[valid_dnds_less, 'pvalue_dnds_less'], method='fdr_bh')[1]
         
         sample_dfs[sample] = df
         
@@ -408,6 +446,9 @@ def analyze_sample(df: pd.DataFrame, sample: str, output_dir: str, cache_file: s
     
             # Add method comparison
         # compare_scoring_methods(df, gene_lengths, sample, sample_dir)  # COMMENTED OUT FOR NOW
+    
+    # New mirrored metric plots
+    plot_gene_metrics_vs_length(df, gene_lengths, sample, sample_dir)
     
     # Create significant genes summary
     create_significant_genes_summary(df, sample, sample_dir, cache_file, gene_strands)
@@ -577,36 +618,83 @@ def analyze_shared_genes(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, g
 
 def plot_effect_relationships(df: pd.DataFrame, gene_lengths: Dict[str, int], sample: str, output_dir: str) -> None:
     """Create plots showing relationships between effect score and gene properties."""
-    plt.figure(figsize=(10, 8))
-    
     # Define significance using FDR corrected p-values
     deleterious = (df['pvalue_more_fdr'] < 0.05)
     protective = (df['pvalue_less_fdr'] < 0.05)
     nonsig = ~(deleterious | protective)
-    
+
     # Get gene lengths for plotting
     gene_lens = df['gene_id'].map(lambda x: gene_lengths.get(x, 1))
-    
-    # Plot: Gene Length vs Effect Score
-    plt.scatter(gene_lens[nonsig], 
-                df[nonsig]['effect_score'],
-                alpha=0.3, color='grey', label='Non-significant')
-    plt.scatter(gene_lens[deleterious],
-                df[deleterious]['effect_score'],
-                alpha=0.7, color='red', label='Deleterious')
-    plt.scatter(gene_lens[protective],
-                df[protective]['effect_score'],
-                alpha=0.7, color='blue', label='Protective')
-    
-    plt.xlabel('Gene Length (bp)')
-    plt.ylabel('Effect Score')
-    plt.legend()
-    
-    plt.title(f'Effect Score vs Gene Length - {sample}')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'{sample}_effect_relationships.png'), 
-                dpi=300, bbox_inches='tight')
-    plt.close()
+
+    # Fixed bounds and single-axis with outlier markers
+    x_min = 75
+    x_max = 8000.0
+    y_main_low, y_main_high = -700.0, 10.0
+
+    # Masks
+    within = (gene_lens >= x_min) & (gene_lens <= x_max) & \
+             (df['effect_score'] >= y_main_low) & (df['effect_score'] <= y_main_high)
+    below = (gene_lens >= x_min) & (gene_lens <= x_max) & (df['effect_score'] < y_main_low)
+    above = (gene_lens >= x_min) & (gene_lens <= x_max) & (df['effect_score'] > y_main_high)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Inliers
+    ax.scatter(gene_lens[nonsig & within], df[nonsig & within]['effect_score'],
+               alpha=0.3, color='grey', label='Non-significant')
+    ax.scatter(gene_lens[deleterious & within], df[deleterious & within]['effect_score'],
+               alpha=0.7, color='darkorange', label='Deleterious')
+    ax.scatter(gene_lens[protective & within], df[protective & within]['effect_score'],
+               alpha=0.7, color='blue', label='Neutral/Protective')
+
+    # Outlier markers aggregated by x-bins and offset from bounds for readability
+    pad = 0.03 * (y_main_high - y_main_low)
+    bins = np.logspace(np.log10(x_min), np.log10(x_max), 25)
+    centers = np.sqrt(bins[:-1] * bins[1:])
+    # Below-range aggregated markers
+    if below.any():
+        counts_below, _ = np.histogram(gene_lens[below], bins=bins)
+        mask = counts_below > 0
+        sizes = 20 + 18 * np.sqrt(counts_below[mask])
+        ax.scatter(centers[mask], np.full(mask.sum(), y_main_low + pad),
+                   marker='v', s=sizes, facecolors='none', edgecolors='black', linewidths=0.6,
+                   alpha=0.9, label='Below range', zorder=5)
+    # Above-range aggregated markers
+    if above.any():
+        counts_above, _ = np.histogram(gene_lens[above], bins=bins)
+        mask = counts_above > 0
+        sizes = 20 + 18 * np.sqrt(counts_above[mask])
+        ax.scatter(centers[mask], np.full(mask.sum(), y_main_high - pad),
+                   marker='^', s=sizes, facecolors='none', edgecolors='black', linewidths=0.6,
+                   alpha=0.9, label='Above range', zorder=5)
+
+    # Annotate counts
+    n_below = int(below.sum())
+    n_above = int(above.sum())
+    if n_below:
+        ax.text(0.99, 0.02, f"{n_below} below", transform=ax.transAxes, fontsize=12,
+                va='bottom', ha='right', color='black')
+    if n_above:
+        ax.text(0.01, 0.98, f"{n_above} above", transform=ax.transAxes, fontsize=12,
+                va='top', ha='left', color='black')
+
+    ax.set_xlabel('Gene Length (bp)', fontsize=16)
+    ax.set_ylabel('Effect Score', fontsize=16)
+    ax.set_xscale('log')
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_main_low, y_main_high)
+    # Force non-scientific tick labels on log axis
+    ax.xaxis.set_major_formatter(ScalarFormatter())
+    ax.ticklabel_format(axis='x', style='plain')
+    ax.tick_params(axis='both', which='major', labelsize=14)
+
+    # Move larger legend into bottom-left where whitespace is available
+    ax.legend(loc='lower left', frameon=True, fontsize=13, fancybox=True, framealpha=0.85, borderpad=0.7)
+
+    ax.set_title('Effect Score vs Gene Length - Treated', fontsize=18)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f'{sample}_effect_relationships.png'), dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 def create_significance_counts(sample_dfs: Dict[str, pd.DataFrame], output_dir: str, cache_file: str = None) -> None:
     """Create table showing how many treated/control samples each gene is significant in."""
@@ -1631,12 +1719,24 @@ def perform_dn_ds_analysis(results_dir: str, output_dir: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def load_group(name: str) -> dict:
-        fp = results_path / f'permuted_provean_results_{name}.json'
-        if not fp.exists():
-            print(f"Warning: pooled results not found for {name} at {fp}")
-            return None
-        with open(fp) as f:
-            return json.load(f)
+        # Try exact filename first
+        exact = results_path / f'permuted_provean_results_{name}.json'
+        if exact.exists():
+            with open(exact) as f:
+                print(f"Using pooled file: {exact}")
+                return json.load(f)
+        # Tag-based fallback within results_path
+        tags = ['treated', 'ems'] if name == 'treated' else ['control', 'controls', 'nt']
+        files = list(results_path.glob('*.json'))
+        candidates = [p for p in files if any(t in p.name.lower() for t in tags)]
+        if candidates:
+            preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+            fp = preferred[0] if preferred else candidates[0]
+            with open(fp) as f:
+                print(f"Using pooled file (tag match): {fp}")
+                return json.load(f)
+        print(f"Warning: pooled results not found for {name} in {results_path}")
+        return None
 
     def summarize_group(group_data: dict, label: str) -> pd.DataFrame:
         rows = []
@@ -1794,12 +1894,24 @@ def perform_simple_counts_analysis(results_dir: str, output_dir: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def load_group(name: str) -> dict:
-        fp = results_path / f'permuted_provean_results_{name}.json'
-        if not fp.exists():
-            print(f"Warning: pooled results not found for {name} at {fp}")
-            return None
-        with open(fp) as f:
-            return json.load(f)
+        # Try exact filename first
+        exact = results_path / f'permuted_provean_results_{name}.json'
+        if exact.exists():
+            with open(exact) as f:
+                print(f"Using pooled file: {exact}")
+                return json.load(f)
+        # Tag-based fallback
+        tags = ['treated', 'ems'] if name == 'treated' else ['control', 'controls', 'nt']
+        files = list(results_path.glob('*.json'))
+        candidates = [p for p in files if any(t in p.name.lower() for t in tags)]
+        if candidates:
+            preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+            fp = preferred[0] if preferred else candidates[0]
+            with open(fp) as f:
+                print(f"Using pooled file (tag match): {fp}")
+                return json.load(f)
+        print(f"Warning: pooled results not found for {name} in {results_path}")
+        return None
 
     def summarize_counts(group_data: dict, label: str) -> pd.DataFrame:
         rows = []
@@ -2050,6 +2162,1067 @@ def verify_site_level_consistency(results_dir: str, output_dir: str) -> None:
 		df.to_csv(csv_path, index=False)
 		print(f"Wrote: {csv_path}")
 
+def compute_global_dn_ds(results_dir: str, output_dir: str) -> None:
+    """Compute genome-wide dN/dS for observed vs permuted (controls and treated),
+    writing summary CSV and histograms similar to non-syn fraction plots.
+    """
+    results_path = Path(results_dir)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def pad_and_add(acc: List[float], arr: List[float]) -> List[float]:
+        a = np.array(acc, dtype=float)
+        b = np.array(arr, dtype=float)
+        if a.size == 0:
+            return b.tolist()
+        if b.size == 0:
+            return a.tolist()
+        if a.size < b.size:
+            a = np.pad(a, (0, b.size - a.size))
+        elif b.size < a.size:
+            b = np.pad(b, (0, a.size - b.size))
+        return (a + b).tolist()
+
+    # Find pooled results
+    ctrl_fp = results_path / 'permuted_provean_results_controls.json'
+    treat_fp = results_path / 'permuted_provean_results_treated.json'
+
+    def load_group(fp: Path, group_name: str) -> Dict[str, Any]:
+        if fp.exists():
+            with open(fp) as f:
+                print(f"Using pooled file: {fp}")
+                return json.load(f)
+        # Tag-based fallback
+        tags = ['treated', 'ems'] if group_name == 'treated' else ['control', 'controls', 'nt']
+        files = list(results_path.glob('*.json'))
+        candidates = [p for p in files if any(t in p.name.lower() for t in tags)]
+        if candidates:
+            preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+            pick = preferred[0] if preferred else candidates[0]
+            with open(pick) as f:
+                print(f"Using pooled file (tag match): {pick}")
+                return json.load(f)
+        print(f"Warning: pooled results not found for {group_name} in {results_path}")
+        return {}
+
+    def summarize(group: Dict[str, Any]) -> Dict[str, Any]:
+        if not group:
+            return {}
+        # Observed totals
+        obs_non = 0
+        obs_syn = 0
+        # Permutation sums per-permutation index
+        perm_non_sums: List[float] = []
+        perm_syn_sums: List[float] = []
+        perm_tot_sums: List[float] = []  # fallback if syn_counts missing
+        for _, vals in group.items():
+            ms = vals.get('mutation_stats', {})
+            obs_non += (ms.get('non_syn_muts', 0) or 0)
+            obs_syn += (ms.get('syn_muts', 0) or 0)
+            perm = vals.get('permutation', {})
+            perm_non = perm.get('non_syn_counts', []) or []
+            perm_syn = perm.get('syn_counts', []) or []
+            perm_tot = perm.get('total_mutations', []) or []
+            perm_non_sums = pad_and_add(perm_non_sums, perm_non)
+            # Prefer explicit syn_counts; else derive from total - non
+            if perm_syn:
+                perm_syn_sums = pad_and_add(perm_syn_sums, perm_syn)
+            elif perm_tot:
+                perm_tot_sums = pad_and_add(perm_tot_sums, perm_tot)
+        # If syn not directly summed, derive from totals - non
+        if (not perm_syn_sums) and perm_tot_sums:
+            a = np.array(perm_tot_sums, dtype=float)
+            b = np.array(perm_non_sums, dtype=float)
+            if b.size < a.size:
+                b = np.pad(b, (0, a.size - b.size))
+            elif a.size < b.size:
+                a = np.pad(a, (0, b.size - a.size))
+            perm_syn_sums = (a - b).tolist()
+        # Compute ratios
+        obs_dn_ds = (obs_non / obs_syn) if obs_syn not in (0, 0.0) else np.nan
+        perm_dn_ds = []
+        if perm_non_sums and perm_syn_sums:
+            non = np.array(perm_non_sums, dtype=float)
+            syn = np.array(perm_syn_sums, dtype=float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                r = np.where(syn > 0, non / syn, np.nan)
+            perm_dn_ds = r[~np.isnan(r)].tolist()
+        return {
+            'observed_dn_ds': obs_dn_ds,
+            'permuted_dn_ds': perm_dn_ds
+        }
+
+    ctrl = load_group(ctrl_fp, 'controls')
+    treat = load_group(treat_fp, 'treated')
+    ctrl_summary = summarize(ctrl)
+    treat_summary = summarize(treat)
+
+    # Save summary + plots
+    rows = []
+    for label, summ in [('controls', ctrl_summary), ('treated', treat_summary)]:
+        if not summ:
+            continue
+        perm_vec = np.array(summ.get('permuted_dn_ds', []), dtype=float)
+        perm_vec = perm_vec[~np.isnan(perm_vec)] if perm_vec.size else perm_vec
+        row = {
+            'group': label,
+            'observed_dn_ds': float(summ.get('observed_dn_ds')) if summ.get('observed_dn_ds') is not None and not np.isnan(summ.get('observed_dn_ds')) else np.nan,
+            'permuted_mean': float(np.nanmean(perm_vec)) if perm_vec.size else np.nan,
+            'permuted_sd': float(np.nanstd(perm_vec)) if perm_vec.size else np.nan,
+            'permuted_q05': float(np.nanpercentile(perm_vec, 5)) if perm_vec.size else np.nan,
+            'permuted_q50': float(np.nanpercentile(perm_vec, 50)) if perm_vec.size else np.nan,
+            'permuted_q95': float(np.nanpercentile(perm_vec, 95)) if perm_vec.size else np.nan,
+        }
+        rows.append(row)
+        if perm_vec.size:
+            plt.figure(figsize=(6, 4))
+            plt.hist(perm_vec, bins=40, color='lightgrey', edgecolor='k')
+            if not np.isnan(row['observed_dn_ds']):
+                plt.axvline(row['observed_dn_ds'], color='red', linestyle='--', label='Observed')
+            plt.xlabel('Genome-wide dN/dS')
+            plt.ylabel('Count')
+            plt.title(f'Permuted vs Observed dN/dS ({label})')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(out_dir / f'dn_ds_{label}.png', dpi=300, bbox_inches='tight')
+            plt.close()
+    if rows:
+        pd.DataFrame(rows).to_csv(out_dir / 'dn_ds_summary.csv', index=False)
+        print(f"dN/dS summary written: {out_dir / 'dn_ds_summary.csv'}")
+
+
+def plot_per_gene_dn_ds_histograms(results_dir: str, output_dir: str, max_genes_per_group: int = 50, min_perm: int = 20) -> None:
+    """For each group, plot per-gene permutation dN/dS histograms with observed marker
+    for up to max_genes_per_group genes (prioritized by observed total mutations).
+    """
+    results_path = Path(results_dir)
+    out_dir = Path(output_dir) / 'per_gene_dn_ds'
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def load_group(name: str) -> dict:
+        # Try exact filename first
+        exact = results_path / f'permuted_provean_results_{name}.json'
+        if not exact.exists():
+            tags = ['treated', 'ems'] if name == 'treated' else ['control', 'controls', 'nt']
+            files = list(results_path.glob('*.json'))
+            candidates = [p for p in files if any(t in p.name.lower() for t in tags)]
+            if candidates:
+                preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+                exact = preferred[0] if preferred else candidates[0]
+        if not exact.exists():
+            print(f"Warning: pooled results not found for {name} in {results_path}")
+            return {}
+        with open(exact) as f:
+            print(f"Using pooled file: {exact}")
+            return json.load(f)
+
+    def per_gene_dn_ds(group_data: dict) -> pd.DataFrame:
+        rows = []
+        for gene_id, vals in group_data.items():
+            ms = vals.get('mutation_stats', {})
+            obs_non = ms.get('non_syn_muts', 0) or 0
+            obs_syn = ms.get('syn_muts', 0) or 0
+            obs_dn_ds = (obs_non / obs_syn) if obs_syn not in (0, 0.0) else np.nan
+            perm = vals.get('permutation', {})
+            perm_non = np.array(perm.get('non_syn_counts', []), dtype=float)
+            perm_tot = np.array(perm.get('total_mutations', []), dtype=float)
+            if 'syn_counts' in perm:
+                perm_syn = np.array(perm.get('syn_counts', []), dtype=float)
+            else:
+                perm_syn = perm_tot - perm_non if perm_non.size and perm_tot.size else np.array([])
+            mask = (perm_syn > 0) if perm_syn.size else np.array([], dtype=bool)
+            dn_ds_vec = (perm_non[mask] / perm_syn[mask]) if mask.size else np.array([])
+            rows.append({
+                'gene_id': gene_id,
+                'obs_total': obs_non + obs_syn,
+                'obs_dn_ds': float(obs_dn_ds) if not np.isnan(obs_dn_ds) else np.nan,
+                'perm_dn_ds': dn_ds_vec
+            })
+        df = pd.DataFrame(rows)
+        return df
+
+    for label in ['controls', 'treated']:
+        data = load_group(label)
+        if not data:
+            continue
+        df = per_gene_dn_ds(data)
+        # Filter genes with enough permutation support
+        df = df[df['perm_dn_ds'].apply(lambda a: isinstance(a, np.ndarray) and a.size >= min_perm)]
+        if df.empty:
+            continue
+        # Take top genes by observed totals
+        df = df.sort_values('obs_total', ascending=False).head(max_genes_per_group)
+        for _, row in df.iterrows():
+            gene_id = row['gene_id']
+            perm_vec = row['perm_dn_ds']
+            obs = row['obs_dn_ds']
+            if perm_vec.size == 0:
+                continue
+            plt.figure(figsize=(6, 4))
+            plt.hist(perm_vec, bins=40, color='lightgrey', edgecolor='k')
+            if not (obs is None or np.isnan(obs)):
+                plt.axvline(obs, color='red', linestyle='--', label='Observed')
+            plt.xlabel('Per-gene dN/dS')
+            plt.ylabel('Count')
+            plt.title(f'{gene_id} dN/dS ({label})')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(out_dir / f'{gene_id}_dn_ds_{label}.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
+def plot_per_gene_dn_ds_vs_deleterious_ratio(results_dir: str, output_dir: str) -> None:
+    """Create per-gene scatter comparing observed dN/dS to observed deleterious ratio,
+    overlaid against permutation mean expectations for both controls and treated.
+
+    Outputs per group:
+      - per_gene_dn_ds_vs_delratio_{group}.png
+      - per_gene_dn_ds_vs_delratio_{group}.csv
+    """
+    results_path = Path(results_dir)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def load_group(name: str) -> dict:
+        exact = results_path / f'permuted_provean_results_{name}.json'
+        if not exact.exists():
+            tags = ['treated', 'ems'] if name == 'treated' else ['control', 'controls', 'nt']
+            files = list(results_path.glob('*.json'))
+            candidates = [p for p in files if any(t in p.name.lower() for t in tags)]
+            if candidates:
+                preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+                exact = preferred[0] if preferred else candidates[0]
+        if not exact.exists():
+            print(f"Warning: pooled results not found for {name} in {results_path}")
+            return {}
+        with open(exact) as f:
+            print(f"Using pooled file: {exact}")
+            return json.load(f)
+
+    def summarize_group(group_data: dict) -> pd.DataFrame:
+        rows = []
+        for gene_id, vals in group_data.items():
+            ms = vals.get('mutation_stats', {})
+            obs_non = ms.get('non_syn_muts', 0) or 0
+            obs_syn = ms.get('syn_muts', 0) or 0
+            obs_tot = obs_non + obs_syn
+            obs_dn_ds = (obs_non / obs_syn) if obs_syn not in (0, 0.0) else np.nan
+            obs_del_ratio = (obs_non / obs_tot) if obs_tot not in (0, 0.0) else np.nan
+            perm = vals.get('permutation', {})
+            perm_non = np.array(perm.get('non_syn_counts', []), dtype=float)
+            if 'syn_counts' in perm:
+                perm_syn = np.array(perm.get('syn_counts', []), dtype=float)
+            else:
+                perm_tot = np.array(perm.get('total_mutations', []), dtype=float)
+                perm_syn = perm_tot - perm_non if perm_non.size and perm_tot.size else np.array([])
+            # Compute per-permutation ratios
+            if perm_non.size and perm_syn.size:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    perm_dn_ds_vec = np.where(perm_syn > 0, perm_non / perm_syn, np.nan)
+                    perm_del_ratio_vec = np.where((perm_non + perm_syn) > 0, perm_non / (perm_non + perm_syn), np.nan)
+                perm_mean_dn_ds = float(np.nanmean(perm_dn_ds_vec)) if np.any(~np.isnan(perm_dn_ds_vec)) else np.nan
+                perm_mean_del_ratio = float(np.nanmean(perm_del_ratio_vec)) if np.any(~np.isnan(perm_del_ratio_vec)) else np.nan
+                n_perm = int(len(perm_dn_ds_vec))
+            else:
+                perm_mean_dn_ds = np.nan
+                perm_mean_del_ratio = np.nan
+                n_perm = 0
+            rows.append({
+                'gene_id': gene_id,
+                'obs_non': obs_non,
+                'obs_syn': obs_syn,
+                'obs_total': obs_tot,
+                'obs_dn_ds': obs_dn_ds,
+                'obs_del_ratio': obs_del_ratio,
+                'perm_mean_dn_ds': perm_mean_dn_ds,
+                'perm_mean_del_ratio': perm_mean_del_ratio,
+                'n_perms': n_perm
+            })
+        df = pd.DataFrame(rows)
+        return df
+
+    for label in ['controls', 'treated']:
+        data = load_group(label)
+        if not data:
+            continue
+        df = summarize_group(data)
+        if df.empty:
+            continue
+        # Save CSV
+        csv_path = out_dir / f'per_gene_dn_ds_vs_delratio_{label}.csv'
+        df.to_csv(csv_path, index=False)
+        # Plot: overlay permutation means (grey) and observed (colored by delta dN/dS)
+        plt.figure(figsize=(8, 6))
+        # Reference expectation cloud
+        ref_df = df.dropna(subset=['perm_mean_del_ratio', 'perm_mean_dn_ds'])
+        if not ref_df.empty:
+            plt.scatter(ref_df['perm_mean_del_ratio'], ref_df['perm_mean_dn_ds'],
+                        color='lightgrey', alpha=0.6, s=12, label='Permutation mean (per gene)')
+        # Observed, colored by delta
+        obs_df = df.dropna(subset=['obs_del_ratio', 'obs_dn_ds'])
+        if not obs_df.empty:
+            delta = obs_df['obs_dn_ds'] - obs_df['perm_mean_dn_ds']
+            sc = plt.scatter(obs_df['obs_del_ratio'], obs_df['obs_dn_ds'],
+                             c=delta, cmap='coolwarm', alpha=0.7, s=14, edgecolors='none')
+            cbar = plt.colorbar(sc)
+            cbar.set_label('Δ dN/dS (obs - perm mean)')
+        plt.xlabel('Observed deleterious ratio (non_syn / total)')
+        plt.ylabel('Observed dN/dS (non_syn / syn)')
+        plt.title(f'Per-gene dN/dS vs deleterious ratio ({label})')
+        plt.legend(loc='best')
+        plt.tight_layout()
+        plt.savefig(out_dir / f'per_gene_dn_ds_vs_delratio_{label}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def create_dn_ds_pvalue_distribution_plots(results_dir: str, output_dir: str, min_perms: int = 10) -> None:
+    """Create distribution plots of empirical p-values for per-gene dN/dS using pooled
+    control and treated permutation outputs.
+
+    Uses non_syn and total counts per permutation (syn = total - non_syn).
+    Autodetects pooled files in results_dir by filename tags.
+    Applies observed-count filters: obs_syn >= 3 and obs_total >= 5.
+    """
+    from pathlib import Path
+
+    def pick_group_file(dir_path: Path, group: str) -> dict:
+        files = list(dir_path.glob('*.json'))
+        if not files:
+            print(f"Warning: no JSON files found in {dir_path}")
+            return {}
+        # Exact expected name first
+        exact = dir_path / f'permuted_provean_results_{group}.json'
+        if exact.exists():
+            with open(exact) as f:
+                print(f"Using pooled file: {exact}")
+                return json.load(f)
+        # Tag-based fallback
+        tag_pos = ['treated', 'ems'] if group == 'treated' else ['control', 'controls', 'nt']
+        candidates = [p for p in files if any(t in p.name.lower() for t in tag_pos)]
+        if candidates:
+            # Prefer ones starting with 'permuted_provean' to avoid per-sample
+            preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+            fp = preferred[0] if preferred else candidates[0]
+            with open(fp) as f:
+                print(f"Using pooled file (tag match): {fp}")
+                return json.load(f)
+        print(f"Warning: no pooled JSON matched tags for {group} in {dir_path}")
+        return {}
+
+    dirp = Path(results_dir)
+    controls = pick_group_file(dirp, 'controls')
+    treated = pick_group_file(dirp, 'treated')
+
+    def per_gene_pvals(group_data: dict) -> tuple[list, list]:
+        p_more_list: list[float] = []
+        p_less_list: list[float] = []
+        eps = 1e-9
+        min_obs_syn = 3
+        min_obs_total = 5
+        for _, vals in group_data.items():
+            ms = vals.get('mutation_stats', {})
+            obs_non = ms.get('non_syn_muts', None)
+            obs_tot = ms.get('total_mutations', None)
+            if obs_tot is None and (ms.get('syn_muts', None) is not None) and (obs_non is not None):
+                obs_tot = (ms.get('syn_muts') or 0) + (obs_non or 0)
+            if obs_non is None or obs_tot is None:
+                continue
+            obs_syn = max(obs_tot - obs_non, 0)
+            # Enforce observed count thresholds
+            if obs_syn < min_obs_syn or obs_tot < min_obs_total:
+                continue
+            obs_dn_ds = obs_non / max(obs_syn, eps)
+
+            perm = vals.get('permutation', {})
+            perm_non = np.array(perm.get('non_syn_counts', []), dtype=float)
+            perm_tot = np.array(perm.get('total_mutations', []), dtype=float)
+            if perm_non.size == 0 or perm_tot.size == 0:
+                continue
+            perm_syn = perm_tot - perm_non
+            with np.errstate(divide='ignore', invalid='ignore'):
+                dn_ds_vec = np.divide(perm_non, np.maximum(perm_syn, eps))
+            dn_ds_vec = dn_ds_vec[np.isfinite(dn_ds_vec)]
+            if dn_ds_vec.size < min_perms:
+                continue
+            n_more = int(np.sum(dn_ds_vec > obs_dn_ds))
+            n_less = int(np.sum(dn_ds_vec < obs_dn_ds))
+            p_more_list.append(n_more / dn_ds_vec.size)
+            p_less_list.append(n_less / dn_ds_vec.size)
+        return p_more_list, p_less_list
+
+    c_more, c_less = per_gene_pvals(controls) if controls else ([], [])
+    t_more, t_less = per_gene_pvals(treated) if treated else ([], [])
+
+    c_more_fdr = multipletests(c_more, method='fdr_bh')[1].tolist() if len(c_more) else []
+    c_less_fdr = multipletests(c_less, method='fdr_bh')[1].tolist() if len(c_less) else []
+    t_more_fdr = multipletests(t_more, method='fdr_bh')[1].tolist() if len(t_more) else []
+    t_less_fdr = multipletests(t_less, method='fdr_bh')[1].tolist() if len(t_less) else []
+
+    dist_plot_dir = os.path.join(output_dir, "distribution_plots")
+    os.makedirs(dist_plot_dir, exist_ok=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    bins = np.linspace(0, 1, 51)
+
+    axes[0, 0].hist([c_more, t_more], bins=bins, label=['Control', 'EMS Treated'],
+                    stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+    axes[0, 0].axvline(0.05, color='r', linestyle='--', alpha=0.5)
+    axes[0, 0].set_title('dN/dS p-values (more)')
+    axes[0, 0].set_xlabel('p-value')
+    axes[0, 0].set_ylabel('Count')
+
+    axes[0, 1].hist([c_less, t_less], bins=bins, label=['Control', 'EMS Treated'],
+                    stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+    axes[0, 1].axvline(0.05, color='r', linestyle='--', alpha=0.5)
+    axes[0, 1].set_title('dN/dS p-values (less)')
+    axes[0, 1].set_xlabel('p-value')
+    axes[0, 1].set_ylabel('Count')
+
+    axes[1, 0].hist([c_more_fdr, t_more_fdr], bins=bins, label=['Control', 'EMS Treated'],
+                    stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+    axes[1, 0].axvline(0.05, color='r', linestyle='--', alpha=0.5)
+    axes[1, 0].set_title('dN/dS p-values (more) - FDR corrected')
+    axes[1, 0].set_xlabel('FDR')
+    axes[1, 0].set_ylabel('Count')
+
+    axes[1, 1].hist([c_less_fdr, t_less_fdr], bins=bins, label=['Control', 'EMS Treated'],
+                    stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+    axes[1, 1].axvline(0.05, color='r', linestyle='--', alpha=0.5)
+    axes[1, 1].set_title('dN/dS p-values (less) - FDR corrected')
+    axes[1, 1].set_xlabel('FDR')
+    axes[1, 1].set_ylabel('Count')
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.04), ncol=2)
+    plt.tight_layout(rect=[0, 0.06, 1, 0.96])
+    plt.suptitle('Per-gene dN/dS empirical p-value distributions', fontsize=16)
+    plt.savefig(os.path.join(dist_plot_dir, 'dn_ds_pvalue_distributions.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    def save_panel(data_pair, title, filename, xlabel='p-value'):
+        plt.figure(figsize=(12, 6))
+        plt.hist(data_pair, bins=bins, label=['Control', 'EMS Treated'],
+                 stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+        plt.axvline(0.05, color='r', linestyle='--', alpha=0.5)
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel('Count')
+        handles, labels = plt.gca().get_legend_handles_labels()
+        plt.legend(handles, labels, loc='upper right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(dist_plot_dir, filename), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    save_panel([c_more, t_more], 'dN/dS p-values (more)', 'dn_ds_pvalues_more.png')
+    save_panel([c_less, t_less], 'dN/dS p-values (less)', 'dn_ds_pvalues_less.png')
+    save_panel([c_more_fdr, t_more_fdr], 'dN/dS FDR (more)', 'dn_ds_pvalues_more_fdr.png', xlabel='FDR')
+    save_panel([c_less_fdr, t_less_fdr], 'dN/dS FDR (less)', 'dn_ds_pvalues_less_fdr.png', xlabel='FDR')
+
+    print(f"dN/dS p-value distribution plots saved to: {dist_plot_dir}")
+
+def plot_effect_relationships_publication(df: pd.DataFrame, gene_lengths: Dict[str, int], output_dir: str) -> None:
+    """Publication-style concise plot of effect score vs gene length for treated.
+
+    - Clips axes to reduce the impact of outliers (1st–99th percentiles)
+    - Uses "Positive effect" instead of "Protective"
+    - Title: "Effect score vs gene length - treated"
+    - Log scale for gene length
+    """
+    # Significance using FDR corrected p-values
+    deleterious = (df['pvalue_more_fdr'] < 0.05)
+    positive = (df['pvalue_less_fdr'] < 0.05)
+    nonsig = ~(deleterious | positive)
+
+    # Gene lengths
+    gene_lens = df['gene_id'].map(lambda x: gene_lengths.get(x, np.nan))
+
+    # Fixed bounds and single-axis with outlier markers for publication
+    x_min = 75
+    x_max = 8000.0
+    y_main_low, y_main_high = -200.0, 10.0
+
+    # Masks
+    within = (gene_lens >= x_min) & (gene_lens <= x_max) & \
+             (df['effect_score'] >= y_main_low) & (df['effect_score'] <= y_main_high)
+    below = (gene_lens >= x_min) & (gene_lens <= x_max) & (df['effect_score'] < y_main_low)
+    above = (gene_lens >= x_min) & (gene_lens <= x_max) & (df['effect_score'] > y_main_high)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+
+    # Inliers
+    ax.scatter(gene_lens[nonsig & within], df[nonsig & within]['effect_score'], s=10,
+               color='lightgrey', alpha=0.7, label='Non-significant')
+    ax.scatter(gene_lens[deleterious & within], df[deleterious & within]['effect_score'], s=12,
+               color='darkorange', alpha=0.9, label='Deleterious (FDR<0.05)')
+    ax.scatter(gene_lens[positive & within], df[positive & within]['effect_score'], s=12,
+               color='royalblue', alpha=0.9, label='Positive effect (FDR<0.05)')
+
+    # Outliers as aggregated edge markers
+    pad = 0.03 * (y_main_high - y_main_low)
+    bins = np.logspace(np.log10(x_min), np.log10(x_max), 25)
+    centers = np.sqrt(bins[:-1] * bins[1:])
+    if below.any():
+        counts_below, _ = np.histogram(gene_lens[below], bins=bins)
+        mask = counts_below > 0
+        sizes = 18 + 16 * np.sqrt(counts_below[mask])
+        ax.scatter(centers[mask], np.full(mask.sum(), y_main_low + pad),
+                   marker='v', s=sizes, facecolors='none', edgecolors='black', linewidths=0.6,
+                   alpha=0.9, label='Below range', zorder=5)
+    if above.any():
+        counts_above, _ = np.histogram(gene_lens[above], bins=bins)
+        mask = counts_above > 0
+        sizes = 18 + 16 * np.sqrt(counts_above[mask])
+        ax.scatter(centers[mask], np.full(mask.sum(), y_main_high - pad),
+                   marker='^', s=sizes, facecolors='none', edgecolors='black', linewidths=0.6,
+                   alpha=0.9, label='Above range', zorder=5)
+
+    # Annotate counts
+    n_below = int(below.sum())
+    n_above = int(above.sum())
+    if n_below:
+        ax.text(0.99, 0.02, f"{n_below} below", transform=ax.transAxes, fontsize=10,
+                va='bottom', ha='right', color='black')
+    if n_above:
+        ax.text(0.01, 0.98, f"{n_above} above", transform=ax.transAxes, fontsize=10,
+                va='top', ha='left', color='black')
+
+    ax.set_xscale('log')
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_main_low, y_main_high)
+    ax.set_xlabel('Gene length (bp)', fontsize=14)
+    ax.set_ylabel('Effect score', fontsize=14)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    ax.legend(frameon=True, loc='lower left', fontsize=12, fancybox=True, framealpha=0.85, borderpad=0.7)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'effect_vs_gene_length_treated_publication.png'), dpi=300, bbox_inches='tight')
+    fig.savefig(os.path.join(output_dir, 'permuted_provean_EMS_effect_relationships.png'), dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+def compute_per_gene_metric_pvalues(results_dir: str, output_dir: str, metric: str, fdr_threshold: float = 0.05,
+                                   min_obs_syn: int = 3, min_obs_total: int = 5, min_perms: int = 10) -> None:
+	"""Compute per-gene empirical p-values for a metric and write significant gene lists and volcano plots.
+
+	Supported metrics:
+	  - 'dn_ds': uses observed non_syn/syn and per-permutation non_syn/syn
+	  - 'nonsyn_fraction': uses observed non_syn/total and per-permutation non_syn/total
+
+	Writes per-group CSVs with p-values and FDR, significant-only CSVs for more/less tails,
+	and volcano plots per group.
+	"""
+	results_path = Path(results_dir)
+	out_dir = Path(output_dir) / 'per_gene_significance'
+	out_dir.mkdir(parents=True, exist_ok=True)
+
+	def pick_group_file(name: str) -> dict:
+		exact = results_path / f'permuted_provean_results_{name}.json'
+		if exact.exists():
+			with open(exact) as f:
+				print(f"Using pooled file: {exact}")
+				return json.load(f)
+		tags = ['treated', 'ems'] if name == 'treated' else ['control', 'controls', 'nt']
+		files = list(results_path.glob('*.json'))
+		candidates = [p for p in files if any(t in p.name.lower() for t in tags)]
+		if candidates:
+			preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+			fp = preferred[0] if preferred else candidates[0]
+			with open(fp) as f:
+				print(f"Using pooled file (tag match): {fp}")
+				return json.load(f)
+		print(f"Warning: pooled results not found for {name} in {results_path}")
+		return {}
+
+	def per_gene_rows(group_dict: dict) -> pd.DataFrame:
+		eps = 1e-9
+		rows = []
+		for gene_id, vals in group_dict.items():
+			ms = vals.get('mutation_stats', {})
+			obs_non = float(ms.get('non_syn_muts', 0) or 0)
+			obs_syn = float(ms.get('syn_muts', 0) or 0)
+			obs_tot = float(ms.get('total_mutations', 0) or (obs_non + obs_syn))
+			# Filters on observed counts
+			if metric == 'dn_ds':
+				if obs_syn < min_obs_syn or obs_tot < min_obs_total:
+					continue
+				obs_val = obs_non / max(obs_syn, eps)
+			elif metric == 'nonsyn_fraction':
+				if obs_tot < min_obs_total:
+					continue
+				obs_val = obs_non / max(obs_tot, eps)
+			else:
+				continue
+			perm = vals.get('permutation', {})
+			perm_non = np.array(perm.get('non_syn_counts', []), dtype=float)
+			perm_tot = np.array(perm.get('total_mutations', []), dtype=float)
+			if perm_non.size == 0 or perm_tot.size == 0:
+				continue
+			if metric == 'dn_ds':
+				perm_syn = perm_tot - perm_non
+				with np.errstate(divide='ignore', invalid='ignore'):
+					perm_vals = np.divide(perm_non, np.maximum(perm_syn, eps))
+			else:
+				with np.errstate(divide='ignore', invalid='ignore'):
+					perm_vals = np.divide(perm_non, np.maximum(perm_tot, eps))
+			perm_vals = perm_vals[np.isfinite(perm_vals)]
+			if perm_vals.size < min_perms:
+				continue
+			n_more = int(np.sum(perm_vals > obs_val))
+			n_less = int(np.sum(perm_vals < obs_val))
+			p_more = n_more / perm_vals.size
+			p_less = n_less / perm_vals.size
+			rows.append({
+				'gene_id': gene_id,
+				'obs_non_syn': obs_non,
+				'obs_syn': obs_syn,
+				'obs_total': obs_tot,
+				'observed_metric': obs_val,
+				'p_more': p_more,
+				'p_less': p_less,
+				'n_perms': int(perm_vals.size)
+			})
+		return pd.DataFrame(rows)
+
+	for group in ['controls', 'treated']:
+		data = pick_group_file(group)
+		if not data:
+			continue
+		df = per_gene_rows(data)
+		if df.empty:
+			continue
+		# FDR
+		df['p_more_fdr'] = np.nan
+		df['p_less_fdr'] = np.nan
+		if df['p_more'].notna().any():
+			df.loc[df['p_more'].notna(), 'p_more_fdr'] = multipletests(df.loc[df['p_more'].notna(), 'p_more'], method='fdr_bh')[1]
+		if df['p_less'].notna().any():
+			df.loc[df['p_less'].notna(), 'p_less_fdr'] = multipletests(df.loc[df['p_less'].notna(), 'p_less'], method='fdr_bh')[1]
+		# Save full table
+		metric_tag = 'dn_ds' if metric == 'dn_ds' else 'nonsyn_fraction'
+		full_path = out_dir / f'per_gene_{metric_tag}_pvalues_{group}.csv'
+		df.to_csv(full_path, index=False)
+		print(f"Wrote: {full_path}")
+		# Significant lists
+		more_sig = df[df['p_more_fdr'] < fdr_threshold].copy()
+		less_sig = df[df['p_less_fdr'] < fdr_threshold].copy()
+		more_path = out_dir / f'per_gene_{metric_tag}_significant_more_{group}.csv'
+		less_path = out_dir / f'per_gene_{metric_tag}_significant_less_{group}.csv'
+		more_sig.to_csv(more_path, index=False)
+		less_sig.to_csv(less_path, index=False)
+		print(f"Wrote: {more_path} ({len(more_sig)})")
+		print(f"Wrote: {less_path} ({len(less_sig)})")
+		# Volcano plot
+		if not df.empty and (df['p_more_fdr'].notna().any() or df['p_less_fdr'].notna().any()):
+			plt.figure(figsize=(6,5))
+			# Two-tail display: color by tail with smaller FDR
+			tail = np.where(df['p_more_fdr'].fillna(1.0) <= df['p_less_fdr'].fillna(1.0), 'more', 'less')
+			x = df['observed_metric']
+			y = -np.log10(np.minimum(df['p_more_fdr'].fillna(1.0), df['p_less_fdr'].fillna(1.0)))
+			colors = np.where(tail == 'more', 'firebrick', 'royalblue')
+			plt.scatter(x, y, c=colors, alpha=0.6, s=12)
+			plt.axhline(-np.log10(fdr_threshold), color='k', linestyle='--', alpha=0.4)
+			xlab = 'Observed dN/dS' if metric == 'dn_ds' else 'Observed non-syn fraction'
+			title = f"Volcano: {xlab} ({group})"
+			plt.xlabel(xlab)
+			plt.ylabel('-log10(FDR)')
+			plt.title(title)
+			plt.tight_layout()
+			vp = out_dir / f'volcano_{metric_tag}_{group}.png'
+			plt.savefig(vp, dpi=300, bbox_inches='tight')
+			plt.close()
+
+
+def create_nonsyn_fraction_pvalue_distribution_plots(results_dir: str, output_dir: str, min_perms: int = 10, min_obs_total: int = 5) -> None:
+	"""Create distribution plots of empirical p-values for per-gene non-synonymous fraction.
+	Uses per-gene permutation arrays (non_syn_counts, total_mutations).
+	"""
+	dirp = Path(results_dir)
+
+	def pick_group_file(name: str) -> dict:
+		exact = dirp / f'permuted_provean_results_{name}.json'
+		if exact.exists():
+			with open(exact) as f:
+				print(f"Using pooled file: {exact}")
+				return json.load(f)
+		tags = ['treated', 'ems'] if name == 'treated' else ['control', 'controls', 'nt']
+		files = list(dirp.glob('*.json'))
+		candidates = [p for p in files if any(t in p.name.lower() for t in tags)]
+		if candidates:
+			preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+			fp = preferred[0] if preferred else candidates[0]
+			with open(fp) as f:
+				print(f"Using pooled file (tag match): {fp}")
+				return json.load(f)
+		print(f"Warning: pooled results not found for {name} in {dirp}")
+		return {}
+
+	def per_gene_pvals(group_data: dict) -> tuple[list, list]:
+		p_more_list: list[float] = []
+		p_less_list: list[float] = []
+		eps = 1e-9
+		for _, vals in group_data.items():
+			ms = vals.get('mutation_stats', {})
+			obs_non = ms.get('non_syn_muts', None)
+			obs_tot = ms.get('total_mutations', None)
+			if obs_tot is None and (ms.get('syn_muts', None) is not None) and (obs_non is not None):
+				obs_tot = (ms.get('syn_muts') or 0) + (obs_non or 0)
+			if obs_non is None or obs_tot is None:
+				continue
+			if obs_tot < min_obs_total:
+				continue
+			obs_frac = obs_non / max(obs_tot, eps)
+			perm = vals.get('permutation', {})
+			perm_non = np.array(perm.get('non_syn_counts', []), dtype=float)
+			perm_tot = np.array(perm.get('total_mutations', []), dtype=float)
+			if perm_non.size == 0 or perm_tot.size == 0:
+				continue
+			with np.errstate(divide='ignore', invalid='ignore'):
+				frac_vec = np.divide(perm_non, np.maximum(perm_tot, eps))
+			frac_vec = frac_vec[np.isfinite(frac_vec)]
+			if frac_vec.size < min_perms:
+				continue
+			n_more = int(np.sum(frac_vec > obs_frac))
+			n_less = int(np.sum(frac_vec < obs_frac))
+			p_more_list.append(n_more / frac_vec.size)
+			p_less_list.append(n_less / frac_vec.size)
+		return p_more_list, p_less_list
+
+	controls = pick_group_file('controls')
+	treated = pick_group_file('treated')
+
+	c_more, c_less = per_gene_pvals(controls) if controls else ([], [])
+	t_more, t_less = per_gene_pvals(treated) if treated else ([], [])
+
+	c_more_fdr = multipletests(c_more, method='fdr_bh')[1].tolist() if len(c_more) else []
+	c_less_fdr = multipletests(c_less, method='fdr_bh')[1].tolist() if len(c_less) else []
+	t_more_fdr = multipletests(t_more, method='fdr_bh')[1].tolist() if len(t_more) else []
+	t_less_fdr = multipletests(t_less, method='fdr_bh')[1].tolist() if len(t_less) else []
+
+	dist_plot_dir = os.path.join(output_dir, "distribution_plots")
+	os.makedirs(dist_plot_dir, exist_ok=True)
+
+	fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+	bins = np.linspace(0, 1, 51)
+
+	axes[0, 0].hist([c_more, t_more], bins=bins, label=['Control', 'EMS Treated'],
+					stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+	axes[0, 0].axvline(0.05, color='r', linestyle='--', alpha=0.5)
+	axes[0, 0].set_title('Non-syn fraction p-values (more)')
+	axes[0, 0].set_xlabel('p-value')
+	axes[0, 0].set_ylabel('Count')
+
+	axes[0, 1].hist([c_less, t_less], bins=bins, label=['Control', 'EMS Treated'],
+					stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+	axes[0, 1].axvline(0.05, color='r', linestyle='--', alpha=0.5)
+	axes[0, 1].set_title('Non-syn fraction p-values (less)')
+	axes[0, 1].set_xlabel('p-value')
+	axes[0, 1].set_ylabel('Count')
+
+	axes[1, 0].hist([c_more_fdr, t_more_fdr], bins=bins, label=['Control', 'EMS Treated'],
+					stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+	axes[1, 0].axvline(0.05, color='r', linestyle='--', alpha=0.5)
+	axes[1, 0].set_title('Non-syn fraction p-values (more) - FDR corrected')
+	axes[1, 0].set_xlabel('FDR')
+	axes[1, 0].set_ylabel('Count')
+
+	axes[1, 1].hist([c_less_fdr, t_less_fdr], bins=bins, label=['Control', 'EMS Treated'],
+					stacked=True, alpha=0.7, color=['lightgrey', 'darkorange'])
+	axes[1, 1].axvline(0.05, color='r', linestyle='--', alpha=0.5)
+	axes[1, 1].set_title('Non-syn fraction p-values (less) - FDR corrected')
+	axes[1, 1].set_xlabel('FDR')
+	axes[1, 1].set_ylabel('Count')
+
+	handles, labels = axes[0, 0].get_legend_handles_labels()
+	fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.04), ncol=2)
+	plt.tight_layout(rect=[0, 0.06, 1, 0.96])
+	plt.suptitle('Per-gene non-syn fraction empirical p-value distributions', fontsize=16)
+	plt.savefig(os.path.join(dist_plot_dir, 'nonsyn_fraction_pvalue_distributions.png'), dpi=300, bbox_inches='tight')
+	plt.close()
+
+# --- New: Synonymous sites analysis from provean_effectscore outputs ---
+
+def analyze_synonymous_sites(results_dir: str, output_dir: str, gene_lengths: Dict[str, int]) -> None:
+    """Analyze observed vs potential synonymous sites produced by provean_effectscore.
+    - Reads control/treated CSVs: *_observed_vs_potential_syn_sites.csv
+    - Adds gene length and per-kb normalization
+    - Reads expected vs observed non-syn fraction to derive expected syn fraction
+    - Writes combined tables and plots distributions (observed fraction, expected syn fraction)
+    """
+    os.makedirs(os.path.join(output_dir, 'synonymous_analysis'), exist_ok=True)
+    syn_dir = os.path.join(output_dir, 'synonymous_analysis')
+
+    def load_csv(path: str) -> pd.DataFrame:
+        if os.path.exists(path):
+            return pd.read_csv(path)
+        return pd.DataFrame()
+
+    # Observed vs potential synonymous sites (treated only)
+    treat_syn_path = os.path.join(results_dir, 'treated_observed_vs_potential_syn_sites.csv')
+    df_treat = load_csv(treat_syn_path)
+
+    if df_treat.empty:
+        print("Treated synonymous site CSV not found; skipping synonymous analysis")
+        return
+
+    # Add gene length and per-kb normalizations
+    def add_len_norm(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        df = df.copy()
+        # Robust mapping: coerce IDs to string; fallback to numeric extraction
+        df['gene_length'] = df['gene_id'].astype(str).map(gene_lengths)
+        missing = df['gene_length'].isna()
+        if missing.any():
+            gid_num = df.loc[missing, 'gene_id'].astype(str).str.extract(r'(\d+)')[0]
+            df.loc[missing, 'gene_length'] = gid_num.map(gene_lengths)
+        # Compute observed fraction if missing
+        if 'observed_fraction_of_potential_syn' not in df.columns or df['observed_fraction_of_potential_syn'].isna().all():
+            with np.errstate(divide='ignore', invalid='ignore'):
+                df['observed_fraction_of_potential_syn'] = np.where(
+                    df['potential_syn_sites'] > 0,
+                    df['observed_syn_sites'] / df['potential_syn_sites'],
+                    np.nan
+                )
+        kb = df['gene_length'] / 1000.0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            df['potential_syn_sites_per_kb'] = np.where(kb > 0, df['potential_syn_sites'] / kb, np.nan)
+            df['observed_syn_sites_per_kb'] = np.where(kb > 0, df['observed_syn_sites'] / kb, np.nan)
+        return df
+
+    df_treat = add_len_norm(df_treat)
+
+    if not df_treat.empty:
+        df_treat.to_csv(os.path.join(syn_dir, 'treated_syn_sites_len_normalized.csv'), index=False)
+
+    # Treated-only plotting of observed fraction distributions
+    if not df_treat.empty:
+        df_all = df_treat.copy()
+        df_all.to_csv(os.path.join(syn_dir, 'syn_sites_treated_only.csv'), index=False)
+
+        # Histogram of observed fraction of potential synonymous mutations (treated only)
+        plt.figure(figsize=(8, 5))
+        bins = np.linspace(0, 1, 51)
+        data_treat = df_all['observed_fraction_of_potential_syn'].dropna().values
+        plt.hist([data_treat], bins=bins, label=['EMS Treated'],
+                 stacked=True, alpha=0.8, color=['darkorange'])
+        plt.xlabel('Observed fraction of potential synonymous mutations')
+        plt.ylabel('Count')
+        plt.title('Synonymous: observed fraction of potential sites (treated)')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(syn_dir, 'observed_fraction_of_potential_syn_hist_treated.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # Scatter: gene length vs observed fraction (treated only)
+        plt.figure(figsize=(8, 6))
+        any_positive = False
+        # Filter to positive gene lengths and finite fractions
+        s = df_all[['gene_length', 'observed_fraction_of_potential_syn']].dropna()
+        s = s[s['gene_length'] > 0]
+        if not s.empty:
+            any_positive = (s['gene_length'] > 0).any()
+            plt.scatter(s['gene_length'], s['observed_fraction_of_potential_syn'],
+                        alpha=0.6, s=16, label='treated', color='darkorange')
+        if any_positive:
+            plt.xscale('log')
+        plt.xlabel('Gene length (bp)')
+        plt.ylabel('Observed fraction of potential synonymous')
+        plt.title('Synonymous fraction vs gene length (treated)')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(syn_dir, 'syn_fraction_vs_gene_length_treated.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    # Expected vs observed synonymous fractions derived from expected/observed non-syn CSVs (treated only)
+    treat_en_path = os.path.join(results_dir, 'treated_expected_vs_observed_nonsyn_fraction.csv')
+    df_treat_en = load_csv(treat_en_path)
+
+    def derive_syn(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        out = df.copy()
+        out['expected_syn_fraction'] = 1.0 - out['expected_nonsyn_fraction']
+        out['observed_syn_fraction'] = 1.0 - out['observed_nonsyn_fraction']
+        out['gene_length'] = out['gene_id'].map(gene_lengths)
+        return out
+
+    df_treat_syn = derive_syn(df_treat_en) if not df_treat_en.empty else pd.DataFrame()
+
+    if not df_treat_syn.empty:
+        df_treat_syn.to_csv(os.path.join(syn_dir, 'expected_vs_observed_syn_fraction_treated.csv'), index=False)
+
+        # Scatter + stats: expected vs observed syn fraction (treated only)
+        plt.figure(figsize=(7, 6))
+        sub = df_treat_syn.dropna(subset=['expected_syn_fraction', 'observed_syn_fraction'])
+        if not sub.empty:
+            plt.scatter(sub['expected_syn_fraction'], sub['observed_syn_fraction'],
+                        alpha=0.7, s=16, color='darkorange')
+        plt.plot([0, 1], [0, 1], 'k--', alpha=0.4)
+        plt.xlabel('Expected synonymous fraction')
+        plt.ylabel('Observed synonymous fraction')
+        plt.title('Expected vs observed synonymous fraction per gene (treated)')
+        plt.tight_layout()
+        plt.savefig(os.path.join(syn_dir, 'expected_vs_observed_syn_fraction_scatter_treated.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # Statistical comparison: Wilcoxon signed-rank (paired per gene)
+        try:
+            from scipy.stats import wilcoxon
+            if not sub.empty and len(sub) >= 5:
+                stat, pval = wilcoxon(sub['observed_syn_fraction'], sub['expected_syn_fraction'], zero_method='wilcox', alternative='two-sided', correction=False, mode='auto')
+                pd.DataFrame({
+                    'test': ['wilcoxon_signed_rank'],
+                    'n_genes': [len(sub)],
+                    'statistic': [stat],
+                    'p_value': [pval],
+                    'observed_mean': [float(np.mean(sub['observed_syn_fraction']))],
+                    'expected_mean': [float(np.mean(sub['expected_syn_fraction']))],
+                    'observed_median': [float(np.median(sub['observed_syn_fraction']))],
+                    'expected_median': [float(np.median(sub['expected_syn_fraction']))]
+                }).to_csv(os.path.join(syn_dir, 'expected_vs_observed_syn_stats_treated.csv'), index=False)
+        except Exception as e:
+            print(f"Warning: failed to compute Wilcoxon stats for treated syn fractions: {e}")
+
+        # Hist: expected syn fraction distribution (treated only)
+        plt.figure(figsize=(8, 5))
+        bins = np.linspace(0, 1, 51)
+        et = df_treat_syn['expected_syn_fraction'].dropna().values
+        plt.hist([et], bins=bins, label=['EMS Treated'],
+                 stacked=True, alpha=0.8, color=['darkorange'])
+        plt.xlabel('Expected synonymous fraction')
+        plt.ylabel('Count')
+        plt.title('Expected distribution of synonymous fraction (treated)')
+        plt.tight_layout()
+        plt.legend()
+        plt.savefig(os.path.join(syn_dir, 'expected_syn_fraction_distribution_treated.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+def plot_gene_metrics_vs_length(df: pd.DataFrame, gene_lengths: Dict[str, int], sample: str, output_dir: str) -> None:
+    """Create plots similar to effect_relationships for non-syn fraction (non_syn/total) and dN/dS (non_syn/syn)."""
+    # Prepare metrics
+    gene_lens = df['gene_id'].map(lambda x: gene_lengths.get(x, np.nan))
+    # non-syn fraction
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ns_frac = np.where(df['total_mutations'] > 0, df['non_syn_muts'] / df['total_mutations'], np.nan)
+    dn_ds = df.get('dn_ds', np.nan)
+
+    x_min = 75
+    x_max = 8000.0
+
+    def scatter_metric(y, y_label, filename, more_fdr_col=None, less_fdr_col=None):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        y_valid = pd.Series(y).astype(float)
+        within = (gene_lens >= x_min) & (gene_lens <= x_max) & np.isfinite(y_valid)
+        # Significance labeling (match style of effect plot)
+        colors = np.array(['grey'] * len(df))
+        alphas = np.array([0.3] * len(df), dtype=float)
+        labels = np.array(['Non-significant'] * len(df), dtype=object)
+        if more_fdr_col in df.columns:
+            more_sig = df[more_fdr_col] < 0.05
+            colors[more_sig] = 'darkorange'
+            alphas[more_sig] = 0.7
+            labels[more_sig] = 'More (significant)'
+        if less_fdr_col in df.columns:
+            less_sig = df[less_fdr_col] < 0.05
+            colors[less_sig] = 'royalblue'
+            alphas[less_sig] = 0.7
+            labels[less_sig] = 'Less (significant)'
+        # Plot points by mask to create legend entries
+        mask = within & (labels == 'Non-significant')
+        ax.scatter(gene_lens[mask], y_valid[mask], alpha=0.3, s=16, color='grey', label='Non-significant')
+        mask = within & (labels == 'More (significant)')
+        ax.scatter(gene_lens[mask], y_valid[mask], alpha=0.7, s=16, color='darkorange', label='More (significant)')
+        mask = within & (labels == 'Less (significant)')
+        ax.scatter(gene_lens[mask], y_valid[mask], alpha=0.7, s=16, color='royalblue', label='Less (significant)')
+        # Axes formatting
+        ax.set_xlabel('Gene Length (bp)', fontsize=16)
+        ax.set_ylabel(y_label, fontsize=16)
+        ax.set_xscale('log')
+        ax.set_xlim(x_min, x_max)
+        ax.tick_params(axis='both', which='major', labelsize=14)
+        from matplotlib.ticker import ScalarFormatter
+        ax.xaxis.set_major_formatter(ScalarFormatter())
+        ax.ticklabel_format(axis='x', style='plain')
+        # Legend bottom-left
+        ax.legend(loc='lower left', frameon=True, fontsize=13, fancybox=True, framealpha=0.85, borderpad=0.7)
+        ax.set_title(f'{y_label} vs Gene Length - Treated', fontsize=18)
+        fig.tight_layout()
+        fig.savefig(os.path.join(output_dir, f'{sample}_{filename}.png'), dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+    scatter_metric(ns_frac, 'Non-synonymous fraction (non_syn / total)', 'nonsyn_fraction_relationships', more_fdr_col='pvalue_nonsyn_more_fdr', less_fdr_col='pvalue_nonsyn_less_fdr')
+    scatter_metric(dn_ds, 'dN/dS (non_syn / syn)', 'dn_ds_relationships', more_fdr_col='pvalue_dnds_more_fdr', less_fdr_col='pvalue_dnds_less_fdr')
+
+def write_gene_perm_counts_csv(results_dir: str, output_dir: str, group: str = 'treated', n_perms: int = 100) -> None:
+    """Write a CSV with one row per gene containing observed non-syn/syn counts and
+    the first n_perms permutation non-syn and syn counts.
+
+    Columns:
+      gid, observed_nonsyn, observed_syn, perm1_non, perm1_syn, ..., perm{n}_non, perm{n}_syn
+    """
+    results_path = Path(results_dir)
+    # Pick pooled file like other helpers
+    def pick_group_file(dir_path: Path, grp: str) -> dict:
+        exact = dir_path / f'permuted_provean_results_{grp}.json'
+        if exact.exists():
+            with open(exact) as f:
+                print(f"Using pooled file: {exact}")
+                return json.load(f)
+        tags = ['treated', 'ems'] if grp == 'treated' else ['control', 'controls', 'nt']
+        files = list(dir_path.glob('*.json'))
+        candidates = [p for p in files if any(t in p.name.lower() for t in tags)]
+        if candidates:
+            preferred = [p for p in candidates if p.name.lower().startswith('permuted_provean')]
+            fp = preferred[0] if preferred else candidates[0]
+            with open(fp) as f:
+                print(f"Using pooled file (tag match): {fp}")
+                return json.load(f)
+        print(f"Warning: pooled results not found for {grp} in {dir_path}")
+        return {}
+
+    data = pick_group_file(results_path, group)
+    if not data:
+        return
+
+    rows = []
+    for gene_id, vals in data.items():
+        ms = vals.get('mutation_stats', {})
+        obs_non = ms.get('non_syn_muts', None)
+        obs_syn = ms.get('syn_muts', None)
+        if obs_syn is None:
+            tot = ms.get('total_mutations', None)
+            if tot is not None and obs_non is not None:
+                obs_syn = max(tot - obs_non, 0)
+        perm = vals.get('permutation', {})
+        non_arr = np.array(perm.get('non_syn_counts', []), dtype=float)
+        if 'syn_counts' in perm:
+            syn_arr = np.array(perm.get('syn_counts', []), dtype=float)
+        else:
+            tot_arr = np.array(perm.get('total_mutations', []), dtype=float)
+            syn_arr = tot_arr - non_arr if tot_arr.size else np.array([])
+        # Ensure same length
+        L = min(len(non_arr), len(syn_arr), n_perms)
+        # Build row dict
+        row = {
+            'gid': gene_id,
+            'observed_nonsyn': obs_non if obs_non is not None else np.nan,
+            'observed_syn': obs_syn if obs_syn is not None else np.nan
+        }
+        for i in range(L):
+            row[f'perm{i+1}_non'] = float(non_arr[i])
+            row[f'perm{i+1}_syn'] = float(syn_arr[i])
+        # Pad missing perms up to n_perms with NaN columns to keep header consistent
+        for i in range(L+1, n_perms+1):
+            row[f'perm{i}_non'] = np.nan
+            row[f'perm{i}_syn'] = np.nan
+        rows.append(row)
+
+    if rows:
+        df = pd.DataFrame(rows)
+        # Order columns
+        cols = ['gid', 'observed_nonsyn', 'observed_syn'] + [c for i in range(1, n_perms+1) for c in (f'perm{i}_non', f'perm{i}_syn')]
+        df = df.reindex(columns=cols)
+        outp = Path(output_dir) / f'gene_perm_counts_{group}_first{n_perms}.csv'
+        df.to_csv(outp, index=False)
+        print(f"Wrote: {outp}")
+
 def main():
 	parser = argparse.ArgumentParser(description='Analyze PROVEAN score results')
 	parser.add_argument('results_dir', help='Directory containing sample results JSON files')
@@ -2124,13 +3297,30 @@ def main():
 	
 	# Create p-value distribution plots
 	create_pvalue_distribution_plots(samples_with_info, args.output_dir)
-	
+	create_dn_ds_pvalue_distribution_plots(args.results_dir, args.output_dir)
 	# New: diagnostics requested
 	compute_global_nonsyn_fractions(args.results_dir, args.output_dir)
+	compute_global_dn_ds(args.results_dir, args.output_dir)
 	perform_dn_ds_analysis(args.results_dir, args.output_dir)
 	perform_simple_counts_analysis(args.results_dir, args.output_dir)
+	plot_per_gene_dn_ds_histograms(args.results_dir, args.output_dir)
+	plot_per_gene_dn_ds_vs_deleterious_ratio(args.results_dir, args.output_dir)
 	plot_codon_position_distributions(args.results_dir, config, args.output_dir)
 	verify_site_level_consistency(args.results_dir, args.output_dir)
+	# New: per-gene significance tables and volcano plots for dn/ds and non-syn fraction
+	compute_per_gene_metric_pvalues(args.results_dir, args.output_dir, 'dn_ds')
+	compute_per_gene_metric_pvalues(args.results_dir, args.output_dir, 'nonsyn_fraction')
+	create_nonsyn_fraction_pvalue_distribution_plots(args.results_dir, args.output_dir)
+
+	# New: synonymous-sites analysis and length-normalized summaries
+	analyze_synonymous_sites(args.results_dir, args.output_dir, gene_lengths)
+	
+	# New: export per-gene observed and first-100 permutation syn/non counts (treated)
+	write_gene_perm_counts_csv(args.results_dir, args.output_dir, group='treated', n_perms=100)
+	
+	# Generate concise publication plot for treated if available
+	if 'EMS_treated' in samples_with_info:
+		plot_effect_relationships_publication(samples_with_info['EMS_treated'], gene_lengths, args.output_dir)
 	
 	print("Analysis complete!")
 
