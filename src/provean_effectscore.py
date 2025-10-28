@@ -223,80 +223,107 @@ def process_mutations(
     with open(f"{paths['results']}/genome_dnds.json", 'w') as of:
         json.dump(all_genome_stats, of, indent=2)
 
-def load_filtered_positions(sample: str, paths: Dict[str, str], mpileup_dir: str) -> Dict[str, List[int]]:
-    """Load filtered positions for a sample from JSON file.
-    
+def load_callable_positions_from_filtered(
+    sample: str,
+    mpileup_dir: str,
+    features: Dict[str, Any]
+) -> Dict[str, List[int]]:
+    """Build per-gene callable positions by complementing filtered positions.
+
+    The JSON written by preprocessing lists positions that were filtered out due to depth/N/bias.
+    We derive callable = all genic sites minus filtered sites. Positions in the input JSON are
+    already 0-based gene-relative in preprocessing; do NOT subtract 1.
+
     Args:
-        sample (str): Sample name (usually stem of nuc_muts JSON)
-        paths (Dict[str, str]): Dictionary containing output paths
-        mpileup_dir (str): Directory containing mpileup files and filtered positions
-        
+        sample: Sample name (stem of nuc_muts JSON)
+        mpileup_dir: Directory containing filtered positions JSON files
+        features: Genome features mapping gene_id -> FeatureLocation (to determine gene lengths)
+
     Returns:
-        Dict[str, List[int]]: Dictionary mapping gene IDs to 0-based relative filtered positions
+        Dict[str, List[int]] mapping gene_id -> sorted list of 0-based callable positions.
     """
-    # Support both naming schemes to avoid double "_filtered" in filenames
-    candidates = []
-    # Common expected names
-    candidates.append(os.path.join(mpileup_dir, f"{sample}_filtered_positions.json"))
-    candidates.append(os.path.join(mpileup_dir, f"{sample}_positions.json"))
-    # If sample already ends with _filtered, prefer *_positions.json and also try base without trailing _filtered
+    # Candidate names
+    candidates = [
+        os.path.join(mpileup_dir, f"{sample}_filtered_positions.json"),
+        os.path.join(mpileup_dir, f"{sample}_positions.json"),
+    ]
     if sample.endswith('_filtered'):
         base = sample[:-9]
         candidates.insert(0, os.path.join(mpileup_dir, f"{sample}_positions.json"))
         candidates.append(os.path.join(mpileup_dir, f"{base}_filtered_positions.json"))
-    for filtered_file in candidates:
-        if os.path.exists(filtered_file):
-            with open(filtered_file) as f:
-                raw_positions = json.load(f)
-            # Convert from 1-based relative to 0-based relative positions
-            corrected_positions = {}
-            for gene_id, positions in raw_positions.items():
-                corrected_positions[gene_id] = [pos - 1 for pos in positions]
-            return corrected_positions
-    return {}
+
+    filtered_positions_map = None
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            with open(candidate) as f:
+                filtered_positions_map = json.load(f)
+            break
+
+    if filtered_positions_map is None:
+        return {}
+
+    callable_map: Dict[str, List[int]] = {}
+    for gene_id, feat in features.items():
+        gene_len = feat.end - feat.start
+        if gene_len <= 0:
+            continue
+        all_pos = set(range(gene_len))
+        filtered_pos = set(filtered_positions_map.get(gene_id, []))
+        # Ensure filtered positions are valid indices
+        filtered_pos = {p for p in filtered_pos if 0 <= p < gene_len}
+        callable_pos = sorted(all_pos - filtered_pos)
+        if callable_pos:
+            callable_map[gene_id] = callable_pos
+    return callable_map
 
 # Helper: build union of callable positions per gene for a set of samples
 
-def build_union_callable_positions(sample_jsons: List[str], paths: Dict[str, str], mpileup_dir: str) -> Dict[str, set]:
-    """Given sample mutation JSON paths, load each sample's filtered positions and
-    return a dict mapping gene_id -> set of 0-based relative positions that are callable
-    in any of the samples (union)."""
+def build_union_callable_positions(
+    sample_jsons: List[str],
+    mpileup_dir: str,
+    features: Dict[str, Any]
+) -> Dict[str, set]:
+    """Union of callable positions across provided samples.
+
+    Callable positions are derived as the complement of filtered positions per sample.
+    """
     union_map: Dict[str, set] = {}
     for js in sample_jsons:
         sample_name = os.path.basename(js).replace('.json', '')
-        filtered = load_filtered_positions(sample_name, paths, mpileup_dir)
-        for gene_id, pos_list in filtered.items():
-            if gene_id not in union_map:
-                union_map[gene_id] = set()
-            union_map[gene_id].update(pos_list)
+        callable_map = load_callable_positions_from_filtered(sample_name, mpileup_dir, features)
+        for gene_id, pos_list in callable_map.items():
+            union_map.setdefault(gene_id, set()).update(pos_list)
     return union_map
 
 # New: build intersection of callable positions across samples
 
-def build_intersection_callable_positions(sample_jsons: List[str], paths: Dict[str, str], mpileup_dir: str) -> Dict[str, set]:
-    """Return gene_id -> set of 0-based positions callable in all provided samples (intersection).
-    If a gene is missing in any sample's filtered map, its intersection becomes empty and is dropped."""
+def build_intersection_callable_positions(
+    sample_jsons: List[str],
+    mpileup_dir: str,
+    features: Dict[str, Any]
+) -> Dict[str, set]:
+    """Intersection of callable positions across samples.
+
+    Callable positions are derived as the complement of filtered positions per sample.
+    Genes missing in any sample reduce the intersection accordingly.
+    """
     inter_map: Dict[str, set] = {}
     first = True
     for js in sample_jsons:
         sample_name = os.path.basename(js).replace('.json', '')
-        filtered = load_filtered_positions(sample_name, paths, mpileup_dir)
+        callable_map = load_callable_positions_from_filtered(sample_name, mpileup_dir, features)
         if first:
-            # seed with first sample's callable positions
-            inter_map = {g: set(pos_list) for g, pos_list in filtered.items()}
+            inter_map = {g: set(pos_list) for g, pos_list in callable_map.items()}
             first = False
         else:
-            # intersect existing genes; genes absent in this sample become empty
             current_genes = set(inter_map.keys())
             for gene_id in list(current_genes):
-                if gene_id in filtered:
-                    inter_map[gene_id] &= set(filtered[gene_id])
+                if gene_id in callable_map:
+                    inter_map[gene_id] &= set(callable_map[gene_id])
                 else:
                     inter_map[gene_id] = set()
-        # Early stop if everything empty
         if not any(len(s) for s in inter_map.values()):
             break
-    # Drop empty entries
     inter_map = {g: s for g, s in inter_map.items() if len(s) > 0}
     return inter_map
 
