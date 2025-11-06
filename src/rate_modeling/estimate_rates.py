@@ -284,8 +284,12 @@ def apply_alpha_correction(df, alpha):
     return df
 
 
-def estimate_rates_glm_genome_wide(df, method='poisson', use_f_clonal=False, f_clonal_regions=None, no_f_clonal=False):
-    """Fit GLM to estimate mutation rate with better uncertainty quantification."""
+def estimate_rates_glm_genome_wide(df, method='poisson', use_f_clonal=False, f_clonal_regions=None, no_f_clonal=False, use_treatment_covariate=True):
+    """Fit GLM to estimate mutation rate with better uncertainty quantification.
+    
+    If use_treatment_covariate=True (default), fits a pooled model across all samples
+    with treatment covariate. Otherwise uses per-sample models with alpha subtraction.
+    """
     df = df.copy()
     
     # Prepare data for GLM
@@ -303,6 +307,7 @@ def estimate_rates_glm_genome_wide(df, method='poisson', use_f_clonal=False, f_c
     
     y = mutation_counts[valid_mask]
     exposure = total_depths[valid_mask]
+    df_valid = df[valid_mask].copy()
     
     # Calculate detection probability if using f-clonal (and not disabled)
     if use_f_clonal and f_clonal_regions and not no_f_clonal:
@@ -312,49 +317,130 @@ def estimate_rates_glm_genome_wide(df, method='poisson', use_f_clonal=False, f_c
         # Adjust exposure by detection probability
         exposure = exposure * detection_probs
     
-    # Alpha to subtract at counts level (same alpha used in simple model)
-    alpha_for_glm = float(df['alpha_used'].iloc[0]) if 'alpha_used' in df.columns and len(df['alpha_used']) > 0 else 0.0
-
-    # Fit individual GLM for each sample
-    for i, (idx, row) in enumerate(df[valid_mask].iterrows()):
-        sample_mutations = mutation_counts[valid_mask][i]
-        sample_exposure = total_depths[valid_mask][i]
+    if use_treatment_covariate:
+        # Treatment covariate approach: fit pooled model with treatment covariate
+        # Create treatment indicator (0 for controls, 1 for treated)
+        treatment = (~df_valid['is_control']).astype(int).values
         
-        if sample_exposure > 0:
-            try:
-                # Suppress warnings for GLM fitting
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
+        # Prepare design matrix with treatment covariate
+        X = pd.DataFrame({'treatment': treatment})
+        design = sm.add_constant(X, has_constant='add')
+        offset = np.log(exposure)
+        
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                
+                if method == 'poisson':
+                    fam = sm.families.Poisson()
+                elif method == 'negative_binomial':
+                    fam = sm.families.NegativeBinomial(alpha=getattr(df, "_nb_alpha", None) or 1.0)
+                
+                model = sm.GLM(y, design, family=fam, offset=offset)
+                result = model.fit()
+                
+                # Extract coefficients
+                beta0 = result.params.get('const', np.nan)
+                beta_treatment = result.params.get('treatment', np.nan)
+                
+                # Calculate rates for each sample
+                for i, (idx, row) in enumerate(df_valid.iterrows()):
+                    is_control = row['is_control']
+                    if is_control:
+                        # Control rate: exp(beta0)
+                        rate = np.exp(beta0) if np.isfinite(beta0) else np.nan
+                        # CI for intercept
+                        ci_beta = result.conf_int().loc['const'].values if 'const' in result.conf_int().index else [np.nan, np.nan]
+                        ci = np.exp(ci_beta)
+                    else:
+                        # Treated rate: exp(beta0 + beta_treatment)
+                        if np.isfinite(beta0) and np.isfinite(beta_treatment):
+                            rate = np.exp(beta0 + beta_treatment)
+                            # CI for treated rate using delta method
+                            # Var(beta0 + beta_treatment) = Var(beta0) + Var(beta_treatment) + 2*Cov(beta0, beta_treatment)
+                            try:
+                                cov_matrix = result.cov_params()
+                                var_const = cov_matrix.loc['const', 'const'] if 'const' in cov_matrix.index else np.nan
+                                var_treat = cov_matrix.loc['treatment', 'treatment'] if 'treatment' in cov_matrix.index else np.nan
+                                cov_const_treat = cov_matrix.loc['const', 'treatment'] if 'const' in cov_matrix.index and 'treatment' in cov_matrix.columns else 0.0
+                                
+                                if np.isfinite(var_const) and np.isfinite(var_treat):
+                                    var_sum = var_const + var_treat + 2 * cov_const_treat
+                                    se_sum = np.sqrt(var_sum)
+                                    # 95% CI on log scale
+                                    log_rate = beta0 + beta_treatment
+                                    ci_low_log = log_rate - 1.96 * se_sum
+                                    ci_high_log = log_rate + 1.96 * se_sum
+                                    ci = [np.exp(ci_low_log), np.exp(ci_high_log)]
+                                else:
+                                    # Fallback: use individual CIs (less accurate)
+                                    ci_const = result.conf_int().loc['const'].values if 'const' in result.conf_int().index else [np.nan, np.nan]
+                                    ci_treat = result.conf_int().loc['treatment'].values if 'treatment' in result.conf_int().index else [np.nan, np.nan]
+                                    ci_low = np.exp(ci_const[0] + ci_treat[0])
+                                    ci_high = np.exp(ci_const[1] + ci_treat[1])
+                                    ci = [ci_low, ci_high]
+                            except Exception:
+                                # Fallback: use individual CIs
+                                ci_const = result.conf_int().loc['const'].values if 'const' in result.conf_int().index else [np.nan, np.nan]
+                                ci_treat = result.conf_int().loc['treatment'].values if 'treatment' in result.conf_int().index else [np.nan, np.nan]
+                                ci_low = np.exp(ci_const[0] + ci_treat[0])
+                                ci_high = np.exp(ci_const[1] + ci_treat[1])
+                                ci = [ci_low, ci_high]
+                        else:
+                            rate = np.nan
+                            ci = [np.nan, np.nan]
                     
-                    # Subtract background alpha at counts level
-                    sample_mutations_adj = max(0, sample_mutations - alpha_for_glm * sample_exposure)
-                    if method == 'poisson':
-                        # Poisson GLM: log(E[counts]) = log(exposure) + log(rate)
-                        model = sm.GLM([sample_mutations_adj], [1], family=sm.families.Poisson(), 
-                                      offset=[np.log(sample_exposure)])
-                        result = model.fit()
-                        rate = np.exp(result.params[0])
-                        ci = np.exp(result.conf_int()[0])
+                    df.loc[idx, 'glm_rate'] = rate
+                    df.loc[idx, 'glm_CI_low'] = ci[0]
+                    df.loc[idx, 'glm_CI_high'] = ci[1]
+        
+        except Exception as e:
+            print(f"Warning: Pooled GLM with treatment covariate failed: {e}")
+            # Fall back to per-sample approach
+            use_treatment_covariate = False
+    
+    if not use_treatment_covariate:
+        # Legacy approach: per-sample models with alpha subtraction
+        alpha_for_glm = float(df['alpha_used'].iloc[0]) if 'alpha_used' in df.columns and len(df['alpha_used']) > 0 else 0.0
+        
+        # Fit individual GLM for each sample
+        for i, (idx, row) in enumerate(df_valid.iterrows()):
+            sample_mutations = y[i]
+            sample_exposure = exposure[i]
+            
+            if sample_exposure > 0:
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
                         
-                    elif method == 'negative_binomial':
-                        # Negative binomial GLM for overdispersion
-                        model = sm.GLM([sample_mutations_adj], [1], family=sm.families.NegativeBinomial(), 
-                                      offset=[np.log(sample_exposure)])
-                        result = model.fit()
-                        rate = np.exp(result.params[0])
-                        ci = np.exp(result.conf_int()[0])
-                
-                # Fill in results for this sample
-                df.loc[idx, 'glm_rate'] = rate
-                df.loc[idx, 'glm_CI_low'] = ci[0]
-                df.loc[idx, 'glm_CI_high'] = ci[1]
-                
-            except Exception as e:
-                print(f"Warning: GLM failed for sample {row['sample']}: {e}")
-                df.loc[idx, 'glm_rate'] = np.nan
-                df.loc[idx, 'glm_CI_low'] = np.nan
-                df.loc[idx, 'glm_CI_high'] = np.nan
+                        # Subtract background alpha at counts level
+                        sample_mutations_adj = max(0, sample_mutations - alpha_for_glm * sample_exposure)
+                        if method == 'poisson':
+                            model = sm.GLM([sample_mutations_adj], [1], family=sm.families.Poisson(), 
+                                          offset=[np.log(sample_exposure)])
+                            result = model.fit()
+                            rate = np.exp(result.params[0])
+                            ci = np.exp(result.conf_int()[0])
+                            
+                        elif method == 'negative_binomial':
+                            fam = sm.families.NegativeBinomial(alpha=getattr(df, "_nb_alpha", None) or 1.0)
+                            model = sm.GLM([sample_mutations_adj], [1], family=fam, 
+                                           offset=[np.log(sample_exposure)])
+                            result = model.fit()
+                            rate = np.exp(result.params[0])
+                            ci = np.exp(result.conf_int()[0])
+                    
+                    df.loc[idx, 'glm_rate'] = rate
+                    df.loc[idx, 'glm_CI_low'] = ci[0]
+                    df.loc[idx, 'glm_CI_high'] = ci[1]
+                    
+                except Exception as e:
+                    print(f"Warning: GLM failed for sample {row['sample']}: {e}")
+                    df.loc[idx, 'glm_rate'] = np.nan
+                    df.loc[idx, 'glm_CI_low'] = np.nan
+                    df.loc[idx, 'glm_CI_high'] = np.nan
         
     # Fill invalid samples with NaN
     df.loc[~valid_mask, 'glm_rate'] = np.nan
@@ -474,8 +560,9 @@ def estimate_rates_glm_per_gene(counts_files, genomic_regions, f_clonal_regions,
                         rate = np.exp(result.params[0])
                         ci = np.exp(result.conf_int()[0])
                     elif method == 'negative_binomial':
-                        model = sm.GLM([mutations_adj], [1], family=sm.families.NegativeBinomial(), 
-                                      offset=[np.log(effective_exposure)])
+                        fam = sm.families.NegativeBinomial(alpha=getattr(result, "_nb_alpha", None) or 1.0)
+                        model = sm.GLM([mutations_adj], [1], family=fam, 
+                                       offset=[np.log(effective_exposure)])
                         result = model.fit(maxiter=50)  # Limit iterations
                         rate = np.exp(result.params[0])
                         ci = np.exp(result.conf_int()[0])
@@ -640,8 +727,9 @@ def estimate_rates_glm_by_depth(counts_files, n_bins=30, method='poisson', min_a
                             rate = np.exp(result.params[0])
                             ci = np.exp(result.conf_int()[0])
                         elif method == 'negative_binomial':
-                            model = sm.GLM([mutations_adj], [1], family=sm.families.NegativeBinomial(), 
-                                          offset=[np.log(depth)])
+                            fam = sm.families.NegativeBinomial(alpha=alpha_for_glm if hasattr(sm.families, 'NegativeBinomial') else 1.0)
+                            model = sm.GLM([mutations_adj], [1], family=fam, 
+                                           offset=[np.log(depth)])
                             result = model.fit(maxiter=50)  # Limit iterations
                             rate = np.exp(result.params[0])
                             ci = np.exp(result.conf_int()[0])
@@ -1296,6 +1384,345 @@ def save_individual_depth_glm_plots(df, output_prefix):
             print(f"Depth GLM comparison scatter plot saved to {output_prefix}_depth_glm_comparison.png")
 
 
+def create_site_level_glm_plots(df, output_prefix):
+    """Create plots for per-sample site-level GLM rates."""
+    if 'site_glm_rate' not in df.columns or df['site_glm_rate'].notna().sum() == 0:
+        print("No per-sample site-level GLM data available for plotting")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Ranking plot
+    df_sorted = df.sort_values('site_glm_rate', ascending=False)
+    colors = ['#FF7F0E' if not is_ctrl else '#1F77B4' for is_ctrl in df_sorted['is_control']]
+    ax1.barh(range(len(df_sorted)), df_sorted['site_glm_rate'], color=colors, alpha=0.7)
+    ax1.set_yticks(range(len(df_sorted)))
+    ax1.set_yticklabels(df_sorted['label'], fontsize=12)
+    ax1.set_xlabel('Per-base mutation probability (site-level GLM)', fontsize=14)
+    fmt = ScalarFormatter(useMathText=True)
+    fmt.set_scientific(True)
+    fmt.set_powerlimits((-2, 2))
+    ax1.xaxis.set_major_formatter(fmt)
+    ax1.set_title('Site-Level GLM Rate Ranking', fontsize=16)
+    ax1.invert_yaxis()
+
+    # Error bars if available
+    if 'site_glm_CI_low' in df_sorted.columns and 'site_glm_CI_high' in df_sorted.columns:
+        y_pos = range(len(df_sorted))
+        xerr_low = df_sorted['site_glm_rate'] - df_sorted['site_glm_CI_low']
+        xerr_high = df_sorted['site_glm_CI_high'] - df_sorted['site_glm_rate']
+        ax1.errorbar(df_sorted['site_glm_rate'], y_pos,
+                     xerr=[xerr_low, xerr_high], fmt='none', color='black', capsize=2, alpha=0.6)
+
+    # Comparison vs per-sample GLM if available
+    if 'glm_rate' in df.columns and df['glm_rate'].notna().any():
+        control_mask = df['is_control']
+        sample_mask = ~control_mask
+        if control_mask.any():
+            ax2.scatter(df.loc[control_mask, 'glm_rate'], df.loc[control_mask, 'site_glm_rate'],
+                        color='#1F77B4', s=100, alpha=0.7, label='Controls')
+        if sample_mask.any():
+            ax2.scatter(df.loc[sample_mask, 'glm_rate'], df.loc[sample_mask, 'site_glm_rate'],
+                        color='#FF7F0E', s=100, alpha=0.7, label='Samples')
+        ax2.set_xlabel('Per-base probability (per-sample GLM)', fontsize=14)
+        ax2.set_ylabel('Per-base probability (site-level GLM)', fontsize=14)
+        ax2.xaxis.set_major_formatter(fmt)
+        ax2.yaxis.set_major_formatter(fmt)
+        ax2.set_title('Per-Sample GLM vs Site-Level GLM', fontsize=16)
+        ax2.legend()
+    else:
+        ax2.text(0.5, 0.5, 'Per-sample GLM not available', ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title('Site-Level GLM Analysis', fontsize=16)
+
+    plt.tight_layout()
+    plot_path = f"{output_prefix}_site_glm_analysis.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Site-level GLM analysis plots saved to {plot_path}")
+
+
+def save_individual_site_level_glm_plots(df, output_prefix):
+    """Save individual ranking plot for per-sample site-level GLM rates."""
+    if 'site_glm_rate' not in df.columns or df['site_glm_rate'].notna().sum() == 0:
+        return
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    df_sorted = df.sort_values('site_glm_rate', ascending=False)
+    colors = ['#FF7F0E' if not is_ctrl else '#1F77B4' for is_ctrl in df_sorted['is_control']]
+    ax.barh(range(len(df_sorted)), df_sorted['site_glm_rate'], color=colors, alpha=0.7)
+    ax.set_yticks(range(len(df_sorted)))
+    ax.set_yticklabels(df_sorted['label'], fontsize=10)
+    ax.set_xlabel('Per-base mutation probability (site-level GLM)')
+    fmt = ScalarFormatter(useMathText=True)
+    fmt.set_scientific(True)
+    fmt.set_powerlimits((-2, 2))
+    ax.xaxis.set_major_formatter(fmt)
+    ax.set_title('Site-Level GLM Rate Ranking')
+    ax.invert_yaxis()
+    if 'site_glm_CI_low' in df_sorted.columns and 'site_glm_CI_high' in df_sorted.columns:
+        y_pos = range(len(df_sorted))
+        xerr_low = df_sorted['site_glm_rate'] - df_sorted['site_glm_CI_low']
+        xerr_high = df_sorted['site_glm_CI_high'] - df_sorted['site_glm_rate']
+        ax.errorbar(df_sorted['site_glm_rate'], y_pos,
+                    xerr=[xerr_low, xerr_high], fmt='none', color='black', capsize=2, alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(f"{output_prefix}_site_glm_ranking.png", dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Site-level GLM ranking saved to {output_prefix}_site_glm_ranking.png")
+
+def load_site_level_data_no_context(counts_dir: str, exclusion_mask: str | None = None):
+    """Load site-level rows across all samples without sequence-context features.
+
+    Returns a DataFrame with columns: chrom, pos, treatment (0 control, 1 treated),
+    depth, ems_count, sample.
+    """
+    excluded_sites = None
+    if exclusion_mask and os.path.exists(exclusion_mask):
+        excluded_sites = load_exclusion_mask(exclusion_mask)
+
+    rows = []
+    counts_files = sorted(glob.glob(os.path.join(counts_dir, "*.counts")))
+    for path in counts_files:
+        sample_name = os.path.basename(path).replace(".counts", "")
+        is_control = ("NT" in sample_name)
+        treatment = 0 if is_control else 1
+        with open(path) as f:
+            reader = csv.reader(f, delimiter="\t")
+            header = next(reader, None)
+            for row in reader:
+                if len(row) < 9:
+                    continue
+                chrom, pos, ref, ref_count, A_count, C_count, G_count, T_count, depth = row
+                if excluded_sites and (chrom, pos) in excluded_sites:
+                    continue
+                try:
+                    A_i = int(A_count)
+                    C_i = int(C_count)
+                    G_i = int(G_count)
+                    T_i = int(T_count)
+                    depth_i = int(depth)
+                except Exception:
+                    continue
+                if depth_i <= 0:
+                    continue
+                if ref not in {"G", "C"}:
+                    continue
+                # Strict EMS-only counting
+                ems_count = T_i if ref == "C" else A_i
+                rows.append({
+                    "chrom": chrom,
+                    "pos": pos,
+                    "treatment": treatment,
+                    "depth": depth_i,
+                    "ems_count": ems_count,
+                    "sample": sample_name,
+                })
+    return pd.DataFrame(rows)
+
+
+def fit_site_level_glm_no_context(df: pd.DataFrame, method: str = "poisson", alpha: float = 0.0):
+    """Fit site-level GLM with Treatment covariate and log(depth) offset.
+
+    Optionally subtract background alpha at counts level per site (max with 0).
+    Returns the fitted model result object and a small summary dict.
+    """
+    if df.empty:
+        return None, {}
+
+    work = df.copy()
+    work["log_depth"] = np.log(work["depth"].values)
+
+    # Apply alpha subtraction at counts level if provided
+    if alpha and alpha > 0:
+        work["ems_adj"] = np.maximum(0.0, work["ems_count"].values - alpha * work["depth"].values)
+        y = work["ems_adj"].values
+    else:
+        y = work["ems_count"].values
+
+    X = work[["treatment"]]
+    design = sm.add_constant(X, has_constant='add')
+
+    if method == "poisson":
+        fam = sm.families.Poisson()
+    else:
+        fam = sm.families.NegativeBinomial(alpha=getattr(df, "_nb_alpha", None) or 1.0)
+
+    model = sm.GLM(y, design, family=fam, offset=work["log_depth"].values)
+    result = model.fit()
+
+    # Interpret coefficients as per-base rates for control (intercept) and treated
+    beta0 = result.params.get("const", np.nan)
+    beta_t = result.params.get("treatment", np.nan)
+    rate_control = float(np.exp(beta0)) if np.isfinite(beta0) else np.nan
+    rate_treated = float(np.exp(beta0 + beta_t)) if np.isfinite(beta0) and np.isfinite(beta_t) else np.nan
+
+    summary = {
+        "aic": float(getattr(result, "aic", np.nan)),
+        "bic": float(getattr(result, "bic", np.nan)) if hasattr(result, "bic") else np.nan,
+        "llf": float(getattr(result, "llf", np.nan)),
+        "rate_control": rate_control,
+        "rate_treated": rate_treated,
+        "coef_const": float(beta0) if np.isfinite(beta0) else np.nan,
+        "coef_treatment": float(beta_t) if np.isfinite(beta_t) else np.nan,
+    }
+
+    return result, summary
+
+
+def fit_site_level_glm_per_sample(site_df: pd.DataFrame, method: str = "poisson", alpha: float = 0.0):
+    """Fit intercept-only site-level GLM separately for each sample.
+
+    Returns a list of dicts with sample-level rate estimates and intervals.
+    """
+    if site_df is None or site_df.empty:
+        return []
+
+    results = []
+    samples = sorted(site_df["sample"].unique())
+
+    for sample_name in samples:
+        df = site_df[site_df["sample"] == sample_name].copy()
+        if df.empty:
+            continue
+
+        df["log_depth"] = np.log(df["depth"].values)
+
+        if alpha and alpha > 0:
+            df["ems_adj"] = np.maximum(0.0, df["ems_count"].values - alpha * df["depth"].values)
+            y = df["ems_adj"].values
+        else:
+            y = df["ems_count"].values
+
+        # Intercept-only design
+        design = sm.add_constant(pd.DataFrame(index=df.index), has_constant='add')
+
+        if method == "poisson":
+            fam = sm.families.Poisson()
+        else:
+            fam = sm.families.NegativeBinomial()
+
+        try:
+            model = sm.GLM(y, design, family=fam, offset=df["log_depth"].values)
+            result = model.fit()
+
+            beta0 = result.params.get("const", np.nan)
+            rate = float(np.exp(beta0)) if np.isfinite(beta0) else np.nan
+
+            # Confidence interval for intercept, transformed
+            try:
+                ci_beta = result.conf_int().loc["const"].values
+                ci_low = float(np.exp(ci_beta[0]))
+                ci_high = float(np.exp(ci_beta[1]))
+            except Exception:
+                ci_low = np.nan
+                ci_high = np.nan
+
+            results.append({
+                "sample": sample_name,
+                "site_glm_rate": rate,
+                "site_glm_CI_low": ci_low,
+                "site_glm_CI_high": ci_high,
+                "site_glm_aic": float(getattr(result, "aic", np.nan)),
+                "site_glm_llf": float(getattr(result, "llf", np.nan)),
+                "site_glm_rows": int(len(df)),
+                "site_glm_depth": int(df["depth"].sum()),
+                "site_glm_mutations": float(df["ems_count"].sum()),
+            })
+        except Exception as e:
+            print(f"Warning: Site-level GLM failed for sample {sample_name}: {e}")
+            results.append({
+                "sample": sample_name,
+                "site_glm_rate": np.nan,
+                "site_glm_CI_low": np.nan,
+                "site_glm_CI_high": np.nan,
+                "site_glm_aic": np.nan,
+                "site_glm_llf": np.nan,
+                "site_glm_rows": int(len(df)),
+                "site_glm_depth": int(df["depth"].sum()),
+                "site_glm_mutations": float(df["ems_count"].sum()),
+            })
+
+    return results
+
+
+def load_site_level_with_ref(counts_dir: str, exclusion_mask: str | None = None) -> pd.DataFrame:
+    """Load site-level rows with reference base retained for min-alt logic.
+
+    Columns: chrom, pos(int), ref, depth, ems_count, sample, is_control(bool)
+    """
+    excluded_sites = None
+    if exclusion_mask and os.path.exists(exclusion_mask):
+        excluded_sites = load_exclusion_mask(exclusion_mask)
+
+    rows = []
+    counts_files = sorted(glob.glob(os.path.join(counts_dir, "*.counts")))
+    for path in counts_files:
+        sample = os.path.basename(path).replace(".counts", "")
+        is_ctrl = ("NT" in sample)
+        with open(path) as f:
+            reader = csv.reader(f, delimiter="\t")
+            _ = next(reader, None)
+            for row in reader:
+                if len(row) < 9:
+                    continue
+                chrom, pos, ref, ref_count, A_count, C_count, G_count, T_count, depth = row
+                if ref not in {"C", "G"}:
+                    continue
+                if excluded_sites and (chrom, pos) in excluded_sites:
+                    continue
+                try:
+                    A_i = int(A_count); C_i = int(C_count); G_i = int(G_count); T_i = int(T_count)
+                    depth_i = int(depth); pos_i = int(pos)
+                except Exception:
+                    continue
+                if depth_i <= 0:
+                    continue
+                ems = T_i if ref == "C" else A_i
+                rows.append({
+                    "chrom": chrom,
+                    "pos": pos_i,
+                    "ref": ref,
+                    "depth": depth_i,
+                    "ems_count": ems,
+                    "sample": sample,
+                    "is_control": is_ctrl,
+                })
+    return pd.DataFrame(rows)
+
+
+def fit_site_level_glm_intercept_only(df_sites: pd.DataFrame, method: str = "poisson", alpha: float = 0.0) -> tuple[float, float, float]:
+    """Fit intercept-only site-level GLM on provided site rows for a single sample.
+
+    Expects columns: depth, y (counts to model). Applies alpha subtraction at counts level.
+    Returns (rate, ci_low, ci_high) in per-base units.
+    """
+    if df_sites is None or df_sites.empty:
+        return (float("nan"), float("nan"), float("nan"))
+
+    work = df_sites.copy()
+    work["log_depth"] = np.log(work["depth"].values)
+
+    if alpha and alpha > 0:
+        y = np.maximum(0.0, work["y"].values - alpha * work["depth"].values)
+    else:
+        y = work["y"].values
+
+    design = sm.add_constant(pd.DataFrame(index=work.index), has_constant='add')
+    fam = sm.families.Poisson() if method == "poisson" else sm.families.NegativeBinomial(alpha=getattr(df_sites, "_nb_alpha", None) or 1.0)
+
+    try:
+        model = sm.GLM(y, design, family=fam, offset=work["log_depth"].values)
+        res = model.fit()
+        b0 = res.params.get("const", np.nan)
+        rate = float(np.exp(b0)) if np.isfinite(b0) else np.nan
+        try:
+            ci_b = res.conf_int().loc["const"].values
+            ci_low = float(np.exp(ci_b[0])); ci_high = float(np.exp(ci_b[1]))
+        except Exception:
+            ci_low = np.nan; ci_high = np.nan
+        return (rate, ci_low, ci_high)
+    except Exception:
+        return (float("nan"), float("nan"), float("nan"))
+
 def main():
     parser = argparse.ArgumentParser(
         description="Estimate mutation rates with enhanced statistical methods"
@@ -1313,7 +1740,9 @@ def main():
     
     # Statistical enhancement arguments (all enabled by default)
     parser.add_argument("--no-alpha-correction", action="store_true",
-                        help="Skip alpha correction even if controls present")
+                        help="Skip alpha correction for simple rates (GLM methods use treatment covariate by default)")
+    parser.add_argument("--use-alpha-correction", action="store_true",
+                        help="Use alpha correction approach instead of treatment covariate for GLM methods (legacy)")
     parser.add_argument("--glm", action="store_true",
                         help="Run GLM analysis: per-sample, depth-binned, and per-gene methods")
     parser.add_argument("--glm-method", type=str, default="poisson", 
@@ -1331,6 +1760,29 @@ def main():
                         help="Number of depth bins for depth-based GLM (default 10)")
     parser.add_argument("--no-depth-glm", action="store_true",
                         help="Disable depth-based GLM analysis")
+    parser.add_argument("--site-glm", action="store_true",
+                        help="Run site-level GLM without sequence-context covariates")
+    parser.add_argument("--site-glm-method", type=str, default="poisson",
+                        choices=["poisson", "negative_binomial"],
+                        help="GLM family for site-level model (default: poisson)")
+    parser.add_argument("--glm-use-nb-alpha-from-controls", action="store_true",
+                        help="For negative_binomial GLMs, estimate NB alpha from NT controls (site-level) and use it")
+    parser.add_argument("--site-glm-use-nb-alpha-from-controls", action="store_true",
+                        help="For site-level GLM negative_binomial, estimate NB alpha from NT controls (site-level) and use it")
+
+    # Sweep options (site-level GLM)
+    parser.add_argument("--sweep", action="store_true",
+                        help="Run a min-alt sweep using site-level per-sample GLM; writes TSVs and plots similar to the sweep script")
+    parser.add_argument("--min-alt-start", type=int, default=2,
+                        help="Sweep start threshold (inclusive) for min-alt")
+    parser.add_argument("--min-alt-end", type=int, default=5,
+                        help="Sweep end threshold (inclusive) for min-alt")
+    parser.add_argument("--sweep-target", type=str, default="C", choices=["C", "G"],
+                        help="Which base to sweep (C or G); the other base fixed at --other-min-alt")
+    parser.add_argument("--other-min-alt", type=int, default=1,
+                        help="Fixed min-alt to apply to the non-swept base during sweep (default 1)")
+    parser.add_argument("--use-split-alpha", action="store_true",
+                        help="During sweep, attempt separate alpha for genic vs intergenic (requires --gff-file); otherwise use overall alpha")
     
     args = parser.parse_args()
 
@@ -1365,35 +1817,73 @@ def main():
         df = df[~df['is_control']].reset_index(drop=True)
         print(f"Excluded controls, analyzing {len(df)} samples")
 
-    # Step 2: Estimate alpha from controls (always run if controls present)
+    # Step 2: Determine approach for handling controls
+    # Default: Treatment covariate approach (controls as covariate in GLM)
+    # Legacy: Alpha correction approach (subtract background rate from counts)
     alpha = 0.0
-    if not args.no_alpha_correction and df['is_control'].any():
-        # Use raw site-level data from control files (most accurate)
+    nb_alpha_controls = None
+    use_treatment_covariate = not args.use_alpha_correction  # Default to True unless user requests alpha correction
+    
+    if df['is_control'].any():
+        if use_treatment_covariate:
+            print("Using treatment covariate approach (controls as covariate in GLM)")
+            print("  This fits a pooled model: log(E[Y]) = log(depth) + β₀ + β₁·treatment")
+            print("  Control rate = exp(β₀), Treated rate = exp(β₀ + β₁)")
+        else:
+            print("Using alpha correction approach (legacy method)")
+            print("  This subtracts background rate from mutation counts before fitting")
+        
+        # Estimate alpha for reference or for simple rate alpha correction
         control_files = [f for f in counts_files if "NT" in os.path.basename(f)]
         if control_files:
             alpha = estimate_alpha_from_control_sites(control_files, min_alt=args.min_alt, excluded_sites=excluded_sites)
             print(f"Estimated alpha from pooled control sites (background rate): {alpha:.2e}")
         else:
-            print("No control files found for pooled alpha estimation, falling back to weighted method")
             alpha = estimate_alpha_from_controls(df)
             print(f"Estimated alpha from weighted control rates (background rate): {alpha:.2e}")
-    elif args.no_alpha_correction:
-        print("Skipping alpha correction (--no-alpha-correction specified)")
     else:
-        print("No control samples found, skipping alpha correction")
+        print("No control samples found, using intercept-only models")
+        use_treatment_covariate = False
 
-    # Step 3: Apply alpha correction
-    if alpha > 0:
+    # Step 3: Apply alpha correction to simple rates (if not skipped)
+    # Note: GLM methods use treatment covariate approach by default
+    if alpha > 0 and not args.no_alpha_correction:
         df = apply_alpha_correction(df, alpha)
-        print("Applied alpha correction to rate estimates")
+        print("Applied alpha correction to simple rate estimates")
+
+    # Optional: Estimate NB alpha from controls at site-level for NB GLMs
+    if (args.glm and args.glm_method == 'negative_binomial' and args.glm_use_nb_alpha_from_controls) or (args.site_glm and args.site_glm_method == 'negative_binomial' and args.site_glm_use_nb_alpha_from_controls):
+        try:
+            site_controls = load_site_level_with_ref(args.counts_dir, args.exclusion_mask)
+            site_controls = site_controls[site_controls['is_control']].copy()
+            if not site_controls.empty:
+                site_controls['log_depth'] = np.log(site_controls['depth'].values)
+                y = site_controls['ems_count'].values
+                design = sm.add_constant(pd.DataFrame(index=site_controls.index), has_constant='add')
+                pois = sm.GLM(y, design, family=sm.families.Poisson(), offset=site_controls['log_depth'].values).fit()
+                mu = pois.fittedvalues
+                var_y = np.var(y)
+                mean_mu = np.mean(mu)
+                if var_y > mean_mu and mean_mu > 0:
+                    nb_alpha_controls = float((mean_mu ** 2) / max(var_y - mean_mu, 1e-12))
+                    print(f"Estimated NB alpha from controls (site-level): {nb_alpha_controls:.4f}")
+                else:
+                    print("Controls suggest Poisson-like dispersion; skipping NB alpha override")
+            else:
+                print("No control site-level rows found for NB alpha estimation")
+        except Exception as e:
+            print(f"Warning: NB alpha estimation from controls failed: {e}")
 
     # Step 4: GLM analysis (if requested)
     if args.glm:
         print(f"Running GLM analysis (method={args.glm_method})")
         
         # 1) Per-sample GLM (genome-wide, no f-clonal)
-        print("Fitting per-sample GLM...")
-        df = estimate_rates_glm_genome_wide(df, method=args.glm_method, use_f_clonal=False, f_clonal_regions=None, no_f_clonal=True)
+        # Uses treatment covariate approach by default (pooled model with treatment covariate)
+        print("Fitting genome-wide GLM with treatment covariate...")
+        if nb_alpha_controls is not None:
+            df._nb_alpha = nb_alpha_controls
+        df = estimate_rates_glm_genome_wide(df, method=args.glm_method, use_f_clonal=False, f_clonal_regions=None, no_f_clonal=True, use_treatment_covariate=use_treatment_covariate)
         
         # 2) Depth-based GLM (30 bins, no f-clonal)
         print(f"Fitting depth-based GLM ({args.depth_bins} bins)...")
@@ -1440,6 +1930,248 @@ def main():
             print("Skipping per-gene GLM (no GFF file provided)")
     else:
         print("Skipping GLM analysis (--glm not specified)")
+
+    # Optional: Site-level GLM without sequence-context covariates
+    if args.site_glm:
+        print(f"Running site-level GLM (method={args.site_glm_method}) without sequence-context covariates")
+        site_df = load_site_level_data_no_context(args.counts_dir, args.exclusion_mask)
+        if site_df is None or site_df.empty:
+            print("No site-level data loaded; skipping site-level GLM")
+        else:
+            site_result, site_summary = fit_site_level_glm_no_context(site_df, method=args.site_glm_method, alpha=alpha)
+
+            # Save a concise report
+            site_dir = args.output_prefix
+            os.makedirs(site_dir, exist_ok=True)
+            report_path = os.path.join(site_dir, "site_level_glm_report.txt")
+            with open(report_path, "w") as fh:
+                fh.write("=== Site-Level GLM (no context covariates) ===\n\n")
+                fh.write(f"Method: {args.site_glm_method}\n")
+                fh.write(f"Rows: {len(site_df)}\n")
+                fh.write(f"Alpha subtracted: {alpha:.2e}\n\n")
+                if site_result is not None:
+                    fh.write(f"AIC: {site_summary.get('aic', float('nan'))}\n")
+                    fh.write(f"BIC: {site_summary.get('bic', float('nan'))}\n")
+                    fh.write(f"LogLik: {site_summary.get('llf', float('nan'))}\n\n")
+                    fh.write("Coefficients (log-rate scale):\n")
+                    fh.write(f"  const: {site_summary.get('coef_const', float('nan'))}\n")
+                    fh.write(f"  treatment: {site_summary.get('coef_treatment', float('nan'))}\n\n")
+                    fh.write("Implied per-base rates:\n")
+                    fh.write(f"  control: {site_summary.get('rate_control', float('nan')):.6e}\n")
+                    fh.write(f"  treated: {site_summary.get('rate_treated', float('nan')):.6e}\n")
+                else:
+                    fh.write("Model fitting failed.\n")
+            print(f"Site-level GLM report saved to {report_path}")
+
+            # Per-sample site-level GLM (intercept-only per sample)
+            print("Fitting per-sample site-level GLMs (intercept-only)...")
+            per_sample_rows = fit_site_level_glm_per_sample(site_df, method=args.site_glm_method, alpha=alpha)
+            per_sample_df = pd.DataFrame(per_sample_rows)
+            tsv_path = os.path.join(site_dir, "site_level_glm_per_sample.tsv")
+            per_sample_df.to_csv(tsv_path, sep="\t", index=False)
+            print(f"Per-sample site-level GLM rates saved to {tsv_path}")
+
+            # Merge per-sample site GLM rates into main results table
+            if not per_sample_df.empty:
+                df = df.merge(per_sample_df[["sample", "site_glm_rate", "site_glm_CI_low", "site_glm_CI_high"]], on="sample", how="left")
+
+            # Create per-sample site-level GLM plots
+            create_site_level_glm_plots(df, os.path.join(site_dir, "site_glm"))
+            save_individual_site_level_glm_plots(df, os.path.join(site_dir, "site_glm"))
+
+    # Optional: Site-level GLM sweep (overall + optional genic/intergenic)
+    if args.sweep:
+        print(f"Running site-level GLM sweep: {args.sweep_target} min_alt {args.min_alt_start}..{args.min_alt_end}, other={args.other_min_alt}")
+        sweep_dir = os.path.join(args.output_prefix, "sweep")
+        os.makedirs(sweep_dir, exist_ok=True)
+
+        # Load site-level rows with reference base
+        site_all = load_site_level_with_ref(args.counts_dir, args.exclusion_mask)
+        if site_all is None or site_all.empty:
+            print("No site-level rows found; skipping sweep")
+        else:
+            thresholds = list(range(args.min_alt_start, args.min_alt_end + 1))
+
+            # Prepare genic regions (optional)
+            gene_regions = None
+            if args.gff_file and os.path.exists(args.gff_file):
+                print("Parsing GFF for genic/intergenic split...")
+                gene_regions = parse_gff(args.gff_file)
+
+            # Helper to test genic membership (simple scan over gene list by chrom)
+            chrom_to_genes = {}
+            if gene_regions:
+                for chrom, start, end, gid in gene_regions:
+                    chrom_to_genes.setdefault(chrom, []).append((start, end))
+                for chrom in chrom_to_genes:
+                    chrom_to_genes[chrom].sort()
+
+            def is_genic(chrom: str, pos: int) -> bool:
+                if not chrom_to_genes:
+                    return False
+                genes = chrom_to_genes.get(chrom)
+                if not genes:
+                    return False
+                # Linear scan (acceptable for moderate sizes); could be optimized with bisect
+                for s, e in genes:
+                    if pos < s:
+                        break
+                    if s <= pos <= e:
+                        return True
+                return False
+
+            # Alpha per threshold (overall); split alpha optional if genic available
+            control_files = [f for f in counts_files if "NT" in os.path.basename(f)]
+
+            overall_wide_frames = []
+            genic_wide_frames = []
+            inter_wide_frames = []
+            trends_rows = []
+
+            for thr in thresholds:
+                thr_c = thr if args.sweep_target == "C" else args.other_min_alt
+                thr_g = thr if args.sweep_target == "G" else args.other_min_alt
+
+                # Estimate alpha overall for this threshold from controls
+                alpha_thr = 0.0
+                if control_files and not args.no_alpha_correction:
+                    alpha_thr = estimate_alpha_from_control_sites(control_files, min_alt=min(thr_c, thr_g), excluded_sites=excluded_sites)
+
+                # Prepare thresholded counts y
+                work = site_all.copy()
+                mask_c = (work["ref"] == "C") & (work["ems_count"] >= thr_c)
+                mask_g = (work["ref"] == "G") & (work["ems_count"] >= thr_g)
+                work["y"] = np.where(mask_c | mask_g, work["ems_count"], 0)
+
+                # Per-sample overall site-level GLM
+                samples = sorted(work["sample"].unique())
+                overall_rows = []
+                genic_rows = []
+                inter_rows = []
+                for s in samples:
+                    sub = work[work["sample"] == s]
+                    is_ctrl = bool(("NT" in s))
+
+                    r_o, lo_o, hi_o = fit_site_level_glm_intercept_only(sub, method=args.site_glm_method, alpha=alpha_thr)
+                    overall_rows.append({"sample": s, "rate": r_o, "lo": lo_o, "hi": hi_o})
+
+                    # Genic/intergenic split if GFF available
+                    if gene_regions:
+                        mask_gx = sub.apply(lambda r: is_genic(r["chrom"], int(r["pos"])), axis=1)
+                        sub_g = sub[mask_gx]
+                        sub_i = sub[~mask_gx]
+
+                        # If requested, we could compute split alphas; for now use overall alpha_thr
+                        r_g, lo_g, hi_g = fit_site_level_glm_intercept_only(sub_g, method=args.site_glm_method, alpha=alpha_thr)
+                        r_i, lo_i, hi_i = fit_site_level_glm_intercept_only(sub_i, method=args.site_glm_method, alpha=alpha_thr)
+                        genic_rows.append({"sample": s, "rate": r_g, "lo": lo_g, "hi": hi_g})
+                        inter_rows.append({"sample": s, "rate": r_i, "lo": lo_i, "hi": hi_i})
+
+                    # Trends row
+                    trends_rows.append({
+                        "sample": s,
+                        "min_alt": thr,
+                        "rate": r_o,
+                        "is_control": is_ctrl,
+                    })
+
+                label = f"{args.sweep_target}_minAlt{thr}"
+                over_df = pd.DataFrame(overall_rows)
+                overall_wide_frames.append(over_df[["sample", "rate"]].rename(columns={"rate": f"rate_{label}"}))
+
+                if gene_regions:
+                    gdf = pd.DataFrame(genic_rows)
+                    idf = pd.DataFrame(inter_rows)
+                    genic_wide_frames.append(gdf[["sample", "rate", "lo", "hi"]].rename(columns={
+                        "rate": f"genic_rate_{label}", "lo": f"genic_CI_low_{label}", "hi": f"genic_CI_high_{label}"
+                    }))
+                    inter_wide_frames.append(idf[["sample", "rate", "lo", "hi"]].rename(columns={
+                        "rate": f"intergenic_rate_{label}", "lo": f"intergenic_CI_low_{label}", "hi": f"intergenic_CI_high_{label}"
+                    }))
+
+            # Merge and save TSVs
+            if overall_wide_frames:
+                rates_wide = overall_wide_frames[0]
+                for f in overall_wide_frames[1:]:
+                    rates_wide = rates_wide.merge(f, on="sample", how="outer")
+                rates_wide_path = os.path.join(sweep_dir, "site_level_overall_rates_wide.tsv")
+                rates_wide.to_csv(rates_wide_path, sep="\t", index=False)
+                print(f"Saved sweep overall wide TSV to {rates_wide_path}")
+
+                rates_long = rates_wide.melt(id_vars=["sample"], var_name="threshold", value_name="rate")
+                rates_long["min_alt"] = rates_long["threshold"].str.extract(r"(\d+)").astype(int)
+                rates_long_path = os.path.join(sweep_dir, "site_level_overall_rates_long.tsv")
+                rates_long.sort_values(["sample", "min_alt"]).to_csv(rates_long_path, sep="\t", index=False)
+                print(f"Saved sweep overall long TSV to {rates_long_path}")
+
+                # Trend plot
+                trend_df = pd.DataFrame(trends_rows)
+                if not trend_df.empty:
+                    plt.figure(figsize=(10, 7))
+                    control_color = "#1f77b4"; treated_color = "#ff7f0e"
+                    for s, sub in trend_df.groupby("sample"):
+                        sub = sub.sort_values("min_alt")
+                        color = control_color if bool(("NT" in s)) else treated_color
+                        plt.plot(sub["min_alt"], sub["rate"], marker="o", alpha=0.55, linewidth=1, color=color)
+                    plt.yscale("log")
+                    plt.xlabel("min_alt"); plt.ylabel("Per-base mutation probability (site-level GLM)")
+                    plt.title("Per-sample site-level GLM rate trends vs min_alt")
+                    legend_elements = [Line2D([0],[0], color=treated_color, lw=2, label="Treated"), Line2D([0],[0], color=control_color, lw=2, label="Control")]
+                    plt.legend(handles=legend_elements, loc="best")
+                    trend_path = os.path.join(sweep_dir, "site_level_trends_overall.png")
+                    plt.tight_layout(); plt.savefig(trend_path, dpi=300); plt.close()
+                    print(f"Saved sweep overall trend plot to {trend_path}")
+
+            if gene_regions and genic_wide_frames and inter_wide_frames:
+                genic_wide = genic_wide_frames[0]
+                for f in genic_wide_frames[1:]:
+                    genic_wide = genic_wide.merge(f, on="sample", how="outer")
+                inter_wide = inter_wide_frames[0]
+                for f in inter_wide_frames[1:]:
+                    inter_wide = inter_wide.merge(f, on="sample", how="outer")
+                genic_wide_path = os.path.join(sweep_dir, "site_level_genic_rates_wide.tsv")
+                inter_wide_path = os.path.join(sweep_dir, "site_level_intergenic_rates_wide.tsv")
+                genic_wide.to_csv(genic_wide_path, sep="\t", index=False)
+                inter_wide.to_csv(inter_wide_path, sep="\t", index=False)
+                print(f"Saved sweep genic/intergenic wide TSVs to {sweep_dir}")
+
+                # Genic vs intergenic scatter per threshold
+                for thr in thresholds:
+                    label = f"{args.sweep_target}_minAlt{thr}"
+                    gcol = f"genic_rate_{label}"; icol = f"intergenic_rate_{label}"
+                    g_lo = f"genic_CI_low_{label}"; g_hi = f"genic_CI_high_{label}"
+                    i_lo = f"intergenic_CI_low_{label}"; i_hi = f"intergenic_CI_high_{label}"
+                    if gcol not in genic_wide.columns or icol not in inter_wide.columns:
+                        continue
+                    join_df = genic_wide[["sample", gcol, g_lo, g_hi]].merge(inter_wide[["sample", icol, i_lo, i_hi]], on="sample", how="inner")
+                    if join_df.empty:
+                        continue
+                    join_df["g_err_low"] = join_df[gcol] - join_df[g_lo]
+                    join_df["g_err_high"] = join_df[g_hi] - join_df[gcol]
+                    join_df["i_err_low"] = join_df[icol] - join_df[i_lo]
+                    join_df["i_err_high"] = join_df[i_hi] - join_df[icol]
+                    plt.figure(figsize=(7,7))
+                    # Control vs treated coloring
+                    mask_ctrl = join_df["sample"].str.contains("NT")
+                    treated_df = join_df[~mask_ctrl]; control_df = join_df[mask_ctrl]
+                    if not treated_df.empty:
+                        plt.errorbar(treated_df[gcol], treated_df[icol], xerr=[treated_df["g_err_low"], treated_df["g_err_high"]], yerr=[treated_df["i_err_low"], treated_df["i_err_high"]], fmt='o', color="#ff7f0e", alpha=0.6, elinewidth=1, capsize=2, label="Treated")
+                    if not control_df.empty:
+                        plt.errorbar(control_df[gcol], control_df[icol], xerr=[control_df["g_err_low"], control_df["g_err_high"]], yerr=[control_df["i_err_low"], control_df["i_err_high"]], fmt='o', color="#1f77b4", alpha=0.6, elinewidth=1, capsize=2, label="Control")
+                    plt.xscale("log"); plt.yscale("log")
+                    plt.xlabel(f"Genic per-base mutation probability (min_alt={thr})")
+                    plt.ylabel(f"Intergenic per-base mutation probability (min_alt={thr})")
+                    plt.title("Site-level GLM: Genic vs Intergenic rates (95% CI)")
+                    # Diagonal
+                    vals = pd.concat([join_df[gcol], join_df[icol]]).replace([np.inf, -np.inf], np.nan).dropna()
+                    if not vals.empty:
+                        lo_v, hi_v = vals.min(), vals.max()
+                        if lo_v > 0 and np.isfinite(hi_v):
+                            plt.plot([lo_v, hi_v], [lo_v, hi_v], linestyle="--", color="grey", alpha=0.6)
+                    plt.legend(loc="best"); plt.grid(alpha=0.2)
+                    scatter_path = os.path.join(sweep_dir, f"site_level_genic_vs_intergenic_minAlt{thr}.png")
+                    plt.tight_layout(); plt.savefig(scatter_path, dpi=300); plt.close()
+                    print(f"Saved sweep genic vs intergenic scatter for min_alt={thr} to {scatter_path}")
 
     # Save results table
     # Step 4: Create output directory

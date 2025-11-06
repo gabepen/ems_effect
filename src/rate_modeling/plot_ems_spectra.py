@@ -20,6 +20,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import seaborn as sns
+import numpy as np
+from scipy.stats import mannwhitneyu
 
 
 def list_tsv_files(input_dir: str, pattern: str) -> List[str]:
@@ -55,6 +57,47 @@ def clean_sample_label(sample_name: str) -> str:
     if m:
         return f"EMS{m.group(1)}_{m.group(2)}d"
     return sample_name
+
+
+def perform_mann_whitney_tests(df, NT_samples_sorted, other_samples_sorted, substitution_order):
+    """Perform Mann-Whitney U tests comparing NT controls vs treated samples for each substitution type.
+    
+    Returns dict mapping substitution -> p_value
+    """
+    p_values = {}
+    
+    for substitution in substitution_order:
+        # Get data for this substitution
+        sub_data = df[df['substitution'] == substitution]
+        
+        if sub_data.empty:
+            p_values[substitution] = 1.0
+            continue
+            
+        # Separate NT controls and treated samples
+        nt_values = []
+        treated_values = []
+        
+        for _, row in sub_data.iterrows():
+            sample = row['sample']
+            proportion = row['proportion']
+            
+            if sample in NT_samples_sorted:
+                nt_values.append(proportion)
+            elif sample in other_samples_sorted:
+                treated_values.append(proportion)
+        
+        # Perform Mann-Whitney U test
+        if len(nt_values) >= 2 and len(treated_values) >= 2:
+            try:
+                statistic, p_value = mannwhitneyu(treated_values, nt_values, alternative='two-sided')
+                p_values[substitution] = p_value
+            except ValueError:
+                p_values[substitution] = 1.0
+        else:
+            p_values[substitution] = 1.0
+    
+    return p_values
 
 
 def detect_columns(path: str) -> Tuple[bool, Dict[str, int]]:
@@ -474,6 +517,9 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
     df["substitution"] = pd.Categorical(df["substitution"], categories=substitution_order, ordered=True)
     df = df.sort_values(["substitution", "sample_display"])
     
+    # Perform Mann-Whitney U tests
+    p_values = perform_mann_whitney_tests(df, NT_samples_sorted, other_samples_sorted, substitution_order)
+    
     # Create figure if ax not provided
     if ax is None:
         plt.figure(figsize=(14, 6))
@@ -500,6 +546,11 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
     ax.tick_params(axis='y', labelsize=14)
     ax.set_yscale('log')  # Log scale for y-axis
     ax.set_ylim(bottom=1e-4)  # Set minimum y value to 10^-4
+    
+    # Adjust upper y-limit to accommodate p-value boxes
+    current_ylim = ax.get_ylim()
+    ax.set_ylim(top=current_ylim[1] * 1.3)  # Increase upper limit by 30%
+    
     ax.tick_params(axis='x', rotation=45, labelsize=14)
     ax.set_xlabel('')  # Remove x-axis label
     
@@ -524,6 +575,41 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
             legend_labels.append(label)
     
     ax.legend(legend_handles, legend_labels, fontsize=12, bbox_to_anchor=(1.05, 1), loc="upper left")
+    
+    # Add p-value annotations below the title but above the bars
+    y_max = ax.get_ylim()[1]
+    y_pos = y_max * 0.72  # Position lower to avoid overlap with bars
+    
+    for i, substitution in enumerate(substitution_order):
+        p_val = p_values.get(substitution, 1.0)
+        
+        # Format p-value
+        if p_val < 0.001:
+            p_text = "p < 0.001"
+        elif p_val < 0.01:
+            p_text = f"p = {p_val:.3f}"
+        elif p_val < 0.05:
+            p_text = f"p = {p_val:.3f}"
+        else:
+            p_text = f"p = {p_val:.3f}"
+        
+        # Color code the p-values
+        if p_val < 0.001:
+            color = 'red'
+            weight = 'bold'
+        elif p_val < 0.01:
+            color = 'darkorange'
+            weight = 'bold'
+        elif p_val < 0.05:
+            color = 'orange'
+            weight = 'normal'
+        else:
+            color = 'gray'
+            weight = 'normal'
+        
+        ax.text(i, y_pos, p_text, ha='center', va='bottom', 
+                fontsize=10, color=color, fontweight=weight,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor=color))
     
     # Set title if provided
     if title:
