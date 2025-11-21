@@ -3,7 +3,7 @@
 Prediction accuracy metrics for GLM models.
 
 Computes various metrics on held-out test data:
-- MSE, MAE, RMSE
+- MSE, RMSE
 - R² (pseudo-R² for GLMs)
 - Correlation (Pearson, Spearman)
 - Poisson-specific metrics
@@ -265,13 +265,26 @@ def compare_models_predictions(
         
         print(f"Evaluating {model_name} on test set...")
         
+        # Debug: Check if this looks like a 7mer model
+        if '7mer' in model_name.lower():
+            print(f"  Model name contains '7mer', model type: {type(model)}")
+            if isinstance(model, list):
+                print(f"  Model is a list with {len(model)} elements")
+            else:
+                print(f"  Warning: 7mer model is not a list - may not be handled correctly")
+        
         try:
             # Special handling for 7mer_split which uses split models
-            if model_name == '7mer_split' and isinstance(model, list):
+            # Check for 7mer in model name (could be '7mer_split' or '7mer')
+            is_7mer_model = ('7mer' in model_name.lower()) and isinstance(model, list)
+            if is_7mer_model:
+                print(f"  Detected 7mer model with {len(model)} split models")
                 # Use split model prediction
                 mu_pred = predict_with_7mer_splits(model, df_test)
+                print(f"  Generated {len(mu_pred)} predictions, {np.sum(~np.isnan(mu_pred))} valid")
                 # Filter to rows where we have 7mer data
                 df7_test = df_test[df_test['kmer7'].notna()].copy()
+                print(f"  Found {len(df7_test)} rows with 7mer data out of {len(df_test)} total rows")
                 if df7_test.empty:
                     print(f"  Warning: No 7mer data in test set, skipping {model_name}")
                     continue
@@ -308,6 +321,7 @@ def compare_models_predictions(
                 metrics = compute_prediction_metrics(y_test_7mer, mu_pred_7mer, mu_pred_7mer)
                 metrics['model_name'] = model_name
                 all_metrics.append(metrics)
+                print(f"  Successfully evaluated {model_name}: {len(y_test_7mer)} observations, R²={metrics['r_squared']:.4f}, Pearson r={metrics['pearson_r']:.4f}")
             else:
                 # Prepare test features
                 from load_saved_models import prepare_data_for_model
@@ -345,12 +359,47 @@ def compare_models_predictions(
 
 def plot_prediction_comparison(metrics_df: pd.DataFrame, output_dir: str):
     """
-    Create visualization comparing prediction accuracy across models.
+    Create publication-ready visualization comparing prediction accuracy across models.
     """
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle('Prediction Accuracy Comparison Across Models', fontsize=16, fontweight='bold')
+    from matplotlib.gridspec import GridSpec
+    import matplotlib.ticker as ticker
+    
+    # Set publication-quality style with larger fonts for document readability
+    plt.rcParams.update({
+        'font.size': 14,
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans'],
+        'axes.labelsize': 16,
+        'axes.titlesize': 17,
+        'axes.linewidth': 1.2,
+        'xtick.labelsize': 13,
+        'ytick.labelsize': 13,
+        'legend.fontsize': 12,
+        'figure.titlesize': 18,
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'axes.grid': True,
+        'grid.alpha': 0.3,
+        'grid.linewidth': 0.8,
+        'grid.linestyle': '--',
+    })
+    
+    fig = plt.figure(figsize=(15, 6))
+    
+    # Create grid: single row with 3 plots
+    gs = GridSpec(1, 3, figure=fig, hspace=0.3, wspace=0.35, 
+                  left=0.06, right=0.98, top=0.95, bottom=0.25)
     
     model_names = metrics_df['model_name'].values
+    
+    # Professional color palette (consistent, colorblind-friendly)
+    colors = {
+        'mse': '#2E86AB',      # Blue
+        'pearson': '#F18F01',  # Orange
+        'r2': '#C73E1D',       # Red
+        'deviance': '#6A994E', # Green
+        'rmsle': '#BC4749'     # Dark red
+    }
     
     # Helper function to set y-axis limits to show differences clearly
     def set_yaxis_to_show_differences(ax, values, min_pad=0.05, max_pad=0.1, start_at_zero=True, zoom_when_similar=True):
@@ -392,75 +441,197 @@ def plot_prediction_comparison(metrics_df: pd.DataFrame, output_dir: str):
         
         ax.set_ylim([y_min, y_max])
     
+    # Helper function to format axes consistently
+    def format_axes(ax, ylabel, title, use_scientific=False):
+        """Format axes with consistent styling."""
+        ax.set_ylabel(ylabel, fontsize=16, fontweight='bold')
+        ax.set_title(title, fontsize=17, fontweight='bold', pad=12)
+        ax.tick_params(axis='x', rotation=45, labelsize=13, length=4, width=1.2)
+        ax.tick_params(axis='y', labelsize=13, length=4, width=1.2)
+        ax.spines['bottom'].set_linewidth(1.2)
+        ax.spines['left'].set_linewidth(1.2)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8, axis='y')
+        ax.set_axisbelow(True)
+        
+        # Format y-axis with scientific notation if needed
+        if use_scientific:
+            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{x:.2e}'))
+        else:
+            # Use standard formatting with appropriate precision
+            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{x:.4f}' if abs(x) < 1 else f'{x:.3f}'))
+    
     # Plot 1: MSE (lower is better)
-    ax = axes[0, 0]
+    ax = fig.add_subplot(gs[0, 0])
     mse_vals = metrics_df['mse'].values
-    ax.bar(model_names, mse_vals, color='#4C78A8')
-    ax.set_ylabel('Mean Squared Error (MSE)')
-    ax.set_title('MSE (lower is better)')
-    ax.tick_params(axis='x', rotation=45)
+    bars = ax.bar(model_names, mse_vals, color=colors['mse'], alpha=0.85, edgecolor='black', linewidth=0.8)
+    format_axes(ax, 'Mean Squared Error', 'MSE', use_scientific=True)
     set_yaxis_to_show_differences(ax, mse_vals, start_at_zero=False, zoom_when_similar=True)
-    ax.grid(alpha=0.3, axis='y')
     
-    # Plot 2: MAE (lower is better)
-    ax = axes[0, 1]
-    mae_vals = metrics_df['mae'].values
-    ax.bar(model_names, mae_vals, color='#F58518')
-    ax.set_ylabel('Mean Absolute Error (MAE)')
-    ax.set_title('MAE (lower is better)')
-    ax.tick_params(axis='x', rotation=45)
-    set_yaxis_to_show_differences(ax, mae_vals, start_at_zero=False, zoom_when_similar=True)
-    ax.grid(alpha=0.3, axis='y')
-    
-    # Plot 3: Pearson correlation (higher is better)
-    ax = axes[0, 2]
+    # Plot 2: Pearson correlation (higher is better)
+    ax = fig.add_subplot(gs[0, 1])
     pearson_vals = metrics_df['pearson_r'].values
-    ax.bar(model_names, pearson_vals, color='#54A24B')
-    ax.set_ylabel('Pearson Correlation')
-    ax.set_title('Correlation (higher is better)')
-    ax.tick_params(axis='x', rotation=45)
-    # For correlation, zoom in to show differences if values are similar
+    bars = ax.bar(model_names, pearson_vals, color=colors['pearson'], alpha=0.85, edgecolor='black', linewidth=0.8)
+    format_axes(ax, 'Pearson Correlation', 'Correlation', use_scientific=False)
     set_yaxis_to_show_differences(ax, pearson_vals, start_at_zero=False, zoom_when_similar=True)
-    ax.grid(alpha=0.3, axis='y')
+    # Set reasonable limits for correlation (typically 0-1, but allow negative)
+    y_min_corr = min(pearson_vals) - 0.05 if min(pearson_vals) < 0 else max(0, min(pearson_vals) - 0.05)
+    y_max_corr = min(1.05, max(pearson_vals) + 0.05) if max(pearson_vals) <= 1 else max(pearson_vals) + 0.05
+    ax.set_ylim([y_min_corr, y_max_corr])
     
-    # Plot 4: R² (higher is better)
-    ax = axes[1, 0]
+    # Plot 3: R² (higher is better)
+    ax = fig.add_subplot(gs[0, 2])
     r2_vals = metrics_df['r_squared'].values
-    ax.bar(model_names, r2_vals, color='#E45756')
-    ax.set_ylabel('R²')
-    ax.set_title('R² (higher is better)')
-    ax.tick_params(axis='x', rotation=45)
-    # For R², zoom in to show differences
+    bars = ax.bar(model_names, r2_vals, color=colors['r2'], alpha=0.85, edgecolor='black', linewidth=0.8)
+    format_axes(ax, 'R²', 'R²', use_scientific=False)
     set_yaxis_to_show_differences(ax, r2_vals, start_at_zero=False, zoom_when_similar=True)
-    ax.grid(alpha=0.3, axis='y')
+    # Set reasonable limits for R² (can be negative for poor models)
+    y_min_r2 = min(r2_vals) - 0.05 if min(r2_vals) < 0 else max(0, min(r2_vals) - 0.05)
+    y_max_r2 = min(1.05, max(r2_vals) + 0.05) if max(r2_vals) <= 1 else max(r2_vals) + 0.05
+    ax.set_ylim([y_min_r2, y_max_r2])
     
-    # Plot 5: Poisson Deviance (lower is better)
-    ax = axes[1, 1]
-    deviance_vals = metrics_df['poisson_deviance'].values
-    ax.bar(model_names, deviance_vals, color='#72B7B2')
-    ax.set_ylabel('Poisson Deviance')
-    ax.set_title('Deviance (lower is better)')
-    ax.tick_params(axis='x', rotation=45)
-    # For large values, zoom in to show differences
-    set_yaxis_to_show_differences(ax, deviance_vals, start_at_zero=False, zoom_when_similar=True)
-    ax.grid(alpha=0.3, axis='y')
-    
-    # Plot 6: RMSLE (lower is better)
-    ax = axes[1, 2]
-    rmsle_vals = metrics_df['rmsle'].values
-    ax.bar(model_names, rmsle_vals, color='#B279A2')
-    ax.set_ylabel('Root Mean Squared Log Error')
-    ax.set_title('RMSLE (lower is better)')
-    ax.tick_params(axis='x', rotation=45)
-    set_yaxis_to_show_differences(ax, rmsle_vals, start_at_zero=False, zoom_when_similar=True)
-    ax.grid(alpha=0.3, axis='y')
-    
-    plt.tight_layout()
+    # Save with high quality
     output_path = os.path.join(output_dir, 'prediction_accuracy_comparison.png')
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.savefig(output_path.replace('.png', '.pdf'), bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close()
     
     print(f"Saved prediction comparison plot to {output_path}")
+
+
+def plot_combined_model_evaluation(
+    prediction_metrics_df: pd.DataFrame,
+    cv_results_path: str,
+    output_dir: str
+):
+    """
+    Create publication-ready single-row multiplot with 3 prediction accuracy metrics:
+    MSE, Pearson Correlation, and R².
+    
+    Args:
+        prediction_metrics_df: DataFrame with prediction accuracy metrics
+        cv_results_path: Path to CV results JSON file (unused, kept for compatibility)
+        output_dir: Output directory for plots
+    """
+    from matplotlib.gridspec import GridSpec
+    import matplotlib.ticker as ticker
+    
+    # Set publication-quality style
+    plt.rcParams.update({
+        'font.size': 11,
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans'],
+        'axes.labelsize': 12,
+        'axes.titlesize': 13,
+        'axes.linewidth': 1.2,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'legend.fontsize': 10,
+        'figure.titlesize': 14,
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'axes.grid': True,
+        'grid.alpha': 0.3,
+        'grid.linewidth': 0.8,
+        'grid.linestyle': '--',
+    })
+    
+    fig = plt.figure(figsize=(15, 5))
+    fig.suptitle('Model Evaluation: Prediction Accuracy', 
+                 fontsize=16, fontweight='bold', y=0.98)
+    
+    # Create grid: single row with 3 plots
+    gs = GridSpec(1, 3, figure=fig, hspace=0.3, wspace=0.35, 
+                  left=0.06, right=0.98, top=0.85, bottom=0.25)
+    
+    model_names = prediction_metrics_df['model_name'].values
+    
+    # Professional color palette
+    colors = {
+        'mse': '#2E86AB',      # Blue
+        'pearson': '#F18F01',  # Orange
+        'r2': '#C73E1D',       # Red
+    }
+    
+    # Helper function to set y-axis limits
+    def set_yaxis_to_show_differences(ax, values, min_pad=0.05, max_pad=0.1, start_at_zero=True, zoom_when_similar=True):
+        if len(values) == 0:
+            return
+        min_val = np.min(values)
+        max_val = np.max(values)
+        val_range = max_val - min_val
+        mean_val = np.mean(values)
+        
+        if zoom_when_similar and val_range > 0 and mean_val > 0:
+            range_pct = (val_range / mean_val) * 100
+            if range_pct < 5:
+                start_at_zero = False
+                min_pad = 0.2
+                max_pad = 0.2
+        
+        if start_at_zero and min_val >= 0:
+            y_min = 0
+        else:
+            y_min = min_val - (val_range * min_pad) if val_range > 0 else min_val * (1 - min_pad)
+            if start_at_zero and y_min < 0:
+                y_min = 0
+        
+        if val_range > 0:
+            y_max = max_val + (val_range * max_pad)
+        else:
+            y_max = max_val * (1 + max_pad) if max_val > 0 else max_pad
+        
+        ax.set_ylim([y_min, y_max])
+    
+    # Helper function to format axes consistently
+    def format_axes(ax, ylabel, title, use_scientific=False):
+        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+        ax.set_title(title, fontsize=13, fontweight='bold', pad=10)
+        ax.tick_params(axis='x', rotation=45, labelsize=10, length=4, width=1.2)
+        ax.tick_params(axis='y', labelsize=10, length=4, width=1.2)
+        ax.spines['bottom'].set_linewidth(1.2)
+        ax.spines['left'].set_linewidth(1.2)
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8, axis='y')
+        ax.set_axisbelow(True)
+        
+        if use_scientific:
+            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{x:.2e}'))
+        else:
+            ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{x:.4f}' if abs(x) < 1 else f'{x:.3f}'))
+    
+    # Plot 1: MSE (lower is better)
+    ax = fig.add_subplot(gs[0, 0])
+    mse_vals = prediction_metrics_df['mse'].values
+    bars = ax.bar(model_names, mse_vals, color=colors['mse'], alpha=0.85, edgecolor='black', linewidth=0.8)
+    format_axes(ax, 'Mean Squared Error', 'MSE', use_scientific=True)
+    set_yaxis_to_show_differences(ax, mse_vals, start_at_zero=False, zoom_when_similar=True)
+    
+    # Plot 2: Pearson correlation (higher is better)
+    ax = fig.add_subplot(gs[0, 1])
+    pearson_vals = prediction_metrics_df['pearson_r'].values
+    bars = ax.bar(model_names, pearson_vals, color=colors['pearson'], alpha=0.85, edgecolor='black', linewidth=0.8)
+    format_axes(ax, 'Pearson Correlation', 'Correlation', use_scientific=False)
+    set_yaxis_to_show_differences(ax, pearson_vals, start_at_zero=False, zoom_when_similar=True)
+    y_min_corr = min(pearson_vals) - 0.05 if min(pearson_vals) < 0 else max(0, min(pearson_vals) - 0.05)
+    y_max_corr = min(1.05, max(pearson_vals) + 0.05) if max(pearson_vals) <= 1 else max(pearson_vals) + 0.05
+    ax.set_ylim([y_min_corr, y_max_corr])
+    
+    # Plot 3: R² (higher is better)
+    ax = fig.add_subplot(gs[0, 2])
+    r2_vals = prediction_metrics_df['r_squared'].values
+    bars = ax.bar(model_names, r2_vals, color=colors['r2'], alpha=0.85, edgecolor='black', linewidth=0.8)
+    format_axes(ax, 'R²', 'R²', use_scientific=False)
+    set_yaxis_to_show_differences(ax, r2_vals, start_at_zero=False, zoom_when_similar=True)
+    y_min_r2 = min(r2_vals) - 0.05 if min(r2_vals) < 0 else max(0, min(r2_vals) - 0.05)
+    y_max_r2 = min(1.05, max(r2_vals) + 0.05) if max(r2_vals) <= 1 else max(r2_vals) + 0.05
+    ax.set_ylim([y_min_r2, y_max_r2])
+    
+    # Save with high quality
+    output_path = os.path.join(output_dir, 'combined_model_evaluation.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.savefig(output_path.replace('.png', '.pdf'), bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close()
+    
+    print(f"Saved combined model evaluation plot to {output_path}")
 
 
 def print_metrics_summary(metrics_df: pd.DataFrame):
@@ -482,13 +653,14 @@ def print_metrics_summary(metrics_df: pd.DataFrame):
         print(f"  RMSLE: {row['rmsle']:.4f}")
 
 
-def regenerate_plots_from_tsv(tsv_path: str, output_dir: str = None):
+def regenerate_plots_from_tsv(tsv_path: str, output_dir: str = None, cv_results_path: str = None):
     """
     Regenerate prediction accuracy plots from existing TSV file.
     
     Args:
         tsv_path: Path to prediction_accuracy_metrics.tsv file
         output_dir: Output directory for plots (default: same directory as TSV)
+        cv_results_path: Optional path to CV results JSON to create combined plot
     """
     if not os.path.exists(tsv_path):
         raise FileNotFoundError(f"TSV file not found: {tsv_path}")
@@ -507,6 +679,17 @@ def regenerate_plots_from_tsv(tsv_path: str, output_dir: str = None):
     plot_prediction_comparison(metrics_df, output_dir)
     
     print(f"\nPlots saved to {output_dir}/prediction_accuracy_comparison.png")
+    
+    # Create combined plot if CV results provided
+    if cv_results_path:
+        if os.path.exists(cv_results_path):
+            print(f"\nCreating combined model evaluation plot with CV results...")
+            plot_combined_model_evaluation(metrics_df, cv_results_path, output_dir)
+            print(f"Combined plot saved to {output_dir}/combined_model_evaluation.png")
+        else:
+            print(f"\nWarning: CV results file not found: {cv_results_path}")
+            print("  Skipping combined plot generation")
+    
     print("\nSummary of metrics:")
     print_metrics_summary(metrics_df)
 
@@ -522,6 +705,8 @@ if __name__ == '__main__':
                        help='Output directory from main modeling script (contains fitted_models/)')
     parser.add_argument('--regenerate-plots', type=str, metavar='TSV_PATH',
                        help='Regenerate plots from existing TSV file (provide path to prediction_accuracy_metrics.tsv)')
+    parser.add_argument('--cv-results', type=str, metavar='JSON_PATH',
+                       help='Path to CV results JSON file (for combined plot generation)')
     parser.add_argument('--counts-dir',
                        help='Directory with .counts files (for loading test data)')
     parser.add_argument('--genome-fasta',
@@ -537,7 +722,7 @@ if __name__ == '__main__':
     
     # If regenerating plots, do that and exit
     if args.regenerate_plots:
-        regenerate_plots_from_tsv(args.regenerate_plots, args.output_dir)
+        regenerate_plots_from_tsv(args.regenerate_plots, args.output_dir, args.cv_results)
         print("\nDone!")
         exit(0)
     
