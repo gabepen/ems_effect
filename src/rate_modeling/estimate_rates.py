@@ -1390,12 +1390,1283 @@ def fit_category_rates_nb_glm(site_df: pd.DataFrame, use_treatment_covariate: bo
         return None, None
 
 
-def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str = "poisson", 
-                            use_treatment_covariate: bool = True, alpha: float = 0.0):
-    """Compare mutation rates across categories (intergenic, synonymous, non-synonymous).
+def _fit_absolute_effect_model(df, categories, method, alpha, log_5mer_offset=None):
+    """
+    Fit constant absolute effect model.
     
-    Fits GLMs with category and treatment covariates, extracts rates for each category,
-    and creates comparison plots and reports.
+    Tests if treatment adds the same absolute number of mutations per base
+    across all categories (not proportional to baseline).
+    
+    Step 1: Estimate control rates by category (with optional 5mer normalization)
+    Step 2: Calculate excess mutations = observed - expected_control
+    Step 3: Fit GLM to excess mutations with identity link
+    Step 4: LRT comparing simple vs interaction models
+    
+    Args:
+        df: DataFrame with site-level data
+        categories: List of category names
+        method: GLM method ('poisson' or 'negative_binomial')
+        alpha: Background rate subtraction
+        log_5mer_offset: Optional Series of log(expected_rate_5mer) for sequence context normalization
+    
+    Returns:
+        dict with absolute_effect_result or None if failed
+    """
+    print("\n=== Using absolute effect model ===")
+    print("Step 1: Fitting control-only model to get category-specific baseline rates")
+    
+    control_df = df[df['is_control']].copy()
+    if len(control_df) == 0:
+        print("Warning: No control samples found")
+        return None
+    
+    # Fit control model
+    X_control = control_df[[f'cat_{cat}' for cat in categories[1:]]]
+    design_control = sm.add_constant(X_control, has_constant='add')
+    y_control = control_df['ems_count'].values
+    offset_control = control_df['log_depth'].values
+    
+    # Add 5mer offset for control samples if provided
+    if log_5mer_offset is not None:
+        valid_5mer_control = ~pd.isna(log_5mer_offset.loc[control_df.index])
+        if valid_5mer_control.sum() > 0:
+            offset_control = offset_control + log_5mer_offset.loc[control_df.index].fillna(0.0).values
+            print(f"  Using 5mer normalization for {valid_5mer_control.sum()} control sites")
+    
+    if alpha > 0:
+        y_control = np.maximum(0.0, y_control - alpha * control_df['depth'].values)
+    
+    try:
+        if method == "poisson":
+            model_control = sm.GLM(y_control, design_control, family=sm.families.Poisson(), offset=offset_control)
+            result_control = model_control.fit()
+        else:
+            exposure_control = np.exp(offset_control)
+            pois_model = sm.GLM(y_control, design_control, family=sm.families.Poisson(), offset=offset_control)
+            pois_result = pois_model.fit()
+            start_params = np.r_[pois_result.params.values, 0.1]
+            nb_model = NBDiscrete(y_control, design_control, exposure=exposure_control)
+            result_control = nb_model.fit(start_params=start_params, disp=False)
+        
+        # Extract control rates
+        beta0_control = result_control.params.get('const', np.nan)
+        beta_syn_control = result_control.params.get('cat_synonymous', 0.0)
+        beta_nonsyn_control = result_control.params.get('cat_non_synonymous', 0.0)
+        
+        print(f"  Control rates: intergenic={np.exp(beta0_control):.2e}, "
+              f"syn={np.exp(beta0_control + beta_syn_control):.2e}, "
+              f"nonsyn={np.exp(beta0_control + beta_nonsyn_control):.2e}")
+        
+        # Step 2: Calculate excess mutations for ALL samples (control and treated)
+        print("Step 2: Calculating excess mutations (observed - expected_control)")
+        df['expected_control_count'] = 0.0
+        for idx, row in df.iterrows():
+            cat = row['category']
+            if cat == 'intergenic':
+                log_rate = beta0_control
+            elif cat == 'synonymous':
+                log_rate = beta0_control + beta_syn_control
+            elif cat == 'non_synonymous':
+                log_rate = beta0_control + beta_nonsyn_control
+            else:
+                log_rate = beta0_control
+            
+            expected_rate = np.exp(log_rate)
+            df.loc[idx, 'expected_control_count'] = expected_rate * row['depth']
+        
+        df['excess_count'] = df['ems_count'] - df['expected_control_count']
+        
+        print(f"  Mean excess in controls: {df[df['is_control']]['excess_count'].mean():.2e}")
+        print(f"  Mean excess in treated: {df[~df['is_control']]['excess_count'].mean():.2e}")
+        
+        # Step 3: Fit models to excess counts using Gaussian family with identity link
+        # (excess can be negative, so we use Gaussian not Poisson)
+        print("Step 3: Fitting models to excess mutations")
+        
+        # We model excess as a function of treatment and depth
+        # Model: excess = β_treatment × depth × treatment + interactions
+        
+        # Create weighted depth variable for each category in treated samples
+        df['depth_treatment'] = df['depth'] * df['treatment']
+        df['depth_treatment_syn'] = df['depth'] * df['treatment'] * df['cat_synonymous']
+        df['depth_treatment_nonsyn'] = df['depth'] * df['treatment'] * df['cat_non_synonymous']
+        
+        # Simple model: excess = β × depth × treatment (no intercept, constant effect)
+        X_simple = df[['depth_treatment']]
+        y_excess = df['excess_count'].values
+        
+        # Fit with Gaussian family (identity link) - no intercept needed
+        model_simple = sm.GLM(y_excess, X_simple, family=sm.families.Gaussian())
+        result_simple = model_simple.fit()
+        
+        beta_simple = result_simple.params.get('depth_treatment', np.nan)
+        se_simple = result_simple.bse.get('depth_treatment', np.nan)
+        print(f"  Simple model: β_treatment = {beta_simple:.2e} (SE={se_simple:.2e})")
+        print(f"    → Treatment adds {beta_simple:.2e} mutations/base uniformly")
+        
+        # Interaction model: excess = β × depth × treatment + interactions
+        X_interaction = df[['depth_treatment', 'depth_treatment_syn', 'depth_treatment_nonsyn']]
+        model_interaction = sm.GLM(y_excess, X_interaction, family=sm.families.Gaussian())
+        result_interaction = model_interaction.fit()
+        
+        beta_inter = result_interaction.params.get('depth_treatment', np.nan)
+        beta_syn_inter = result_interaction.params.get('depth_treatment_syn', np.nan)
+        beta_nonsyn_inter = result_interaction.params.get('depth_treatment_nonsyn', np.nan)
+        
+        print(f"  Interaction model:")
+        print(f"    Intergenic: {beta_inter:.2e} mutations/base")
+        print(f"    Synonymous: {beta_inter + beta_syn_inter:.2e} mutations/base")
+        print(f"    Non-synonymous: {beta_inter + beta_nonsyn_inter:.2e} mutations/base")
+        
+        # Step 4: Likelihood ratio test
+        # For Gaussian models, LR = (RSS_simple - RSS_interaction) / (RSS_interaction / (n - p_interaction))
+        # But we'll use deviance which is analogous
+        lr_stat = result_simple.deviance - result_interaction.deviance
+        df_diff = 2  # 2 additional parameters in interaction model
+        lr_pvalue = 1 - stats.chi2.cdf(lr_stat, df=df_diff)
+        
+        print(f"\n=== Absolute effect model results ===")
+        print(f"LR test: LR={lr_stat:.4f}, p={lr_pvalue:.4e}")
+        if lr_pvalue > 0.05:
+            print(f"  → p > 0.05: Absolute treatment effect is CONSTANT across categories")
+        else:
+            print(f"  → p < 0.05: Absolute treatment effect DIFFERS across categories")
+        print("="*60)
+        
+        return {
+            'result_simple': result_simple,
+            'result_interaction': result_interaction,
+            'result_control': result_control,
+            'beta0_control': beta0_control,
+            'beta_syn_control': beta_syn_control,
+            'beta_nonsyn_control': beta_nonsyn_control,
+            'lr_stat': lr_stat,
+            'lr_pvalue': lr_pvalue,
+            'beta_simple': beta_simple,
+            'se_simple': se_simple,
+            'beta_intergenic': beta_inter,
+            'beta_synonymous': beta_inter + beta_syn_inter,
+            'beta_nonsyn': beta_inter + beta_nonsyn_inter,
+            'df_modified': df
+        }
+        
+    except Exception as e:
+        print(f"Warning: Absolute effect model failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _fit_control_baseline_model(df, categories, method, alpha, log_5mer_offset=None):
+    """
+    Fit control-baseline model: first estimate control rates, then test treatment effects.
+    
+    Args:
+        df: DataFrame with site-level data
+        categories: List of category names
+        method: GLM method ('poisson' or 'negative_binomial')
+        alpha: Background rate subtraction
+        log_5mer_offset: Optional Series of log(expected_rate_5mer) for sequence context normalization
+    
+    Returns:
+        dict with control_baseline_result or None if failed
+    """
+    print("\n=== Using control-baseline approach ===")
+    print("Step 1: Fitting control-only model to get category-specific baseline rates")
+    
+    control_df = df[df['is_control']].copy()
+    if len(control_df) == 0:
+        print("Warning: No control samples found")
+        return None
+    
+    # Fit control model
+    X_control = control_df[[f'cat_{cat}' for cat in categories[1:]]]
+    design_control = sm.add_constant(X_control, has_constant='add')
+    y_control = control_df['ems_count'].values
+    offset_control = control_df['log_depth'].values
+    
+    # Add 5mer offset for control samples if provided
+    if log_5mer_offset is not None:
+        valid_5mer_control = ~pd.isna(log_5mer_offset.loc[control_df.index])
+        if valid_5mer_control.sum() > 0:
+            offset_control = offset_control + log_5mer_offset.loc[control_df.index].fillna(0.0).values
+            print(f"  Using 5mer normalization for {valid_5mer_control.sum()} control sites")
+    
+    if alpha > 0:
+        y_control = np.maximum(0.0, y_control - alpha * control_df['depth'].values)
+    
+    try:
+        if method == "poisson":
+            model_control = sm.GLM(y_control, design_control, family=sm.families.Poisson(), offset=offset_control)
+            result_control = model_control.fit()
+        else:
+            exposure_control = np.exp(offset_control)
+            pois_model = sm.GLM(y_control, design_control, family=sm.families.Poisson(), offset=offset_control)
+            pois_result = pois_model.fit()
+            start_params = np.r_[pois_result.params.values, 0.1]
+            nb_model = NBDiscrete(y_control, design_control, exposure=exposure_control)
+            result_control = nb_model.fit(start_params=start_params, disp=False)
+        
+        # Extract control rates
+        beta0_control = result_control.params.get('const', np.nan)
+        beta_syn_control = result_control.params.get('cat_synonymous', 0.0)
+        beta_nonsyn_control = result_control.params.get('cat_non_synonymous', 0.0)
+        
+        print(f"  Control rates: intergenic={np.exp(beta0_control):.2e}, "
+              f"syn={np.exp(beta0_control + beta_syn_control):.2e}, "
+              f"nonsyn={np.exp(beta0_control + beta_nonsyn_control):.2e}")
+        
+        # Calculate expected control rate for each site
+        df['log_expected_control_rate'] = np.nan
+        for idx, row in df.iterrows():
+            cat = row['category']
+            if cat == 'intergenic':
+                log_rate = beta0_control
+            elif cat == 'synonymous':
+                log_rate = beta0_control + beta_syn_control
+            elif cat == 'non_synonymous':
+                log_rate = beta0_control + beta_nonsyn_control
+            else:
+                log_rate = beta0_control
+            df.loc[idx, 'log_expected_control_rate'] = log_rate
+        
+        print("Step 2: Fitting treatment model with control rates as baseline offset")
+        
+        # Fit treatment models (simple and interaction)
+        X_treatment = df[['treatment']]
+        design_treatment = sm.add_constant(X_treatment, has_constant='add')
+        y_all = df['ems_count'].values
+        offset_treatment = df['log_depth'].values + df['log_expected_control_rate'].values
+        
+        # Add 5mer offset for all samples if provided
+        if log_5mer_offset is not None:
+            valid_5mer_all = ~pd.isna(log_5mer_offset)
+            if valid_5mer_all.sum() > 0:
+                offset_treatment = offset_treatment + log_5mer_offset.fillna(0.0).values
+                print(f"  Using 5mer normalization for {valid_5mer_all.sum()} sites in treatment model")
+        
+        if alpha > 0:
+            y_all = np.maximum(0.0, y_all - alpha * df['depth'].values)
+        
+        # Simple model
+        if method == "poisson":
+            model_simple = sm.GLM(y_all, design_treatment, family=sm.families.Poisson(), offset=offset_treatment)
+            result_simple = model_simple.fit()
+        else:
+            exposure = np.exp(offset_treatment)
+            pois_model = sm.GLM(y_all, design_treatment, family=sm.families.Poisson(), offset=offset_treatment)
+            pois_result = pois_model.fit()
+            start_params = np.r_[pois_result.params.values, 0.1]
+            nb_model = NBDiscrete(y_all, design_treatment, exposure=exposure)
+            result_simple = nb_model.fit(start_params=start_params, disp=False)
+        
+        beta_treatment_simple = result_simple.params.get('treatment', np.nan)
+        beta_treatment_se_simple = result_simple.bse.get('treatment', np.nan)
+        
+        print("Step 3: Fitting model WITH category×treatment interactions")
+        
+        # Interaction model
+        X_interaction = df[['treatment']].copy()
+        for cat in categories[1:]:
+            df[f'treatment_x_cat_{cat}'] = df['treatment'] * df[f'cat_{cat}']
+            X_interaction = pd.concat([X_interaction, df[[f'treatment_x_cat_{cat}']]], axis=1)
+        
+        design_interaction = sm.add_constant(X_interaction, has_constant='add')
+        
+        if method == "poisson":
+            model_interaction = sm.GLM(y_all, design_interaction, family=sm.families.Poisson(), offset=offset_treatment)
+            result_interaction = model_interaction.fit()
+        else:
+            nb_model = NBDiscrete(y_all, design_interaction, exposure=exposure)
+            pois_model = sm.GLM(y_all, design_interaction, family=sm.families.Poisson(), offset=offset_treatment)
+            pois_result = pois_model.fit()
+            pois_coefs = pois_result.params.values
+            alpha_val = 0.1
+            start_params = np.r_[pois_coefs, alpha_val]
+            result_interaction = nb_model.fit(start_params=start_params, disp=False)
+        
+        # Likelihood ratio test
+        lr_stat = 2 * (result_interaction.llf - result_simple.llf)
+        lr_pvalue = 1 - stats.chi2.cdf(lr_stat, df=2)
+        
+        print(f"\n=== Control-baseline model results ===")
+        print(f"Treatment effect (constant): β={beta_treatment_simple:.4f} (SE={beta_treatment_se_simple:.4f})")
+        print(f"Rate ratio: exp(β)={np.exp(beta_treatment_simple):.4f}")
+        print(f"LR test: LR={lr_stat:.4f}, p={lr_pvalue:.4e}")
+        if lr_pvalue > 0.05:
+            print(f"  → p > 0.05: Treatment effect is SAME across categories")
+        else:
+            print(f"  → p < 0.05: Treatment effect DIFFERS across categories")
+        print("="*60)
+        
+        return {
+            'result_simple': result_simple,
+            'result_interaction': result_interaction,
+            'result_control': result_control,
+            'beta0_control': beta0_control,
+            'beta_syn_control': beta_syn_control,
+            'beta_nonsyn_control': beta_nonsyn_control,
+            'lr_stat': lr_stat,
+            'lr_pvalue': lr_pvalue,
+            'beta_treatment_simple': beta_treatment_simple,
+            'beta_treatment_se_simple': beta_treatment_se_simple,
+            'df_modified': df
+        }
+        
+    except Exception as e:
+        print(f"Warning: Control-baseline model failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _fit_standard_model(df, categories, method, alpha, use_treatment_covariate, log_5mer_offset=None):
+    """
+    Fit standard interaction model.
+    
+    Args:
+        df: DataFrame with site-level data
+        categories: List of category names
+        method: GLM method ('poisson' or 'negative_binomial')
+        alpha: Background rate subtraction
+        use_treatment_covariate: Include treatment covariate
+        log_5mer_offset: Optional Series of log(expected_rate_5mer) for sequence context normalization
+    
+    Returns:
+        fitted model result or None if failed
+    """
+    if use_treatment_covariate:
+        X_cols = ['treatment'] + [f'cat_{cat}' for cat in categories[1:]]
+        for cat in categories[1:]:
+            df[f'treatment_x_cat_{cat}'] = df['treatment'] * df[f'cat_{cat}']
+            X_cols.append(f'treatment_x_cat_{cat}')
+        X = df[X_cols]
+    else:
+        X = df[[f'cat_{cat}' for cat in categories[1:]]]
+    
+    design = sm.add_constant(X, has_constant='add')
+    y = df['ems_count'].values
+    offset = df['log_depth'].values
+    
+    # Add 5mer offset if provided: log(E[Y]) = log(depth) + log(expected_rate_5mer) + X*beta
+    if log_5mer_offset is not None:
+        valid_5mer = ~pd.isna(log_5mer_offset)
+        if valid_5mer.sum() > 0:
+            offset = offset + log_5mer_offset.fillna(0.0).values
+            print(f"  Using 5mer normalization for {valid_5mer.sum()} sites")
+    
+    if alpha > 0:
+        y = np.maximum(0.0, y - alpha * df['depth'].values)
+    
+    try:
+        if method == "poisson":
+            model = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset)
+            result = model.fit()
+        else:
+            exposure = np.exp(offset)
+            pois_model = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset)
+            pois_result = pois_model.fit()
+            start_params = np.r_[pois_result.params.values, 0.1]
+            nb_model = NBDiscrete(y, design, exposure=exposure)
+            result = nb_model.fit(start_params=start_params, disp=False)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error fitting standard model: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _calculate_rates_and_cis(result, categories, use_treatment_covariate, control_baseline_result=None, mean_expected_rates=None):
+    """
+    Calculate rates and confidence intervals from fitted model.
+    
+    If control_baseline_result is provided, uses control-baseline approach:
+    - Control rates from Step 1 (result_control)
+    - Treated rates as control_rate × exp(treatment_effects) from Step 2 (result_interaction)
+    
+    Otherwise, extracts rates from standard interaction model.
+    
+    If mean_expected_rates is provided (from 5mer normalization), the rates are multiplied
+    by the appropriate mean expected rate to convert from relative (exp(beta)) to absolute
+    per-base rates.
+    
+    Args:
+        result: Fitted GLM result
+        categories: List of category names
+        use_treatment_covariate: Whether treatment covariate was used
+        control_baseline_result: Optional control-baseline model results
+        mean_expected_rates: Optional dict mapping 'category_treatment' to mean expected 5mer rate
+    
+    Returns:
+        tuple of (rates dict, cis dict)
+    """
+    rates = {}
+    cis = {}
+    
+    # Control-baseline approach: extract rates differently
+    if control_baseline_result is not None:
+        # Check if this is an absolute effect model (identity link) or control-baseline (log link)
+        is_absolute_effect_model = 'beta_intergenic' in control_baseline_result
+        
+        if is_absolute_effect_model:
+            print("Extracting rates from ABSOLUTE EFFECT model (identity link)")
+        else:
+            print("Extracting rates from control-baseline model (log link)")
+        
+        # Step 1: Get control rates from control-only model
+        result_control = control_baseline_result['result_control']
+        beta0_control = control_baseline_result['beta0_control']
+        beta_syn_control = control_baseline_result['beta_syn_control']
+        beta_nonsyn_control = control_baseline_result['beta_nonsyn_control']
+        
+        # Control rates
+        # If 5mer normalization was used, multiply by mean expected rate to get actual rates
+        control_rates = {
+            'intergenic': np.exp(beta0_control),
+            'synonymous': np.exp(beta0_control + beta_syn_control),
+            'non_synonymous': np.exp(beta0_control + beta_nonsyn_control)
+        }
+        
+        # Apply 5mer normalization scaling if available
+        if mean_expected_rates is not None:
+            for cat in control_rates:
+                key = f'{cat}_control'
+                if key in mean_expected_rates and np.isfinite(mean_expected_rates[key]):
+                    control_rates[cat] = control_rates[cat] * mean_expected_rates[key]
+        
+        # Control CIs (from result_control)
+        try:
+            vcov_control = result_control.cov_params()
+            for cat in categories:
+                if cat == 'intergenic':
+                    var = vcov_control.loc['const', 'const']
+                    se = np.sqrt(var) if var > 0 else np.nan
+                    ci_low = control_rates[cat] * np.exp(-1.96 * se) if np.isfinite(se) else np.nan
+                    ci_high = control_rates[cat] * np.exp(1.96 * se) if np.isfinite(se) else np.nan
+                elif cat == 'synonymous':
+                    var = (vcov_control.loc['const', 'const'] + 
+                           vcov_control.loc['cat_synonymous', 'cat_synonymous'] +
+                           2 * vcov_control.loc['const', 'cat_synonymous'])
+                    se = np.sqrt(var) if var > 0 else np.nan
+                    ci_low = control_rates[cat] * np.exp(-1.96 * se) if np.isfinite(se) else np.nan
+                    ci_high = control_rates[cat] * np.exp(1.96 * se) if np.isfinite(se) else np.nan
+                elif cat == 'non_synonymous':
+                    var = (vcov_control.loc['const', 'const'] + 
+                           vcov_control.loc['cat_non_synonymous', 'cat_non_synonymous'] +
+                           2 * vcov_control.loc['const', 'cat_non_synonymous'])
+                    se = np.sqrt(var) if var > 0 else np.nan
+                    ci_low = control_rates[cat] * np.exp(-1.96 * se) if np.isfinite(se) else np.nan
+                    ci_high = control_rates[cat] * np.exp(1.96 * se) if np.isfinite(se) else np.nan
+                
+                rates[f'{cat}_control'] = control_rates[cat]
+                cis[f'{cat}_control'] = (ci_low, ci_high)
+        except Exception as e:
+            print(f"Warning: Failed to calculate control CIs: {e}")
+            for cat in categories:
+                rates[f'{cat}_control'] = control_rates[cat]
+                cis[f'{cat}_control'] = (np.nan, np.nan)
+        
+        # Step 2: Get treatment effects
+        if is_absolute_effect_model:
+            # ABSOLUTE EFFECT MODEL (identity link): treated_rate = control_rate + β_absolute
+            # Get absolute treatment effects directly from the model
+            beta_abs_intergenic = control_baseline_result.get('beta_intergenic', np.nan)
+            beta_abs_synonymous = control_baseline_result.get('beta_synonymous', np.nan)
+            beta_abs_nonsyn = control_baseline_result.get('beta_nonsyn', np.nan)
+            
+            # Get SEs from the interaction model
+            result_interaction = control_baseline_result['result_interaction']
+            try:
+                vcov_interaction = result_interaction.cov_params()
+            except:
+                vcov_interaction = None
+            
+            # Store absolute effects for reporting
+            rates['absolute_effect_intergenic'] = beta_abs_intergenic
+            rates['absolute_effect_synonymous'] = beta_abs_synonymous
+            rates['absolute_effect_nonsyn'] = beta_abs_nonsyn
+            
+            for cat in categories:
+                control_rate = control_rates[cat]
+                
+                # Get absolute treatment effect for this category
+                if cat == 'intergenic':
+                    abs_effect = beta_abs_intergenic
+                    if vcov_interaction is not None and 'depth_treatment' in vcov_interaction.index:
+                        var_treatment = vcov_interaction.loc['depth_treatment', 'depth_treatment']
+                    else:
+                        var_treatment = np.nan
+                elif cat == 'synonymous':
+                    abs_effect = beta_abs_synonymous
+                    if vcov_interaction is not None:
+                        try:
+                            var_treatment = (vcov_interaction.loc['depth_treatment', 'depth_treatment'] +
+                                           vcov_interaction.loc['depth_treatment_syn', 'depth_treatment_syn'] +
+                                           2 * vcov_interaction.loc['depth_treatment', 'depth_treatment_syn'])
+                        except:
+                            var_treatment = np.nan
+                    else:
+                        var_treatment = np.nan
+                elif cat == 'non_synonymous':
+                    abs_effect = beta_abs_nonsyn
+                    if vcov_interaction is not None:
+                        try:
+                            var_treatment = (vcov_interaction.loc['depth_treatment', 'depth_treatment'] +
+                                           vcov_interaction.loc['depth_treatment_nonsyn', 'depth_treatment_nonsyn'] +
+                                           2 * vcov_interaction.loc['depth_treatment', 'depth_treatment_nonsyn'])
+                        except:
+                            var_treatment = np.nan
+                    else:
+                        var_treatment = np.nan
+                
+                # IDENTITY LINK: treated_rate = control_rate + abs_effect
+                treated_rate = control_rate + abs_effect
+                
+                # Apply 5mer normalization to treated rate if available
+                if mean_expected_rates is not None:
+                    key = f'{cat}_treated'
+                    if key in mean_expected_rates and np.isfinite(mean_expected_rates[key]):
+                        # For absolute model with 5mer: multiply the absolute effect by the 5mer ratio
+                        # This accounts for different 5mer compositions in treated vs control
+                        pass  # The abs_effect is already in the right units
+                
+                # CI for identity link: treated_rate ± 1.96 × SE
+                se_treatment = np.sqrt(var_treatment) if np.isfinite(var_treatment) and var_treatment > 0 else np.nan
+                if np.isfinite(se_treatment):
+                    ci_low = treated_rate - 1.96 * se_treatment
+                    ci_high = treated_rate + 1.96 * se_treatment
+                else:
+                    ci_low = np.nan
+                    ci_high = np.nan
+                
+                rates[f'{cat}_treated'] = treated_rate
+                cis[f'{cat}_treated'] = (ci_low, ci_high)
+                
+                print(f"  {cat}: control={control_rate:.2e}, treated={treated_rate:.2e} (abs_effect={abs_effect:.2e})")
+            
+        else:
+            # CONTROL-BASELINE MODEL (log link): treated_rate = control_rate × exp(β_treatment)
+            result_interaction = control_baseline_result['result_interaction']
+            beta_treatment = result_interaction.params.get('treatment', np.nan)
+            beta_treatment_syn = result_interaction.params.get('treatment_x_cat_synonymous', 0.0)
+            beta_treatment_nonsyn = result_interaction.params.get('treatment_x_cat_non_synonymous', 0.0)
+            
+            try:
+                vcov_interaction = result_interaction.cov_params()
+            except:
+                vcov_interaction = None
+            
+            for cat in categories:
+                control_rate = control_rates[cat]
+                
+                if cat == 'intergenic':
+                    treatment_effect = beta_treatment
+                    if vcov_interaction is not None:
+                        var_treatment = vcov_interaction.loc['treatment', 'treatment']
+                    else:
+                        var_treatment = np.nan
+                elif cat == 'synonymous':
+                    treatment_effect = beta_treatment + beta_treatment_syn
+                    if vcov_interaction is not None:
+                        var_treatment = (vcov_interaction.loc['treatment', 'treatment'] +
+                                       vcov_interaction.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
+                                       2 * vcov_interaction.loc['treatment', 'treatment_x_cat_synonymous'])
+                    else:
+                        var_treatment = np.nan
+                elif cat == 'non_synonymous':
+                    treatment_effect = beta_treatment + beta_treatment_nonsyn
+                    if vcov_interaction is not None:
+                        var_treatment = (vcov_interaction.loc['treatment', 'treatment'] +
+                                       vcov_interaction.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] +
+                                       2 * vcov_interaction.loc['treatment', 'treatment_x_cat_non_synonymous'])
+                    else:
+                        var_treatment = np.nan
+                
+                treated_rate = control_rate * np.exp(treatment_effect)
+                
+                # Approximate CI (ignoring covariance between control and treatment estimates)
+                se_treatment = np.sqrt(var_treatment) if np.isfinite(var_treatment) and var_treatment > 0 else np.nan
+                if np.isfinite(se_treatment):
+                    ci_low = treated_rate * np.exp(-1.96 * se_treatment)
+                    ci_high = treated_rate * np.exp(1.96 * se_treatment)
+                else:
+                    ci_low = np.nan
+                    ci_high = np.nan
+                
+                rates[f'{cat}_treated'] = treated_rate
+                cis[f'{cat}_treated'] = (ci_low, ci_high)
+        
+        return rates, cis
+    
+    # Standard approach: extract rates from interaction model
+    beta0 = result.params.get('const', np.nan)
+    beta_treatment = result.params.get('treatment', 0.0) if use_treatment_covariate else 0.0
+    beta_syn = result.params.get('cat_synonymous', 0.0)
+    beta_nonsyn = result.params.get('cat_non_synonymous', 0.0)
+    beta_treatment_syn = result.params.get('treatment_x_cat_synonymous', 0.0) if use_treatment_covariate else 0.0
+    beta_treatment_nonsyn = result.params.get('treatment_x_cat_non_synonymous', 0.0) if use_treatment_covariate else 0.0
+    
+    try:
+        vcov = result.cov_params()
+    except:
+        vcov = None
+    
+    for cat in categories:
+        for is_control in [True, False]:
+            linear_pred = beta0
+            
+            if cat == 'synonymous':
+                linear_pred += beta_syn
+            elif cat == 'non_synonymous':
+                linear_pred += beta_nonsyn
+            
+            if not is_control and use_treatment_covariate:
+                linear_pred += beta_treatment
+                if cat == 'synonymous':
+                    linear_pred += beta_treatment_syn
+                elif cat == 'non_synonymous':
+                    linear_pred += beta_treatment_nonsyn
+            
+            rate = np.exp(linear_pred) if np.isfinite(linear_pred) else np.nan
+            
+            # Apply 5mer normalization scaling if available
+            # This converts from relative rate (exp(beta)) to absolute per-base rate
+            treatment_label = 'control' if is_control else 'treated'
+            key = f"{cat}_{treatment_label}"
+            if mean_expected_rates is not None and key in mean_expected_rates:
+                expected_rate = mean_expected_rates[key]
+                if np.isfinite(expected_rate) and expected_rate > 0:
+                    rate = rate * expected_rate
+            
+            # Calculate variance using delta method
+            var_linear = _calc_var_linear(cat, is_control, vcov, use_treatment_covariate)
+            se_linear = np.sqrt(var_linear) if np.isfinite(var_linear) and var_linear > 0 else np.nan
+            
+            if np.isfinite(se_linear) and se_linear > 0:
+                ci_low = rate * np.exp(-1.96 * se_linear)
+                ci_high = rate * np.exp(1.96 * se_linear)
+            else:
+                ci_low = np.nan
+                ci_high = np.nan
+            
+            rates[key] = rate
+            cis[key] = (ci_low, ci_high)
+    
+    return rates, cis
+
+
+def _calc_var_linear(cat, is_control, vcov, use_treatment_covariate):
+    """Calculate variance of linear predictor using delta method."""
+    if vcov is None:
+        return np.nan
+    
+    var = 0.0
+    
+    if 'const' in vcov.index:
+        var += vcov.loc['const', 'const']
+    
+    if not is_control and use_treatment_covariate and 'treatment' in vcov.index:
+        var += vcov.loc['treatment', 'treatment']
+        if 'const' in vcov.index:
+            var += 2 * vcov.loc['const', 'treatment']
+    
+    if cat == 'synonymous' and 'cat_synonymous' in vcov.index:
+        var += vcov.loc['cat_synonymous', 'cat_synonymous']
+        if 'const' in vcov.index:
+            var += 2 * vcov.loc['const', 'cat_synonymous']
+        if not is_control and use_treatment_covariate:
+            if 'treatment' in vcov.index:
+                var += 2 * vcov.loc['treatment', 'cat_synonymous']
+            if 'treatment_x_cat_synonymous' in vcov.index:
+                var += vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous']
+                if 'const' in vcov.index:
+                    var += 2 * vcov.loc['const', 'treatment_x_cat_synonymous']
+                if 'treatment' in vcov.index:
+                    var += 2 * vcov.loc['treatment', 'treatment_x_cat_synonymous']
+                var += 2 * vcov.loc['cat_synonymous', 'treatment_x_cat_synonymous']
+    
+    elif cat == 'non_synonymous' and 'cat_non_synonymous' in vcov.index:
+        var += vcov.loc['cat_non_synonymous', 'cat_non_synonymous']
+        if 'const' in vcov.index:
+            var += 2 * vcov.loc['const', 'cat_non_synonymous']
+        if not is_control and use_treatment_covariate:
+            if 'treatment' in vcov.index:
+                var += 2 * vcov.loc['treatment', 'cat_non_synonymous']
+            if 'treatment_x_cat_non_synonymous' in vcov.index:
+                var += vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous']
+                if 'const' in vcov.index:
+                    var += 2 * vcov.loc['const', 'treatment_x_cat_non_synonymous']
+                if 'treatment' in vcov.index:
+                    var += 2 * vcov.loc['treatment', 'treatment_x_cat_non_synonymous']
+                var += 2 * vcov.loc['cat_non_synonymous', 'treatment_x_cat_non_synonymous']
+    
+    return var if np.isfinite(var) and var > 0 else np.nan
+
+
+def _run_statistical_tests(result, df, rates, cis, use_treatment_covariate, control_baseline_result, absolute_effect_result=None):
+    """
+    Run all statistical tests.
+    
+    Returns:
+        list of test result dicts
+    """
+    test_results = []
+    
+    # Add absolute effect model test if available (PRIMARY TEST)
+    if absolute_effect_result is not None:
+        test_results.append({
+            'test': 'Absolute effect model: Treatment adds constant mutations/base across categories?',
+            'coefficient': 'Likelihood ratio test (simple vs interaction model on excess counts)',
+            'estimate': absolute_effect_result['lr_stat'],
+            'SE': np.nan,
+            'z': np.nan,
+            'p_value': absolute_effect_result['lr_pvalue'],
+            'rate_ratio': np.nan,
+            'rate_ratio_CI_low': np.nan,
+            'rate_ratio_CI_high': np.nan,
+            'absolute_effect_intergenic': absolute_effect_result['beta_intergenic'],
+            'absolute_effect_synonymous': absolute_effect_result['beta_synonymous'],
+            'absolute_effect_nonsyn': absolute_effect_result['beta_nonsyn'],
+            'interpretation': 'Tests if treatment adds the same ABSOLUTE mutations/base across categories. p > 0.05 means absolute effect is constant (category does NOT matter).'
+        })
+        print(f"✓ Added absolute effect model test: p={absolute_effect_result['lr_pvalue']:.4e}")
+    
+    # Add control-baseline test if available
+    if control_baseline_result is not None:
+        test_results.append({
+            'test': 'Control-baseline: Treatment effect constant across categories?',
+            'coefficient': 'Likelihood ratio test (simple vs interaction model)',
+            'estimate': control_baseline_result['lr_stat'],
+            'SE': np.nan,
+            'z': np.nan,
+            'p_value': control_baseline_result['lr_pvalue'],
+            'rate_ratio': np.exp(control_baseline_result['beta_treatment_simple']),
+            'rate_ratio_CI_low': np.exp(control_baseline_result['beta_treatment_simple'] - 1.96 * control_baseline_result['beta_treatment_se_simple']),
+            'rate_ratio_CI_high': np.exp(control_baseline_result['beta_treatment_simple'] + 1.96 * control_baseline_result['beta_treatment_se_simple']),
+            'interpretation': 'Tests if treatment has same PROPORTIONAL effect across categories (p > 0.05 means proportional effect is constant)'
+        })
+        print(f"✓ Added control-baseline test: p={control_baseline_result['lr_pvalue']:.4e}")
+    
+    if not use_treatment_covariate:
+        return test_results
+    
+    # Get coefficients
+    beta_treatment = result.params.get('treatment', 0.0)
+    beta_syn = result.params.get('cat_synonymous', 0.0)
+    beta_nonsyn = result.params.get('cat_non_synonymous', 0.0)
+    beta_treatment_syn = result.params.get('treatment_x_cat_synonymous', 0.0)
+    beta_treatment_nonsyn = result.params.get('treatment_x_cat_non_synonymous', 0.0)
+    
+    try:
+        vcov = result.cov_params()
+    except:
+        vcov = None
+    
+    # Test: Absolute treatment effect (coding vs intergenic)
+    if 'intergenic_control' in rates and 'intergenic_treated' in rates:
+        test_results.extend(_test_absolute_treatment_effect(df, rates, cis))
+    
+    # Test: Category effects in treated
+    if 'cat_synonymous' in result.params.index and 'treatment_x_cat_synonymous' in result.params.index:
+        test_results.extend(_test_category_effects_in_treated(result, beta_syn, beta_nonsyn, beta_treatment_syn, beta_treatment_nonsyn, vcov))
+    
+    # Test: Treatment effect
+    if 'treatment' in result.params.index:
+        beta_treatment_se = result.bse.get('treatment', np.nan)
+        if np.isfinite(beta_treatment) and np.isfinite(beta_treatment_se) and beta_treatment_se > 0:
+            z_treatment = beta_treatment / beta_treatment_se
+            p_treatment = 2 * (1 - stats.norm.cdf(abs(z_treatment)))
+            test_results.append({
+                'test': 'treatment effect (intergenic)',
+                'coefficient': 'β_treatment',
+                'estimate': beta_treatment,
+                'SE': beta_treatment_se,
+                'z': z_treatment,
+                'p_value': p_treatment,
+                'rate_ratio': np.exp(beta_treatment),
+                'rate_ratio_CI_low': np.exp(beta_treatment - 1.96 * beta_treatment_se),
+                'rate_ratio_CI_high': np.exp(beta_treatment + 1.96 * beta_treatment_se),
+            })
+    
+    # Test: Interaction terms (EMS effect on category differences)
+    test_results.extend(_test_interaction_terms(result, beta_treatment_syn, beta_treatment_nonsyn, vcov))
+    
+    # Test: Category differences within controls
+    test_results.extend(_test_category_effects_in_controls(result, beta_syn, beta_nonsyn, vcov))
+    
+    return test_results
+
+
+def _test_absolute_treatment_effect(df, rates, cis):
+    """Test if absolute treatment effect is the same for coding and intergenic."""
+    tests = []
+    
+    if 'synonymous_control' not in rates or 'non_synonymous_control' not in rates:
+        return tests
+    
+    treated_df = df[df['treatment'] == 1].copy()
+    n_syn = treated_df[treated_df['category'] == 'synonymous']['depth'].sum()
+    n_nonsyn = treated_df[treated_df['category'] == 'non_synonymous']['depth'].sum()
+    n_coding = n_syn + n_nonsyn
+    
+    if n_coding == 0:
+        return tests
+    
+    try:
+        # Calculate weighted average rates
+        syn_control = rates['synonymous_control']
+        nonsyn_control = rates['non_synonymous_control']
+        syn_treated = rates['synonymous_treated']
+        nonsyn_treated = rates['non_synonymous_treated']
+        
+        coding_control = (n_syn * syn_control + n_nonsyn * nonsyn_control) / n_coding
+        coding_treated = (n_syn * syn_treated + n_nonsyn * nonsyn_treated) / n_coding
+        
+        abs_effect_intergenic = rates['intergenic_treated'] - rates['intergenic_control']
+        abs_effect_coding = coding_treated - coding_control
+        abs_diff = abs_effect_coding - abs_effect_intergenic
+        
+        # Calculate SE
+        ci_ig_c = cis['intergenic_control']
+        ci_ig_t = cis['intergenic_treated']
+        ci_syn_c = cis['synonymous_control']
+        ci_syn_t = cis['synonymous_treated']
+        ci_ns_c = cis['non_synonymous_control']
+        ci_ns_t = cis['non_synonymous_treated']
+        
+        se_ig_c = (ci_ig_c[1] - ci_ig_c[0]) / (2 * 1.96)
+        se_ig_t = (ci_ig_t[1] - ci_ig_t[0]) / (2 * 1.96)
+        se_syn_c = (ci_syn_c[1] - ci_syn_c[0]) / (2 * 1.96)
+        se_syn_t = (ci_syn_t[1] - ci_syn_t[0]) / (2 * 1.96)
+        se_ns_c = (ci_ns_c[1] - ci_ns_c[0]) / (2 * 1.96)
+        se_ns_t = (ci_ns_t[1] - ci_ns_t[0]) / (2 * 1.96)
+        
+        se_coding_c = np.sqrt((n_syn**2 * se_syn_c**2 + n_nonsyn**2 * se_ns_c**2) / (n_coding**2))
+        se_coding_t = np.sqrt((n_syn**2 * se_syn_t**2 + n_nonsyn**2 * se_ns_t**2) / (n_coding**2))
+        
+        se_abs_ig = np.sqrt(se_ig_t**2 + se_ig_c**2)
+        se_abs_coding = np.sqrt(se_coding_t**2 + se_coding_c**2)
+        se_abs_diff = np.sqrt(se_abs_coding**2 + se_abs_ig**2)
+        
+        if se_abs_diff > 0 and np.isfinite(se_abs_diff):
+            z = abs_diff / se_abs_diff
+            p = 2 * (1 - stats.norm.cdf(abs(z)))
+            
+            tests.append({
+                'test': 'Absolute treatment effect: coding vs intergenic (same absolute increase?)',
+                'coefficient': '(treated_coding - control_coding) - (treated_intergenic - control_intergenic)',
+                'estimate': abs_diff,
+                'SE': se_abs_diff,
+                'z': z,
+                'p_value': p,
+                'absolute_effect_intergenic': abs_effect_intergenic,
+                'absolute_effect_coding': abs_effect_coding,
+                'interpretation': 'Tests if treatment adds the same ABSOLUTE amount to coding and intergenic rates. p > 0.05 means absolute treatment effect is the same (category does NOT matter for absolute treatment effect).'
+            })
+    except Exception as e:
+        print(f"Warning: Failed absolute treatment effect test: {e}")
+    
+    return tests
+
+
+def _test_category_effects_in_treated(result, beta_syn, beta_nonsyn, beta_treatment_syn, beta_treatment_nonsyn, vcov):
+    """Test category effects within treated samples."""
+    tests = []
+    
+    # Synonymous vs intergenic in treated
+    cat_effect = beta_syn + beta_treatment_syn
+    if vcov is not None:
+        try:
+            var = (vcov.loc['cat_synonymous', 'cat_synonymous'] + 
+                  vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
+                  2 * vcov.loc['cat_synonymous', 'treatment_x_cat_synonymous'])
+            se = np.sqrt(var) if var > 0 else np.nan
+            if np.isfinite(se) and se > 0:
+                z = cat_effect / se
+                p = 2 * (1 - stats.norm.cdf(abs(z)))
+                tests.append({
+                    'test': 'synonymous vs intergenic (IN TREATED)',
+                    'coefficient': 'β_syn + β_treatment_syn',
+                    'estimate': cat_effect,
+                    'SE': se,
+                    'z': z,
+                    'p_value': p,
+                    'rate_ratio': np.exp(cat_effect),
+                    'rate_ratio_CI_low': np.exp(cat_effect - 1.96 * se),
+                    'rate_ratio_CI_high': np.exp(cat_effect + 1.96 * se),
+                })
+        except:
+            pass
+    
+    # Non-synonymous vs intergenic in treated
+    cat_effect = beta_nonsyn + beta_treatment_nonsyn
+    if vcov is not None:
+        try:
+            var = (vcov.loc['cat_non_synonymous', 'cat_non_synonymous'] + 
+                  vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] +
+                  2 * vcov.loc['cat_non_synonymous', 'treatment_x_cat_non_synonymous'])
+            se = np.sqrt(var) if var > 0 else np.nan
+            if np.isfinite(se) and se > 0:
+                z = cat_effect / se
+                p = 2 * (1 - stats.norm.cdf(abs(z)))
+                tests.append({
+                    'test': 'non_synonymous vs intergenic (IN TREATED)',
+                    'coefficient': 'β_nonsyn + β_treatment_nonsyn',
+                    'estimate': cat_effect,
+                    'SE': se,
+                    'z': z,
+                    'p_value': p,
+                    'rate_ratio': np.exp(cat_effect),
+                    'rate_ratio_CI_low': np.exp(cat_effect - 1.96 * se),
+                    'rate_ratio_CI_high': np.exp(cat_effect + 1.96 * se),
+                })
+        except:
+            pass
+    
+    return tests
+
+
+def _test_interaction_terms(result, beta_treatment_syn, beta_treatment_nonsyn, vcov):
+    """Test interaction terms (EMS effect on category differences)."""
+    tests = []
+    
+    # Test β_treatment_syn
+    if 'treatment_x_cat_synonymous' in result.params.index:
+        se = result.bse.get('treatment_x_cat_synonymous', np.nan)
+        if np.isfinite(beta_treatment_syn) and np.isfinite(se) and se > 0:
+            z = beta_treatment_syn / se
+            p = 2 * (1 - stats.norm.cdf(abs(z)))
+            tests.append({
+                'test': 'EMS effect on category difference: synonymous vs intergenic (treated - controls)',
+                'coefficient': 'β_treatment_syn',
+                'estimate': beta_treatment_syn,
+                'SE': se,
+                'z': z,
+                'p_value': p,
+                'rate_ratio': np.exp(beta_treatment_syn),
+                'rate_ratio_CI_low': np.exp(beta_treatment_syn - 1.96 * se),
+                'rate_ratio_CI_high': np.exp(beta_treatment_syn + 1.96 * se),
+                'interpretation': 'Tests if EMS causes synonymous vs intergenic difference that differs from controls'
+            })
+    
+    # Test β_treatment_nonsyn
+    if 'treatment_x_cat_non_synonymous' in result.params.index:
+        se = result.bse.get('treatment_x_cat_non_synonymous', np.nan)
+        if np.isfinite(beta_treatment_nonsyn) and np.isfinite(se) and se > 0:
+            z = beta_treatment_nonsyn / se
+            p = 2 * (1 - stats.norm.cdf(abs(z)))
+            tests.append({
+                'test': 'EMS effect on category difference: non_synonymous vs intergenic (treated - controls)',
+                'coefficient': 'β_treatment_nonsyn',
+                'estimate': beta_treatment_nonsyn,
+                'SE': se,
+                'z': z,
+                'p_value': p,
+                'rate_ratio': np.exp(beta_treatment_nonsyn),
+                'rate_ratio_CI_low': np.exp(beta_treatment_nonsyn - 1.96 * se),
+                'rate_ratio_CI_high': np.exp(beta_treatment_nonsyn + 1.96 * se),
+                'interpretation': 'Tests if EMS causes non-synonymous vs intergenic difference that differs from controls'
+            })
+    
+    # Test β_treatment_syn - β_treatment_nonsyn
+    if vcov is not None and 'treatment_x_cat_synonymous' in result.params.index and 'treatment_x_cat_non_synonymous' in result.params.index:
+        diff = beta_treatment_syn - beta_treatment_nonsyn
+        try:
+            var = (vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
+                   vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] -
+                   2 * vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_non_synonymous'])
+            se = np.sqrt(var) if var > 0 else np.nan
+            if np.isfinite(se) and se > 0:
+                z = diff / se
+                p = 2 * (1 - stats.norm.cdf(abs(z)))
+                tests.append({
+                    'test': 'EMS effect on category difference: synonymous vs non_synonymous (treated - controls)',
+                    'coefficient': 'β_treatment_syn - β_treatment_nonsyn',
+                    'estimate': diff,
+                    'SE': se,
+                    'z': z,
+                    'p_value': p,
+                    'rate_ratio': np.exp(diff),
+                    'rate_ratio_CI_low': np.exp(diff - 1.96 * se),
+                    'rate_ratio_CI_high': np.exp(diff + 1.96 * se),
+                    'interpretation': 'Tests if EMS causes synonymous vs non-synonymous difference that differs from controls'
+                })
+        except:
+            pass
+    
+    # Test average interaction: (β_treatment_syn + β_treatment_nonsyn) / 2
+    if vcov is not None and 'treatment_x_cat_synonymous' in result.params.index and 'treatment_x_cat_non_synonymous' in result.params.index:
+        avg = (beta_treatment_syn + beta_treatment_nonsyn) / 2
+        try:
+            var = (vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
+                   vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] +
+                   2 * vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_non_synonymous']) / 4
+            se = np.sqrt(var) if var > 0 else np.nan
+            if np.isfinite(se) and se > 0:
+                z = avg / se
+                p = 2 * (1 - stats.norm.cdf(abs(z)))
+                tests.append({
+                    'test': 'EMS effect on category difference: coding vs intergenic (treated - controls, average)',
+                    'coefficient': '(β_treatment_syn + β_treatment_nonsyn) / 2',
+                    'estimate': avg,
+                    'SE': se,
+                    'z': z,
+                    'p_value': p,
+                    'rate_ratio': np.exp(avg),
+                    'rate_ratio_CI_low': np.exp(avg - 1.96 * se),
+                    'rate_ratio_CI_high': np.exp(avg + 1.96 * se),
+                    'interpretation': 'Tests if EMS causes coding vs intergenic difference (averaged across syn/nonsyn) that differs from controls'
+                })
+        except:
+            pass
+    
+    return tests
+
+
+def _test_category_effects_in_controls(result, beta_syn, beta_nonsyn, vcov):
+    """Test category effects within control samples."""
+    tests = []
+    
+    # Test β_syn
+    if 'cat_synonymous' in result.params.index:
+        se = result.bse.get('cat_synonymous', np.nan)
+        if np.isfinite(beta_syn) and np.isfinite(se) and se > 0:
+            z = beta_syn / se
+            p = 2 * (1 - stats.norm.cdf(abs(z)))
+            tests.append({
+                'test': 'synonymous vs intergenic (within controls)',
+                'coefficient': 'β_syn',
+                'estimate': beta_syn,
+                'SE': se,
+                'z': z,
+                'p_value': p,
+                'rate_ratio': np.exp(beta_syn),
+                'rate_ratio_CI_low': np.exp(beta_syn - 1.96 * se),
+                'rate_ratio_CI_high': np.exp(beta_syn + 1.96 * se),
+            })
+    
+    # Test β_nonsyn
+    if 'cat_non_synonymous' in result.params.index:
+        se = result.bse.get('cat_non_synonymous', np.nan)
+        if np.isfinite(beta_nonsyn) and np.isfinite(se) and se > 0:
+            z = beta_nonsyn / se
+            p = 2 * (1 - stats.norm.cdf(abs(z)))
+            tests.append({
+                'test': 'non_synonymous vs intergenic (within controls)',
+                'coefficient': 'β_nonsyn',
+                'estimate': beta_nonsyn,
+                'SE': se,
+                'z': z,
+                'p_value': p,
+                'rate_ratio': np.exp(beta_nonsyn),
+                'rate_ratio_CI_low': np.exp(beta_nonsyn - 1.96 * se),
+                'rate_ratio_CI_high': np.exp(beta_nonsyn + 1.96 * se),
+            })
+    
+    # Test β_syn - β_nonsyn
+    if vcov is not None and 'cat_synonymous' in result.params.index and 'cat_non_synonymous' in result.params.index:
+        diff = beta_syn - beta_nonsyn
+        try:
+            var = (vcov.loc['cat_synonymous', 'cat_synonymous'] +
+                   vcov.loc['cat_non_synonymous', 'cat_non_synonymous'] -
+                   2 * vcov.loc['cat_synonymous', 'cat_non_synonymous'])
+            se = np.sqrt(var) if var > 0 else np.nan
+            if np.isfinite(se) and se > 0:
+                z = diff / se
+                p = 2 * (1 - stats.norm.cdf(abs(z)))
+                tests.append({
+                    'test': 'synonymous vs non_synonymous (within controls)',
+                    'coefficient': 'β_syn - β_nonsyn',
+                    'estimate': diff,
+                    'SE': se,
+                    'z': z,
+                    'p_value': p,
+                    'rate_ratio': np.exp(diff),
+                    'rate_ratio_CI_low': np.exp(diff - 1.96 * se),
+                    'rate_ratio_CI_high': np.exp(diff + 1.96 * se),
+                })
+        except:
+            pass
+    
+    return tests
+
+
+def _save_results(summary_df, test_df, result, output_dir, kmer5_normalized=False, absolute_effects=None):
+    """Save results to TSV files and text report."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save summary
+    summary_path = os.path.join(output_dir, 'category_rates_summary.tsv')
+    summary_df.to_csv(summary_path, sep='\t', index=False)
+    print(f"Category rates summary saved to {summary_path}")
+    
+    # Save tests
+    if not test_df.empty:
+        test_path = os.path.join(output_dir, 'category_statistical_tests.tsv')
+        test_df.to_csv(test_path, sep='\t', index=False)
+        print(f"Category statistical tests saved to {test_path}")
+    
+    # Save text report
+    report_path = os.path.join(output_dir, 'category_comparison_report.txt')
+    with open(report_path, 'w') as f:
+        f.write("=== CATEGORY-SPECIFIC MUTATION RATES ===\n\n")
+        
+        # Add 5mer normalization status
+        if kmer5_normalized:
+            f.write("✓ 5mer sequence context normalization: ENABLED\n")
+            f.write("  Rates are absolute per-base mutation rates (5mer-normalized)\n\n")
+        else:
+            f.write("5mer sequence context normalization: NOT APPLIED\n")
+            f.write("  Rates are relative to depth-normalized baseline\n\n")
+        
+        # Add absolute effect model info if available
+        if absolute_effects is not None:
+            f.write("✓ Absolute effect model (identity link): ENABLED\n")
+            f.write("  Treatment effects are ADDITIVE: treated_rate = control_rate + β_absolute\n\n")
+            
+            f.write("=== ABSOLUTE TREATMENT EFFECTS (mutations/base added by EMS) ===\n\n")
+            abs_inter = absolute_effects.get('absolute_effect_intergenic', np.nan)
+            abs_syn = absolute_effects.get('absolute_effect_synonymous', np.nan)
+            abs_nonsyn = absolute_effects.get('absolute_effect_nonsyn', np.nan)
+            f.write(f"  Intergenic:     {abs_inter:.6e}\n")
+            f.write(f"  Synonymous:     {abs_syn:.6e}\n")
+            f.write(f"  Non-synonymous: {abs_nonsyn:.6e}\n\n")
+        
+        f.write(f"{'Category':<15} {'Treatment':<10} {'Rate':<15} {'CI_low':<15} {'CI_high':<15}")
+        if 'absolute_effect' in summary_df.columns:
+            f.write(f" {'Abs_Effect':<15}")
+        f.write("\n")
+        f.write("-" * (85 if 'absolute_effect' in summary_df.columns else 70) + "\n")
+        for _, row in summary_df.iterrows():
+            f.write(f"{row['category']:<15} {row['treatment']:<10} {row['rate']:<15.6e} {row['CI_low']:<15.6e} {row['CI_high']:<15.6e}")
+            if 'absolute_effect' in summary_df.columns and row['treatment'] == 'treated':
+                abs_eff = row.get('absolute_effect', np.nan)
+                if np.isfinite(abs_eff):
+                    f.write(f" {abs_eff:<15.6e}")
+                else:
+                    f.write(f" {'N/A':<15}")
+            elif 'absolute_effect' in summary_df.columns:
+                f.write(f" {'-':<15}")
+            f.write("\n")
+        
+        f.write(f"\n=== STATISTICAL TESTS ===\n\n")
+        if not test_df.empty:
+            f.write(f"{'Test':<35} {'Coefficient':<20} {'Estimate':<12} {'SE':<12} {'z':<10} {'p_value':<12} {'Rate_Ratio':<15}\n")
+            f.write("-" * 120 + "\n")
+            for _, row in test_df.iterrows():
+                sig = "***" if row['p_value'] < 0.001 else "**" if row['p_value'] < 0.01 else "*" if row['p_value'] < 0.05 else ""
+                f.write(f"{row['test']:<35} {row['coefficient']:<20} {row['estimate']:<12.6f} {row['SE']:<12.6f} {row['z']:<10.3f} {row['p_value']:<12.6e} {row['rate_ratio']:<15.6f} {sig}\n")
+        
+        f.write(f"\nModel fit statistics:\n")
+        f.write(f"  AIC: {result.aic:.2f}\n")
+        f.write(f"  Log-likelihood: {result.llf:.2f}\n")
+    
+    print(f"Category rates report saved to {report_path}")
+
+
+def _compute_5mer_offsets(df: pd.DataFrame, kmer5_model_path: str, genome_fasta: str):
+    """
+    Compute 5mer-based expected rate offsets for each site.
+    
+    Returns log(expected_rate_5mer) for each site, which will be added to the GLM offset.
+    This normalizes for sequence context bias.
+    
+    Args:
+        df: DataFrame with columns: chrom, pos, depth, treatment
+        kmer5_model_path: Path to fitted 5mer model pickle file
+        genome_fasta: Path to genome FASTA file
+    
+    Returns:
+        Series of log(expected_rate_5mer) values, or None if failed
+    """
+    try:
+        # Load 5mer model
+        model_5mer = load_5mer_model(kmer5_model_path)
+        seqs = load_genome_sequences(genome_fasta)
+        
+        # Extract 5mer contexts
+        print("  Extracting 5mer contexts...")
+        df['chrom_str'] = df['chrom'].astype(str)
+        df['pos_int'] = pd.to_numeric(df['pos'], errors='coerce')
+        
+        kmers = []
+        for chrom, pos in zip(df['chrom_str'].values, df['pos_int'].values):
+            if pd.isna(pos):
+                kmers.append(None)
+                continue
+            kmer5 = extract_kmer(seqs, chrom, int(pos), 5)
+            if kmer5 is None:
+                kmers.append(None)
+                continue
+            kmer5_canonical = canonical_kmer(kmer5)
+            kmers.append(kmer5_canonical if (kmer5_canonical and len(kmer5_canonical) == 5) else None)
+        
+        df['kmer5'] = kmers
+        
+        # Compute expected rates (vectorized by unique combinations)
+        print("  Predicting rates from 5mer model...")
+        valid_mask = df['kmer5'].notna() & df['depth'].notna() & (df['depth'] > 0)
+        
+        log_expected_rates = pd.Series(np.nan, index=df.index)
+        
+        if valid_mask.sum() > 0:
+            valid_df = df[valid_mask].copy()
+            unique_combos = valid_df[['kmer5', 'treatment', 'depth']].drop_duplicates()
+            
+            # Build prediction dict
+            pred_dict = {}
+            for _, row in unique_combos.iterrows():
+                kmer5 = row['kmer5']
+                treatment = int(row['treatment'])
+                depth = float(row['depth'])
+                combo_key = (kmer5, treatment, depth)
+                
+                if combo_key not in pred_dict:
+                    pred_rate = predict_5mer_rate(model_5mer, kmer5, treatment, depth)
+                    if np.isfinite(pred_rate) and pred_rate > 0:
+                        pred_dict[combo_key] = np.log(pred_rate)
+                    else:
+                        pred_dict[combo_key] = np.nan
+            
+            # Map back to all sites
+            for idx in valid_df.index:
+                kmer5 = df.loc[idx, 'kmer5']
+                treatment = int(df.loc[idx, 'treatment'])
+                depth = float(df.loc[idx, 'depth'])
+                combo_key = (kmer5, treatment, depth)
+                if combo_key in pred_dict:
+                    log_expected_rates.loc[idx] = pred_dict[combo_key]
+        
+        return log_expected_rates
+        
+    except Exception as e:
+        print(f"  Error computing 5mer offsets: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str = "poisson", 
+                            use_treatment_covariate: bool = True, alpha: float = 0.0,
+                            use_control_baseline: bool = False, 
+                            kmer5_model_path: str = None, genome_fasta: str = None):
+    """
+    Compare mutation rates across categories (intergenic, synonymous, non-synonymous).
+    
+    Refactored version with clean separation of concerns.
+    
+    Args:
+        site_df: Site-level DataFrame with mutation counts
+        output_dir: Output directory for results
+        method: GLM method ('poisson' or 'negative_binomial')
+        use_treatment_covariate: Include treatment covariate in model
+        alpha: Background rate subtraction
+        use_control_baseline: Use control-baseline modeling approach
+        kmer5_model_path: Path to fitted 5mer model (optional, for sequence context normalization)
+        genome_fasta: Path to genome FASTA file (required if kmer5_model_path provided)
     """
     if site_df is None or site_df.empty:
         print("No site-level data available for category comparison")
@@ -1407,1098 +2678,124 @@ def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str =
     df['log_depth'] = np.log(df['depth'].values)
     df['treatment'] = (~df['is_control']).astype(int).values
     
+    # Add 5mer normalization if model provided
+    log_5mer_offset = None
+    mean_expected_rates = None  # Will store mean expected rates per category/treatment
+    if kmer5_model_path is not None and genome_fasta is not None:
+        print("Computing 5mer-based expected rates for sequence context normalization...")
+        log_5mer_offset = _compute_5mer_offsets(df, kmer5_model_path, genome_fasta)
+        if log_5mer_offset is not None:
+            print(f"✓ 5mer offsets computed for {(~pd.isna(log_5mer_offset)).sum()} sites")
+            
+            # Calculate mean expected rates per category and treatment for rate recovery
+            # This is needed to convert exp(coefficients) back to actual rates
+            df['log_5mer_offset'] = log_5mer_offset
+            mean_expected_rates = {}
+            categories_for_mean = ['intergenic', 'synonymous', 'non_synonymous']
+            for cat in categories_for_mean:
+                for is_control in [True, False]:
+                    treatment_label = 'control' if is_control else 'treated'
+                    mask = (df['category'] == cat) & (df['is_control'] == is_control) & df['log_5mer_offset'].notna()
+                    if mask.sum() > 0:
+                        # Weighted mean of expected rates (weighted by depth)
+                        weights = df.loc[mask, 'depth'].values
+                        log_offsets = df.loc[mask, 'log_5mer_offset'].values
+                        # Mean of log gives geometric mean; use weighted arithmetic mean of exp
+                        expected_rates = np.exp(log_offsets)
+                        mean_expected_rate = np.average(expected_rates, weights=weights)
+                        mean_expected_rates[f'{cat}_{treatment_label}'] = mean_expected_rate
+                        print(f"  Mean expected rate for {cat} ({treatment_label}): {mean_expected_rate:.6e}")
+                    else:
+                        mean_expected_rates[f'{cat}_{treatment_label}'] = np.nan
+            print(f"✓ Mean expected rates computed per category/treatment")
+        else:
+            print("⚠ Warning: 5mer offset computation failed, proceeding without normalization")
+    
     # Create category dummy variables (intergenic as reference)
     categories = ['intergenic', 'synonymous', 'non_synonymous']
-    for cat in categories[1:]:  # Skip intergenic (reference)
+    for cat in categories[1:]:
         df[f'cat_{cat}'] = (df['category'] == cat).astype(int)
     
-    # Prepare design matrix
-    if use_treatment_covariate:
-        # Model with interactions: log(E[Y]) = log(depth) + β₀ + β_treatment·treatment + 
-        # β_syn·cat_synonymous + β_nonsyn·cat_non_synonymous + 
-        # β_treatment_syn·treatment·cat_synonymous + β_treatment_nonsyn·treatment·cat_non_synonymous
-        # This allows category effects to differ between controls and treated
-        X_cols = ['treatment'] + [f'cat_{cat}' for cat in categories[1:]]
-        # Add interaction terms: treatment × category
-        for cat in categories[1:]:
-            df[f'treatment_x_cat_{cat}'] = df['treatment'] * df[f'cat_{cat}']
-            X_cols.append(f'treatment_x_cat_{cat}')
-        X = df[X_cols]
-    else:
-        # Without treatment covariate, just category effects
-        X = df[[f'cat_{cat}' for cat in categories[1:]]]
+    # Try control-baseline model first if requested
+    control_baseline_result = None
+    absolute_effect_result = None
+    result = None
     
-    design = sm.add_constant(X, has_constant='add')
-    y = df['ems_count'].values
-    offset = df['log_depth'].values
+    if use_control_baseline and use_treatment_covariate:
+        # Try absolute effect model first (answers the constant absolute effect question)
+        absolute_effect_result = _fit_absolute_effect_model(df, categories, method, alpha, log_5mer_offset)
+        
+        # Also fit control-baseline model (for comparison)
+        control_baseline_result = _fit_control_baseline_model(df, categories, method, alpha, log_5mer_offset)
+        
+        if absolute_effect_result is not None:
+            # Use absolute effect model's interaction result for rate extraction
+            # (it has same structure as control-baseline interaction model)
+            result = absolute_effect_result['result_interaction']
+            df = absolute_effect_result['df_modified']
+            print("✓ Absolute effect model succeeded")
+        elif control_baseline_result is not None:
+            result = control_baseline_result['result_interaction']
+            df = control_baseline_result['df_modified']
+            print("✓ Control-baseline model succeeded")
+        else:
+            print("Both absolute effect and control-baseline models failed, falling back to standard model")
     
-    # Apply alpha subtraction if provided
-    if alpha and alpha > 0:
-        y = np.maximum(0.0, y - alpha * df['depth'].values)
+    # Fit standard model if control-baseline not used or failed
+    if result is None:
+        result = _fit_standard_model(df, categories, method, alpha, use_treatment_covariate, log_5mer_offset)
+        if result is None:
+            print("⚠ Warning: Category comparison failed")
+            return None
     
-    # Fit GLM
-    try:
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            
-            if method == "poisson":
-                fam = sm.families.Poisson()
-                model = sm.GLM(y, design, family=fam, offset=offset)
-                result = model.fit()
-            else:
-                # For negative binomial, estimate alpha from all data (controls + treated)
-                # This is correct when using treatment covariate approach
-                from statsmodels.discrete.discrete_model import NegativeBinomial as NBDiscrete
-                exposure = np.exp(offset)
-                # Warm start with Poisson
-                pois_model = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset)
-                pois_result = pois_model.fit()
-                start_params = np.r_[pois_result.params.values, 0.1]  # Add dispersion parameter
-                
-                nb_model = NBDiscrete(y, design, exposure=exposure)
-                result = nb_model.fit(start_params=start_params, disp=False)
-            
-            # Extract coefficients and their standard errors
-            beta0 = result.params.get('const', np.nan)
-            beta_treatment = result.params.get('treatment', 0.0) if use_treatment_covariate else 0.0
-            beta_syn = result.params.get('cat_synonymous', 0.0)
-            beta_nonsyn = result.params.get('cat_non_synonymous', 0.0)
-            # Interaction terms (allow category effects to differ between controls and treated)
-            beta_treatment_syn = result.params.get('treatment_x_cat_synonymous', 0.0) if use_treatment_covariate else 0.0
-            beta_treatment_nonsyn = result.params.get('treatment_x_cat_non_synonymous', 0.0) if use_treatment_covariate else 0.0
-            
-            # Get variance-covariance matrix for delta method
-            try:
-                vcov = result.cov_params()
-            except Exception:
-                vcov = None
-            
-            # Get coefficient standard errors and p-values
-            try:
-                coef_summary = result.summary().tables[1]
-                pvalues = result.pvalues
-            except Exception:
-                pvalues = {}
-            
-            # Helper function to calculate variance of linear predictor using delta method
-            def calc_var_linear(cat, is_control, vcov):
-                """Calculate variance of linear predictor for a given category and treatment.
-                
-                With interactions, linear predictor is:
-                - Controls: β₀ + β_cat·cat
-                - Treated: β₀ + β_treatment + β_cat·cat + β_treatment_cat·cat
-                
-                Variance includes all relevant terms and their covariances.
-                """
-                if vcov is None:
-                    return np.nan
-                
-                var = 0.0
-                
-                # Var(β₀)
-                if 'const' in vcov.index:
-                    var += vcov.loc['const', 'const']
-                
-                # Add treatment term if treated
-                if not is_control and use_treatment_covariate and 'treatment' in vcov.index:
-                    # Var(β_treatment)
-                    var += vcov.loc['treatment', 'treatment']
-                    # 2·Cov(β₀, β_treatment)
-                    if 'const' in vcov.index:
-                        var += 2 * vcov.loc['const', 'treatment']
-                
-                # Add category term
-                if cat == 'synonymous' and 'cat_synonymous' in vcov.index:
-                    # Var(β_syn)
-                    var += vcov.loc['cat_synonymous', 'cat_synonymous']
-                    # 2·Cov(β₀, β_syn)
-                    if 'const' in vcov.index:
-                        var += 2 * vcov.loc['const', 'cat_synonymous']
-                    # 2·Cov(β_treatment, β_syn) if treated
-                    if not is_control and use_treatment_covariate and 'treatment' in vcov.index:
-                        var += 2 * vcov.loc['treatment', 'cat_synonymous']
-                    # Add interaction term if treated
-                    if not is_control and use_treatment_covariate and 'treatment_x_cat_synonymous' in vcov.index:
-                        # Var(β_treatment_syn)
-                        var += vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous']
-                        # 2·Cov(β₀, β_treatment_syn)
-                        if 'const' in vcov.index:
-                            var += 2 * vcov.loc['const', 'treatment_x_cat_synonymous']
-                        # 2·Cov(β_treatment, β_treatment_syn)
-                        if 'treatment' in vcov.index:
-                            var += 2 * vcov.loc['treatment', 'treatment_x_cat_synonymous']
-                        # 2·Cov(β_syn, β_treatment_syn)
-                        var += 2 * vcov.loc['cat_synonymous', 'treatment_x_cat_synonymous']
-                elif cat == 'non_synonymous' and 'cat_non_synonymous' in vcov.index:
-                    # Var(β_nonsyn)
-                    var += vcov.loc['cat_non_synonymous', 'cat_non_synonymous']
-                    # 2·Cov(β₀, β_nonsyn)
-                    if 'const' in vcov.index:
-                        var += 2 * vcov.loc['const', 'cat_non_synonymous']
-                    # 2·Cov(β_treatment, β_nonsyn) if treated
-                    if not is_control and use_treatment_covariate and 'treatment' in vcov.index:
-                        var += 2 * vcov.loc['treatment', 'cat_non_synonymous']
-                    # Add interaction term if treated
-                    if not is_control and use_treatment_covariate and 'treatment_x_cat_non_synonymous' in vcov.index:
-                        # Var(β_treatment_nonsyn)
-                        var += vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous']
-                        # 2·Cov(β₀, β_treatment_nonsyn)
-                        if 'const' in vcov.index:
-                            var += 2 * vcov.loc['const', 'treatment_x_cat_non_synonymous']
-                        # 2·Cov(β_treatment, β_treatment_nonsyn)
-                        if 'treatment' in vcov.index:
-                            var += 2 * vcov.loc['treatment', 'treatment_x_cat_non_synonymous']
-                        # 2·Cov(β_nonsyn, β_treatment_nonsyn)
-                        var += 2 * vcov.loc['cat_non_synonymous', 'treatment_x_cat_non_synonymous']
-                
-                return var if np.isfinite(var) and var > 0 else np.nan
-            
-            # Calculate rates and proper CIs using delta method
-            rates = {}
-            cis = {}
-            
-            for cat in categories:
-                for is_control in [True, False]:
-                    # Calculate linear predictor with interactions:
-                    # Controls: β₀ + β_cat·cat
-                    # Treated: β₀ + β_treatment + β_cat·cat + β_treatment_cat·cat
-                    linear_pred = beta0
-                    
-                    # Add category effect
-                    if cat == 'synonymous' and np.isfinite(beta_syn):
-                        linear_pred += beta_syn
-                    elif cat == 'non_synonymous' and np.isfinite(beta_nonsyn):
-                        linear_pred += beta_nonsyn
-                    
-                    # Add treatment effect and interaction if treated
-                    if not is_control and use_treatment_covariate:
-                        if np.isfinite(beta_treatment):
-                            linear_pred += beta_treatment
-                        # Add interaction term (allows category effect to differ in treated)
-                        if cat == 'synonymous' and np.isfinite(beta_treatment_syn):
-                            linear_pred += beta_treatment_syn
-                        elif cat == 'non_synonymous' and np.isfinite(beta_treatment_nonsyn):
-                            linear_pred += beta_treatment_nonsyn
-                    
-                    # Calculate rate: exp(linear_pred)
-                    rate = np.exp(linear_pred) if np.isfinite(linear_pred) else np.nan
-                    
-                    # Calculate variance of linear predictor
-                    var_linear = calc_var_linear(cat, is_control, vcov)
-                    se_linear = np.sqrt(var_linear) if np.isfinite(var_linear) and var_linear > 0 else np.nan
-                    
-                    # Delta method: 95% CI for exp(linear_pred)
-                    z = 1.96
-                    if np.isfinite(se_linear) and se_linear > 0 and np.isfinite(rate):
-                        ci_low = rate * np.exp(-z * se_linear)
-                        ci_high = rate * np.exp(z * se_linear)
-                    else:
-                        ci_low = np.nan
-                        ci_high = np.nan
-                    
-                    key = f"{cat}_{'control' if is_control else 'treated'}"
-                    rates[key] = rate
-                    cis[key] = (ci_low, ci_high)
-            
-            # Statistical tests
-            # Focus: Controls are background noise, we want to test category differences in TREATED samples
-            test_results = []
-            
-            # KEY TESTS: Category differences WITHIN TREATED samples
-            # In treated: rate = exp(β₀ + β_treatment + β_cat + β_treatment_cat)
-            # So category effect in treated = β_cat + β_treatment_cat
-            
-            # Test: Synonymous vs intergenic IN TREATED
-            # Treated synonymous rate = exp(β₀ + β_treatment + β_syn + β_treatment_syn)
-            # Treated intergenic rate = exp(β₀ + β_treatment)
-            # Ratio = exp(β_syn + β_treatment_syn)
-            # Test: β_syn + β_treatment_syn = 0
-            if use_treatment_covariate and 'cat_synonymous' in result.params.index:
-                if 'treatment_x_cat_synonymous' in result.params.index:
-                    # With interaction: test β_syn + β_treatment_syn = 0
-                    cat_effect_treated = beta_syn + beta_treatment_syn
-                    # Var(β_syn + β_treatment_syn) = Var(β_syn) + Var(β_treatment_syn) + 2·Cov(β_syn, β_treatment_syn)
-                    if vcov is not None:
-                        try:
-                            var_effect = (vcov.loc['cat_synonymous', 'cat_synonymous'] + 
-                                        vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
-                                        2 * vcov.loc['cat_synonymous', 'treatment_x_cat_synonymous'])
-                            se_effect = np.sqrt(var_effect) if var_effect > 0 else np.nan
-                            if np.isfinite(se_effect) and se_effect > 0:
-                                z_effect = cat_effect_treated / se_effect
-                                p_effect = 2 * (1 - stats.norm.cdf(abs(z_effect)))
-                                test_results.append({
-                                    'test': 'synonymous vs intergenic (IN TREATED)',
-                                    'coefficient': 'β_syn + β_treatment_syn',
-                                    'estimate': cat_effect_treated,
-                                    'SE': se_effect,
-                                    'z': z_effect,
-                                    'p_value': p_effect,
-                                    'rate_ratio': np.exp(cat_effect_treated),
-                                    'rate_ratio_CI_low': np.exp(cat_effect_treated - 1.96 * se_effect),
-                                    'rate_ratio_CI_high': np.exp(cat_effect_treated + 1.96 * se_effect),
-                                })
-                        except Exception:
-                            pass
-                else:
-                    # Without interaction: test β_syn = 0 (same in controls and treated)
-                    beta_syn_se = result.bse.get('cat_synonymous', np.nan)
-                    if np.isfinite(beta_syn) and np.isfinite(beta_syn_se) and beta_syn_se > 0:
-                        z_syn = beta_syn / beta_syn_se
-                        p_syn = 2 * (1 - stats.norm.cdf(abs(z_syn)))
-                        test_results.append({
-                            'test': 'synonymous vs intergenic (IN TREATED, no interaction)',
-                            'coefficient': 'β_syn',
-                            'estimate': beta_syn,
-                            'SE': beta_syn_se,
-                            'z': z_syn,
-                            'p_value': p_syn,
-                            'rate_ratio': np.exp(beta_syn),
-                            'rate_ratio_CI_low': np.exp(beta_syn - 1.96 * beta_syn_se),
-                            'rate_ratio_CI_high': np.exp(beta_syn + 1.96 * beta_syn_se),
-                        })
-            
-            # Test: Non-synonymous vs intergenic IN TREATED
-            if use_treatment_covariate and 'cat_non_synonymous' in result.params.index:
-                if 'treatment_x_cat_non_synonymous' in result.params.index:
-                    # With interaction: test β_nonsyn + β_treatment_nonsyn = 0
-                    cat_effect_treated = beta_nonsyn + beta_treatment_nonsyn
-                    if vcov is not None:
-                        try:
-                            var_effect = (vcov.loc['cat_non_synonymous', 'cat_non_synonymous'] + 
-                                        vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] +
-                                        2 * vcov.loc['cat_non_synonymous', 'treatment_x_cat_non_synonymous'])
-                            se_effect = np.sqrt(var_effect) if var_effect > 0 else np.nan
-                            if np.isfinite(se_effect) and se_effect > 0:
-                                z_effect = cat_effect_treated / se_effect
-                                p_effect = 2 * (1 - stats.norm.cdf(abs(z_effect)))
-                                test_results.append({
-                                    'test': 'non_synonymous vs intergenic (IN TREATED)',
-                                    'coefficient': 'β_nonsyn + β_treatment_nonsyn',
-                                    'estimate': cat_effect_treated,
-                                    'SE': se_effect,
-                                    'z': z_effect,
-                                    'p_value': p_effect,
-                                    'rate_ratio': np.exp(cat_effect_treated),
-                                    'rate_ratio_CI_low': np.exp(cat_effect_treated - 1.96 * se_effect),
-                                    'rate_ratio_CI_high': np.exp(cat_effect_treated + 1.96 * se_effect),
-                                })
-                        except Exception:
-                            pass
-                else:
-                    # Without interaction: test β_nonsyn = 0
-                    beta_nonsyn_se = result.bse.get('cat_non_synonymous', np.nan)
-                    if np.isfinite(beta_nonsyn) and np.isfinite(beta_nonsyn_se) and beta_nonsyn_se > 0:
-                        z_nonsyn = beta_nonsyn / beta_nonsyn_se
-                        p_nonsyn = 2 * (1 - stats.norm.cdf(abs(z_nonsyn)))
-                        test_results.append({
-                            'test': 'non_synonymous vs intergenic (IN TREATED, no interaction)',
-                            'coefficient': 'β_nonsyn',
-                            'estimate': beta_nonsyn,
-                            'SE': beta_nonsyn_se,
-                            'z': z_nonsyn,
-                            'p_value': p_nonsyn,
-                            'rate_ratio': np.exp(beta_nonsyn),
-                            'rate_ratio_CI_low': np.exp(beta_nonsyn - 1.96 * beta_nonsyn_se),
-                            'rate_ratio_CI_high': np.exp(beta_nonsyn + 1.96 * beta_nonsyn_se),
-                        })
-            
-            # Test: Synonymous vs non-synonymous IN TREATED
-            # Treated synonymous rate = exp(β₀ + β_treatment + β_syn + β_treatment_syn)
-            # Treated non-synonymous rate = exp(β₀ + β_treatment + β_nonsyn + β_treatment_nonsyn)
-            # Ratio = exp((β_syn + β_treatment_syn) - (β_nonsyn + β_treatment_nonsyn))
-            # Test: (β_syn + β_treatment_syn) - (β_nonsyn + β_treatment_nonsyn) = 0
-            if (use_treatment_covariate and 'cat_synonymous' in result.params.index and 
-                'cat_non_synonymous' in result.params.index and vcov is not None):
-                if ('treatment_x_cat_synonymous' in result.params.index and 
-                    'treatment_x_cat_non_synonymous' in result.params.index):
-                    # With interactions
-                    diff_treated = (beta_syn + beta_treatment_syn) - (beta_nonsyn + beta_treatment_nonsyn)
-                    # Var = Var(β_syn) + Var(β_treatment_syn) + Var(β_nonsyn) + Var(β_treatment_nonsyn)
-                    #      + 2·Cov(β_syn, β_treatment_syn) - 2·Cov(β_syn, β_nonsyn) - 2·Cov(β_syn, β_treatment_nonsyn)
-                    #      - 2·Cov(β_treatment_syn, β_nonsyn) - 2·Cov(β_treatment_syn, β_treatment_nonsyn)
-                    #      + 2·Cov(β_nonsyn, β_treatment_nonsyn)
-                    try:
-                        var_diff = (vcov.loc['cat_synonymous', 'cat_synonymous'] + 
-                                   vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
-                                   vcov.loc['cat_non_synonymous', 'cat_non_synonymous'] +
-                                   vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] +
-                                   2 * vcov.loc['cat_synonymous', 'treatment_x_cat_synonymous'] -
-                                   2 * vcov.loc['cat_synonymous', 'cat_non_synonymous'] -
-                                   2 * vcov.loc.get('cat_synonymous', pd.Series([0])).get('treatment_x_cat_non_synonymous', 0) if hasattr(vcov.loc.get('cat_synonymous', pd.Series([0])), 'get') else 0 -
-                                   2 * vcov.loc.get('treatment_x_cat_synonymous', pd.Series([0])).get('cat_non_synonymous', 0) if hasattr(vcov.loc.get('treatment_x_cat_synonymous', pd.Series([0])), 'get') else 0 -
-                                   2 * vcov.loc.get('treatment_x_cat_synonymous', pd.Series([0])).get('treatment_x_cat_non_synonymous', 0) if hasattr(vcov.loc.get('treatment_x_cat_synonymous', pd.Series([0])), 'get') else 0 +
-                                   2 * vcov.loc['cat_non_synonymous', 'treatment_x_cat_non_synonymous'])
-                        # Simplify: use diagonal + key covariances
-                        var_diff = (vcov.loc['cat_synonymous', 'cat_synonymous'] + 
-                                   vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
-                                   vcov.loc['cat_non_synonymous', 'cat_non_synonymous'] +
-                                   vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] +
-                                   2 * vcov.loc['cat_synonymous', 'treatment_x_cat_synonymous'] -
-                                   2 * vcov.loc['cat_synonymous', 'cat_non_synonymous'] -
-                                   2 * vcov.loc['treatment_x_cat_synonymous', 'cat_non_synonymous'] -
-                                   2 * vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_non_synonymous'] +
-                                   2 * vcov.loc['cat_non_synonymous', 'treatment_x_cat_non_synonymous'])
-                        se_diff = np.sqrt(var_diff) if var_diff > 0 else np.nan
-                        if np.isfinite(se_diff) and se_diff > 0:
-                            z_diff = diff_treated / se_diff
-                            p_diff = 2 * (1 - stats.norm.cdf(abs(z_diff)))
-                            test_results.append({
-                                'test': 'synonymous vs non_synonymous (IN TREATED)',
-                                'coefficient': '(β_syn + β_treatment_syn) - (β_nonsyn + β_treatment_nonsyn)',
-                                'estimate': diff_treated,
-                                'SE': se_diff,
-                                'z': z_diff,
-                                'p_value': p_diff,
-                                'rate_ratio': np.exp(diff_treated),
-                                'rate_ratio_CI_low': np.exp(diff_treated - 1.96 * se_diff),
-                                'rate_ratio_CI_high': np.exp(diff_treated + 1.96 * se_diff),
-                            })
-                    except Exception as e:
-                        # Fallback: simpler calculation
-                        try:
-                            diff_treated = (beta_syn + beta_treatment_syn) - (beta_nonsyn + beta_treatment_nonsyn)
-                            # Use individual SEs as approximation
-                            beta_syn_se = result.bse.get('cat_synonymous', np.nan)
-                            beta_treatment_syn_se = result.bse.get('treatment_x_cat_synonymous', np.nan)
-                            beta_nonsyn_se = result.bse.get('cat_non_synonymous', np.nan)
-                            beta_treatment_nonsyn_se = result.bse.get('treatment_x_cat_non_synonymous', np.nan)
-                            se_diff = np.sqrt(beta_syn_se**2 + beta_treatment_syn_se**2 + 
-                                            beta_nonsyn_se**2 + beta_treatment_nonsyn_se**2) if all(np.isfinite([beta_syn_se, beta_treatment_syn_se, beta_nonsyn_se, beta_treatment_nonsyn_se])) else np.nan
-                            if np.isfinite(se_diff) and se_diff > 0:
-                                z_diff = diff_treated / se_diff
-                                p_diff = 2 * (1 - stats.norm.cdf(abs(z_diff)))
-                                test_results.append({
-                                    'test': 'synonymous vs non_synonymous (IN TREATED, approximate)',
-                                    'coefficient': '(β_syn + β_treatment_syn) - (β_nonsyn + β_treatment_nonsyn)',
-                                    'estimate': diff_treated,
-                                    'SE': se_diff,
-                                    'z': z_diff,
-                                    'p_value': p_diff,
-                                    'rate_ratio': np.exp(diff_treated),
-                                    'rate_ratio_CI_low': np.exp(diff_treated - 1.96 * se_diff),
-                                    'rate_ratio_CI_high': np.exp(diff_treated + 1.96 * se_diff),
-                                })
-                        except Exception:
-                            pass
-                else:
-                    # Without interactions: test β_syn - β_nonsyn = 0
-                    diff = beta_syn - beta_nonsyn
-                    try:
-                        var_diff = (vcov.loc['cat_synonymous', 'cat_synonymous'] + 
-                                   vcov.loc['cat_non_synonymous', 'cat_non_synonymous'] -
-                                   2 * vcov.loc['cat_synonymous', 'cat_non_synonymous'])
-                        se_diff = np.sqrt(var_diff) if var_diff > 0 else np.nan
-                        if np.isfinite(se_diff) and se_diff > 0:
-                            z_diff = diff / se_diff
-                            p_diff = 2 * (1 - stats.norm.cdf(abs(z_diff)))
-                            test_results.append({
-                                'test': 'synonymous vs non_synonymous (IN TREATED, no interaction)',
-                                'coefficient': 'β_syn - β_nonsyn',
-                                'estimate': diff,
-                                'SE': se_diff,
-                                'z': z_diff,
-                                'p_value': p_diff,
-                                'rate_ratio': np.exp(diff),
-                                'rate_ratio_CI_low': np.exp(diff - 1.96 * se_diff),
-                                'rate_ratio_CI_high': np.exp(diff + 1.96 * se_diff),
-                            })
-                    except Exception:
-                        pass
-            
-            # Test: Combined coding effect (synonymous + non-synonymous) vs intergenic IN TREATED
-            # This tests if coding regions overall differ from intergenic regions
-            # Proper coding effect = weighted average based on number of bases in each category
-            # coding_effect = (n_syn * syn_effect + n_nonsyn * nonsyn_effect) / (n_syn + n_nonsyn)
-            # This represents the true combined mutation rate in coding regions
-            if (use_treatment_covariate and 'cat_synonymous' in result.params.index and 
-                'cat_non_synonymous' in result.params.index and vcov is not None):
-                if ('treatment_x_cat_synonymous' in result.params.index and 
-                    'treatment_x_cat_non_synonymous' in result.params.index):
-                    # Calculate total number of bases (depth) in each category for treated samples
-                    # This is the proper weight for computing the combined coding mutation rate
-                    treated_df = df[df['treatment'] == 1].copy()
-                    n_syn = treated_df[treated_df['category'] == 'synonymous']['depth'].sum()
-                    n_nonsyn = treated_df[treated_df['category'] == 'non_synonymous']['depth'].sum()
-                    n_coding = n_syn + n_nonsyn
-                    
-                    if n_coding > 0:
-                        # With interactions: weighted average of (β_syn + β_treatment_syn) and (β_nonsyn + β_treatment_nonsyn)
-                    syn_effect_treated = beta_syn + beta_treatment_syn
-                    nonsyn_effect_treated = beta_nonsyn + beta_treatment_nonsyn
-                        # Weighted average based on number of bases
-                        coding_effect = (n_syn * syn_effect_treated + n_nonsyn * nonsyn_effect_treated) / n_coding
-                    else:
-                        # Fallback to simple average if no sites (shouldn't happen)
-                        syn_effect_treated = beta_syn + beta_treatment_syn
-                        nonsyn_effect_treated = beta_nonsyn + beta_treatment_nonsyn
-                        coding_effect = (syn_effect_treated + nonsyn_effect_treated) / 2
-                        n_syn = 1
-                        n_nonsyn = 1
-                        n_coding = 2
-                    
-                    # Var(weighted average) = Var((n_syn * syn_effect + n_nonsyn * nonsyn_effect) / n_coding)
-                    # = (1/n_coding²) * [n_syn² * Var(syn_effect) + n_nonsyn² * Var(nonsyn_effect) 
-                    #     + 2 * n_syn * n_nonsyn * Cov(syn_effect, nonsyn_effect)]
-                    try:
-                        # Variance of syn_effect = Var(β_syn + β_treatment_syn)
-                        var_syn = (vcov.loc['cat_synonymous', 'cat_synonymous'] + 
-                            vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
-                                   2 * vcov.loc['cat_synonymous', 'treatment_x_cat_synonymous'])
-                        
-                        # Variance of nonsyn_effect = Var(β_nonsyn + β_treatment_nonsyn)
-                        var_nonsyn = (vcov.loc['cat_non_synonymous', 'cat_non_synonymous'] + 
-                            vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] +
-                                     2 * vcov.loc['cat_non_synonymous', 'treatment_x_cat_non_synonymous'])
-                        
-                        # Covariance between syn_effect and nonsyn_effect
-                        cov_syn_nonsyn = (vcov.loc['cat_synonymous', 'cat_non_synonymous'] +
-                                         vcov.loc.get('cat_synonymous', pd.Series([0])).get('treatment_x_cat_non_synonymous', 0) if hasattr(vcov.loc.get('cat_synonymous', pd.Series([0])), 'get') else 0 +
-                                         vcov.loc.get('treatment_x_cat_synonymous', pd.Series([0])).get('cat_non_synonymous', 0) if hasattr(vcov.loc.get('treatment_x_cat_synonymous', pd.Series([0])), 'get') else 0 +
-                                         vcov.loc.get('treatment_x_cat_synonymous', pd.Series([0])).get('treatment_x_cat_non_synonymous', 0) if hasattr(vcov.loc.get('treatment_x_cat_synonymous', pd.Series([0])), 'get') else 0)
-                        
-                        # Try to get actual covariance values
-                        try:
-                            cov_syn_nonsyn = (vcov.loc['cat_synonymous', 'cat_non_synonymous'] +
-                                             vcov.loc['cat_synonymous', 'treatment_x_cat_non_synonymous'] +
-                                             vcov.loc['treatment_x_cat_synonymous', 'cat_non_synonymous'] +
-                                             vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_non_synonymous'])
-                        except (KeyError, AttributeError):
-                            # Fallback: use available covariances
-                            cov_syn_nonsyn = vcov.loc.get('cat_synonymous', pd.Series([0])).get('cat_non_synonymous', 0) if hasattr(vcov.loc.get('cat_synonymous', pd.Series([0])), 'get') else 0
-                        
-                        # Weighted variance
-                        var_coding = (n_syn**2 * var_syn + n_nonsyn**2 * var_nonsyn + 
-                                     2 * n_syn * n_nonsyn * cov_syn_nonsyn) / (n_coding**2)
-                        
-                        se_coding = np.sqrt(var_coding) if var_coding > 0 else np.nan
-                        if np.isfinite(se_coding) and se_coding > 0:
-                            z_coding = coding_effect / se_coding
-                            p_coding = 2 * (1 - stats.norm.cdf(abs(z_coding)))
-                            test_results.append({
-                                'test': 'coding (syn+non-syn) vs intergenic (IN TREATED)',
-                                'coefficient': f'(n_syn * (β_syn + β_treatment_syn) + n_nonsyn * (β_nonsyn + β_treatment_nonsyn)) / (n_syn + n_nonsyn)',
-                                'estimate': coding_effect,
-                                'SE': se_coding,
-                                'z': z_coding,
-                                'p_value': p_coding,
-                                'rate_ratio': np.exp(coding_effect),
-                                'rate_ratio_CI_low': np.exp(coding_effect - 1.96 * se_coding),
-                                'rate_ratio_CI_high': np.exp(coding_effect + 1.96 * se_coding),
-                            })
-                            print(f"Added coding vs intergenic test: p={p_coding:.4e}, rate_ratio={np.exp(coding_effect):.4f}")
-                            
-                            # NEW TEST: Does treatment affect coding differently than intergenic?
-                            # This tests: H0: weighted_avg(β_treatment_syn, β_treatment_nonsyn) = 0
-                            # Treatment effect on intergenic = β_treatment
-                            # Treatment effect on coding = β_treatment + weighted_avg(β_treatment_syn, β_treatment_nonsyn)
-                            # Differential effect = weighted_avg(β_treatment_syn, β_treatment_nonsyn)
-                            try:
-                                # Calculate weighted average of treatment interaction terms
-                                treatment_interaction_coding = (n_syn * beta_treatment_syn + n_nonsyn * beta_treatment_nonsyn) / n_coding
-                                
-                                # Variance of weighted average of interaction terms
-                                # Var(weighted_avg) = (1/n_coding²) * [n_syn² * Var(β_treatment_syn) + n_nonsyn² * Var(β_treatment_nonsyn) 
-                                #     + 2 * n_syn * n_nonsyn * Cov(β_treatment_syn, β_treatment_nonsyn)]
-                                var_treatment_syn = vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous']
-                                var_treatment_nonsyn = vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous']
-                                try:
-                                    cov_treatment_syn_nonsyn = vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_non_synonymous']
-                                except (KeyError, AttributeError):
-                                    cov_treatment_syn_nonsyn = 0.0
-                                
-                                var_treatment_interaction = (n_syn**2 * var_treatment_syn + n_nonsyn**2 * var_treatment_nonsyn + 
-                                                             2 * n_syn * n_nonsyn * cov_treatment_syn_nonsyn) / (n_coding**2)
-                                
-                                se_treatment_interaction = np.sqrt(var_treatment_interaction) if var_treatment_interaction > 0 else np.nan
-                                
-                                if np.isfinite(se_treatment_interaction) and se_treatment_interaction > 0:
-                                    z_treatment_interaction = treatment_interaction_coding / se_treatment_interaction
-                                    p_treatment_interaction = 2 * (1 - stats.norm.cdf(abs(z_treatment_interaction)))
-                                    
-                                    test_results.append({
-                                        'test': 'Treatment differential effect: coding vs intergenic',
-                                        'coefficient': f'(n_syn * β_treatment_syn + n_nonsyn * β_treatment_nonsyn) / (n_syn + n_nonsyn)',
-                                        'estimate': treatment_interaction_coding,
-                                        'SE': se_treatment_interaction,
-                                        'z': z_treatment_interaction,
-                                        'p_value': p_treatment_interaction,
-                                        'rate_ratio': np.exp(treatment_interaction_coding),
-                                        'rate_ratio_CI_low': np.exp(treatment_interaction_coding - 1.96 * se_treatment_interaction),
-                                        'rate_ratio_CI_high': np.exp(treatment_interaction_coding + 1.96 * se_treatment_interaction),
-                                        'interpretation': 'Tests if treatment affects coding regions differently than intergenic regions (differential treatment effect)'
-                                    })
-                                    print(f"Added treatment differential effect test: p={p_treatment_interaction:.4e}, rate_ratio={np.exp(treatment_interaction_coding):.4f}")
-                    except Exception as e:
-                                print(f"Warning: Failed to compute treatment differential effect test: {e}")
-                    except Exception as e:
-                        print(f"Warning: Failed to compute coding vs intergenic test with full variance: {e}")
-                        # Fallback: simpler calculation using individual SEs with weighted average
-                        try:
-                            beta_syn_se = result.bse.get('cat_synonymous', np.nan)
-                            beta_treatment_syn_se = result.bse.get('treatment_x_cat_synonymous', np.nan)
-                            beta_nonsyn_se = result.bse.get('cat_non_synonymous', np.nan)
-                            beta_treatment_nonsyn_se = result.bse.get('treatment_x_cat_non_synonymous', np.nan)
-                            if all(np.isfinite([beta_syn_se, beta_treatment_syn_se, beta_nonsyn_se, beta_treatment_nonsyn_se])):
-                                # Approximate SE of weighted average
-                                # SE(syn_effect) ≈ sqrt(SE(β_syn)² + SE(β_treatment_syn)²)
-                                se_syn = np.sqrt(beta_syn_se**2 + beta_treatment_syn_se**2)
-                                se_nonsyn = np.sqrt(beta_nonsyn_se**2 + beta_treatment_nonsyn_se**2)
-                                # Weighted SE: sqrt((n_syn² * se_syn² + n_nonsyn² * se_nonsyn²) / n_coding²)
-                                se_coding = np.sqrt((n_syn**2 * se_syn**2 + n_nonsyn**2 * se_nonsyn**2) / (n_coding**2))
-                                if np.isfinite(se_coding) and se_coding > 0:
-                                    z_coding = coding_effect / se_coding
-                                    p_coding = 2 * (1 - stats.norm.cdf(abs(z_coding)))
-                                    test_results.append({
-                                        'test': 'coding (syn+non-syn) vs intergenic (IN TREATED, approximate)',
-                                        'coefficient': f'(n_syn * (β_syn + β_treatment_syn) + n_nonsyn * (β_nonsyn + β_treatment_nonsyn)) / (n_syn + n_nonsyn)',
-                                        'estimate': coding_effect,
-                                        'SE': se_coding,
-                                        'z': z_coding,
-                                        'p_value': p_coding,
-                                        'rate_ratio': np.exp(coding_effect),
-                                        'rate_ratio_CI_low': np.exp(coding_effect - 1.96 * se_coding),
-                                        'rate_ratio_CI_high': np.exp(coding_effect + 1.96 * se_coding),
-                                    })
-                        except Exception:
-                            pass
-                else:
-                    # No interaction terms - coding effect would be average of syn and nonsyn effects
-                    # This is less ideal but we can still compute it
-                    treated_df = df[df['treatment'] == 1].copy()
-                    n_syn = treated_df[treated_df['category'] == 'synonymous']['depth'].sum()
-                    n_nonsyn = treated_df[treated_df['category'] == 'non_synonymous']['depth'].sum()
-                    n_coding = n_syn + n_nonsyn
-                    
-                    if n_coding > 0 and np.isfinite(beta_syn) and np.isfinite(beta_nonsyn):
-                        # Weighted average of syn and nonsyn effects (no treatment interaction)
-                        coding_effect = (n_syn * beta_syn + n_nonsyn * beta_nonsyn) / n_coding
-                        
-                        # Approximate SE
-                        beta_syn_se = result.bse.get('cat_synonymous', np.nan)
-                        beta_nonsyn_se = result.bse.get('cat_non_synonymous', np.nan)
-                        if np.isfinite(beta_syn_se) and np.isfinite(beta_nonsyn_se):
-                            se_coding = np.sqrt((n_syn**2 * beta_syn_se**2 + n_nonsyn**2 * beta_nonsyn_se**2) / (n_coding**2))
-                            if np.isfinite(se_coding) and se_coding > 0:
-                                z_coding = coding_effect / se_coding
-                                p_coding = 2 * (1 - stats.norm.cdf(abs(z_coding)))
-                                test_results.append({
-                                    'test': 'coding (syn+non-syn) vs intergenic (IN TREATED, no interaction)',
-                                    'coefficient': f'(n_syn * β_syn + n_nonsyn * β_nonsyn) / (n_syn + n_nonsyn)',
-                                    'estimate': coding_effect,
-                                    'SE': se_coding,
-                                    'z': z_coding,
-                                    'p_value': p_coding,
-                                    'rate_ratio': np.exp(coding_effect),
-                                    'rate_ratio_CI_low': np.exp(coding_effect - 1.96 * se_coding),
-                                    'rate_ratio_CI_high': np.exp(coding_effect + 1.96 * se_coding),
-                                })
-                                print(f"Added coding vs intergenic test (no interaction): p={p_coding:.4e}, rate_ratio={np.exp(coding_effect):.4f}")
-            
-            # NEW TEST: Treatment differential effect: coding vs intergenic
-            # This test should be computed independently whenever interaction terms are available
-            # It directly answers: "Does treatment affect coding and intergenic regions differently?"
-            if (use_treatment_covariate and 'treatment_x_cat_synonymous' in result.params.index and 
-                'treatment_x_cat_non_synonymous' in result.params.index and vcov is not None):
-                try:
-                    # Get treated sample counts for weighting
-                    treated_df = df[df['treatment'] == 1].copy()
-                    n_syn = treated_df[treated_df['category'] == 'synonymous']['depth'].sum()
-                    n_nonsyn = treated_df[treated_df['category'] == 'non_synonymous']['depth'].sum()
-                    n_coding = n_syn + n_nonsyn
-                    
-                    if n_coding > 0:
-                        # Calculate weighted average of treatment interaction terms
-                        treatment_interaction_coding = (n_syn * beta_treatment_syn + n_nonsyn * beta_treatment_nonsyn) / n_coding
-                        
-                        # Variance of weighted average of interaction terms
-                        var_treatment_syn = vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous']
-                        var_treatment_nonsyn = vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous']
-                        try:
-                            cov_treatment_syn_nonsyn = vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_non_synonymous']
-                        except (KeyError, AttributeError):
-                            cov_treatment_syn_nonsyn = 0.0
-                        
-                        var_treatment_interaction = (n_syn**2 * var_treatment_syn + n_nonsyn**2 * var_treatment_nonsyn + 
-                                                     2 * n_syn * n_nonsyn * cov_treatment_syn_nonsyn) / (n_coding**2)
-                        
-                        se_treatment_interaction = np.sqrt(var_treatment_interaction) if var_treatment_interaction > 0 else np.nan
-                        
-                        if np.isfinite(se_treatment_interaction) and se_treatment_interaction > 0:
-                            z_treatment_interaction = treatment_interaction_coding / se_treatment_interaction
-                            p_treatment_interaction = 2 * (1 - stats.norm.cdf(abs(z_treatment_interaction)))
-                            
-                            test_results.append({
-                                'test': 'Treatment differential effect: coding vs intergenic',
-                                'coefficient': f'(n_syn * β_treatment_syn + n_nonsyn * β_treatment_nonsyn) / (n_syn + n_nonsyn)',
-                                'estimate': treatment_interaction_coding,
-                                'SE': se_treatment_interaction,
-                                'z': z_treatment_interaction,
-                                'p_value': p_treatment_interaction,
-                                'rate_ratio': np.exp(treatment_interaction_coding),
-                                'rate_ratio_CI_low': np.exp(treatment_interaction_coding - 1.96 * se_treatment_interaction),
-                                'rate_ratio_CI_high': np.exp(treatment_interaction_coding + 1.96 * se_treatment_interaction),
-                                'interpretation': 'Tests if treatment affects coding regions differently than intergenic regions (differential treatment effect)'
-                            })
-                            print(f"Added Treatment differential effect: coding vs intergenic test: p={p_treatment_interaction:.4e}, rate_ratio={np.exp(treatment_interaction_coding):.4f}")
-                        else:
-                            # Fallback: use individual SEs as approximation
-                            beta_treatment_syn_se = result.bse.get('treatment_x_cat_synonymous', np.nan)
-                            beta_treatment_nonsyn_se = result.bse.get('treatment_x_cat_non_synonymous', np.nan)
-                            if all(np.isfinite([beta_treatment_syn_se, beta_treatment_nonsyn_se])):
-                                se_treatment_interaction_approx = np.sqrt((n_syn**2 * beta_treatment_syn_se**2 + n_nonsyn**2 * beta_treatment_nonsyn_se**2) / (n_coding**2))
-                                if np.isfinite(se_treatment_interaction_approx) and se_treatment_interaction_approx > 0:
-                                    z_treatment_interaction = treatment_interaction_coding / se_treatment_interaction_approx
-                                    p_treatment_interaction = 2 * (1 - stats.norm.cdf(abs(z_treatment_interaction)))
-                                    test_results.append({
-                                        'test': 'Treatment differential effect: coding vs intergenic (approximate)',
-                                        'coefficient': f'(n_syn * β_treatment_syn + n_nonsyn * β_treatment_nonsyn) / (n_syn + n_nonsyn)',
-                                        'estimate': treatment_interaction_coding,
-                                        'SE': se_treatment_interaction_approx,
-                                        'z': z_treatment_interaction,
-                                        'p_value': p_treatment_interaction,
-                                        'rate_ratio': np.exp(treatment_interaction_coding),
-                                        'rate_ratio_CI_low': np.exp(treatment_interaction_coding - 1.96 * se_treatment_interaction_approx),
-                                        'rate_ratio_CI_high': np.exp(treatment_interaction_coding + 1.96 * se_treatment_interaction_approx),
-                                        'interpretation': 'Tests if treatment affects coding regions differently than intergenic regions (differential treatment effect)'
-                                    })
-                                    print(f"Added Treatment differential effect: coding vs intergenic test (approximate): p={p_treatment_interaction:.4e}, rate_ratio={np.exp(treatment_interaction_coding):.4f}")
-                except Exception as e:
-                    print(f"Warning: Failed to compute Treatment differential effect test: {e}")
-            
-            # Test: Treatment effect (β_treatment = 0) - this is the treatment effect in intergenic
-            if use_treatment_covariate and 'treatment' in result.params.index:
-                beta_treatment_se = result.bse.get('treatment', np.nan)
-                if np.isfinite(beta_treatment) and np.isfinite(beta_treatment_se) and beta_treatment_se > 0:
-                    z_treatment = beta_treatment / beta_treatment_se
-                    p_treatment = 2 * (1 - stats.norm.cdf(abs(z_treatment)))
-                    test_results.append({
-                        'test': 'treatment effect (intergenic)',
-                        'coefficient': 'β_treatment',
-                        'estimate': beta_treatment,
-                        'SE': beta_treatment_se,
-                        'z': z_treatment,
-                        'p_value': p_treatment,
-                        'rate_ratio': np.exp(beta_treatment),
-                        'rate_ratio_CI_low': np.exp(beta_treatment - 1.96 * beta_treatment_se),
-                        'rate_ratio_CI_high': np.exp(beta_treatment + 1.96 * beta_treatment_se),
-                    })
-            
-            # ====================================================================
-            # KEY TESTS: Does EMS treatment lead to category differences that are
-            # NOT just noise from controls? These are the PRIMARY tests of interest.
-            # ====================================================================
-            # These tests directly answer: "Is the category difference in treated 
-            # samples significantly different from the category difference in controls?"
-            # If significant, EMS treatment causes category-specific effects beyond
-            # what is seen in controls.
-            
-            # Test 1: Is the synonymous vs intergenic difference in treated 
-            # DIFFERENT from the synonymous vs intergenic difference in controls?
-            # Category difference in controls: β_syn
-            # Category difference in treated: β_syn + β_treatment_syn
-            # Difference of differences: β_treatment_syn
-            # This is the interaction term - if significant, EMS causes a different
-            # synonymous effect than what exists in controls
-            if use_treatment_covariate and 'treatment_x_cat_synonymous' in result.params.index:
-                beta_treatment_syn_se = result.bse.get('treatment_x_cat_synonymous', np.nan)
-                if np.isfinite(beta_treatment_syn) and np.isfinite(beta_treatment_syn_se) and beta_treatment_syn_se > 0:
-                    z_treatment_syn = beta_treatment_syn / beta_treatment_syn_se
-                    p_treatment_syn = 2 * (1 - stats.norm.cdf(abs(z_treatment_syn)))
-                    test_results.append({
-                        'test': 'EMS effect on category difference: synonymous vs intergenic (treated - controls)',
-                        'coefficient': 'β_treatment_syn',
-                        'estimate': beta_treatment_syn,
-                        'SE': beta_treatment_syn_se,
-                        'z': z_treatment_syn,
-                        'p_value': p_treatment_syn,
-                        'rate_ratio': np.exp(beta_treatment_syn),
-                        'rate_ratio_CI_low': np.exp(beta_treatment_syn - 1.96 * beta_treatment_syn_se),
-                        'rate_ratio_CI_high': np.exp(beta_treatment_syn + 1.96 * beta_treatment_syn_se),
-                        'interpretation': 'Tests if EMS causes synonymous vs intergenic difference that differs from controls'
-                    })
-            
-            # Test 2: Is the non-synonymous vs intergenic difference in treated 
-            # DIFFERENT from the non-synonymous vs intergenic difference in controls?
-            if use_treatment_covariate and 'treatment_x_cat_non_synonymous' in result.params.index:
-                beta_treatment_nonsyn_se = result.bse.get('treatment_x_cat_non_synonymous', np.nan)
-                if np.isfinite(beta_treatment_nonsyn) and np.isfinite(beta_treatment_nonsyn_se) and beta_treatment_nonsyn_se > 0:
-                    z_treatment_nonsyn = beta_treatment_nonsyn / beta_treatment_nonsyn_se
-                    p_treatment_nonsyn = 2 * (1 - stats.norm.cdf(abs(z_treatment_nonsyn)))
-                    test_results.append({
-                        'test': 'EMS effect on category difference: non_synonymous vs intergenic (treated - controls)',
-                        'coefficient': 'β_treatment_nonsyn',
-                        'estimate': beta_treatment_nonsyn,
-                        'SE': beta_treatment_nonsyn_se,
-                        'z': z_treatment_nonsyn,
-                        'p_value': p_treatment_nonsyn,
-                        'rate_ratio': np.exp(beta_treatment_nonsyn),
-                        'rate_ratio_CI_low': np.exp(beta_treatment_nonsyn - 1.96 * beta_treatment_nonsyn_se),
-                        'rate_ratio_CI_high': np.exp(beta_treatment_nonsyn + 1.96 * beta_treatment_nonsyn_se),
-                        'interpretation': 'Tests if EMS causes non-synonymous vs intergenic difference that differs from controls'
-                    })
-            
-            # Test 3: Is the synonymous vs non-synonymous difference in treated
-            # DIFFERENT from the synonymous vs non-synonymous difference in controls?
-            # Difference in controls: β_syn - β_nonsyn
-            # Difference in treated: (β_syn + β_treatment_syn) - (β_nonsyn + β_treatment_nonsyn)
-            # Difference of differences: β_treatment_syn - β_treatment_nonsyn
-            if (use_treatment_covariate and 'treatment_x_cat_synonymous' in result.params.index and 
-                'treatment_x_cat_non_synonymous' in result.params.index and vcov is not None):
-                diff_of_diffs = beta_treatment_syn - beta_treatment_nonsyn
-                try:
-                    var_diff_of_diffs = (
-                        vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
-                        vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] -
-                        2 * vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_non_synonymous']
-                    )
-                    se_diff_of_diffs = np.sqrt(var_diff_of_diffs) if var_diff_of_diffs > 0 else np.nan
-                    if np.isfinite(se_diff_of_diffs) and se_diff_of_diffs > 0:
-                        z_diff_of_diffs = diff_of_diffs / se_diff_of_diffs
-                        p_diff_of_diffs = 2 * (1 - stats.norm.cdf(abs(z_diff_of_diffs)))
-                        test_results.append({
-                            'test': 'EMS effect on category difference: synonymous vs non_synonymous (treated - controls)',
-                            'coefficient': 'β_treatment_syn - β_treatment_nonsyn',
-                            'estimate': diff_of_diffs,
-                            'SE': se_diff_of_diffs,
-                            'z': z_diff_of_diffs,
-                            'p_value': p_diff_of_diffs,
-                            'rate_ratio': np.exp(diff_of_diffs),
-                            'rate_ratio_CI_low': np.exp(diff_of_diffs - 1.96 * se_diff_of_diffs),
-                            'rate_ratio_CI_high': np.exp(diff_of_diffs + 1.96 * se_diff_of_diffs),
-                            'interpretation': 'Tests if EMS causes synonymous vs non-synonymous difference that differs from controls'
-                        })
-                except Exception:
-                    pass
-            
-            # Test 4: Combined coding effect difference (controls vs treated)
-            # Average coding effect difference = (β_treatment_syn + β_treatment_nonsyn) / 2
-            # This tests if coding regions overall have a different effect in treated vs controls
-            if (use_treatment_covariate and 'treatment_x_cat_synonymous' in result.params.index and 
-                'treatment_x_cat_non_synonymous' in result.params.index and vcov is not None):
-                avg_interaction = (beta_treatment_syn + beta_treatment_nonsyn) / 2
-                # Var((β_treatment_syn + β_treatment_nonsyn) / 2) = (1/4) * [Var(β_treatment_syn) + Var(β_treatment_nonsyn) + 2·Cov(β_treatment_syn, β_treatment_nonsyn)]
-                try:
-                    var_avg_int = (
-                        vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_synonymous'] +
-                        vcov.loc['treatment_x_cat_non_synonymous', 'treatment_x_cat_non_synonymous'] +
-                        2 * vcov.loc['treatment_x_cat_synonymous', 'treatment_x_cat_non_synonymous']
-                    ) / 4
-                    se_avg_int = np.sqrt(var_avg_int) if var_avg_int > 0 else np.nan
-                    if np.isfinite(se_avg_int) and se_avg_int > 0:
-                        z_avg_int = avg_interaction / se_avg_int
-                        p_avg_int = 2 * (1 - stats.norm.cdf(abs(z_avg_int)))
-                        test_results.append({
-                            'test': 'EMS effect on category difference: coding vs intergenic (treated - controls, average)',
-                            'coefficient': '(β_treatment_syn + β_treatment_nonsyn) / 2',
-                            'estimate': avg_interaction,
-                            'SE': se_avg_int,
-                            'z': z_avg_int,
-                            'p_value': p_avg_int,
-                            'rate_ratio': np.exp(avg_interaction),
-                            'rate_ratio_CI_low': np.exp(avg_interaction - 1.96 * se_avg_int),
-                            'rate_ratio_CI_high': np.exp(avg_interaction + 1.96 * se_avg_int),
-                            'interpretation': 'Tests if EMS causes coding vs intergenic difference (averaged across syn/nonsyn) that differs from controls'
-                        })
-                except Exception:
-                    # Fallback
-                    try:
-                        beta_treatment_syn_se = result.bse.get('treatment_x_cat_synonymous', np.nan)
-                        beta_treatment_nonsyn_se = result.bse.get('treatment_x_cat_non_synonymous', np.nan)
-                        if all(np.isfinite([beta_treatment_syn_se, beta_treatment_nonsyn_se])):
-                            se_avg_int = np.sqrt(beta_treatment_syn_se**2 + beta_treatment_nonsyn_se**2) / 2
-                            if np.isfinite(se_avg_int) and se_avg_int > 0:
-                                z_avg_int = avg_interaction / se_avg_int
-                                p_avg_int = 2 * (1 - stats.norm.cdf(abs(z_avg_int)))
-                                test_results.append({
-                                    'test': 'EMS effect on category difference: coding vs intergenic (treated - controls, average, approximate)',
-                                    'coefficient': '(β_treatment_syn + β_treatment_nonsyn) / 2',
-                                    'estimate': avg_interaction,
-                                    'SE': se_avg_int,
-                                    'z': z_avg_int,
-                                    'p_value': p_avg_int,
-                                    'rate_ratio': np.exp(avg_interaction),
-                                    'rate_ratio_CI_low': np.exp(avg_interaction - 1.96 * se_avg_int),
-                                    'rate_ratio_CI_high': np.exp(avg_interaction + 1.96 * se_avg_int),
-                                    'interpretation': 'Tests if EMS causes coding vs intergenic difference (averaged across syn/nonsyn) that differs from controls'
-                                })
-                    except Exception:
-                        pass
-            
-            # Additional tests: Category differences WITHIN controls and WITHIN treated
-            # These test if category effects differ between controls and treated
-            
-            # Test: Category differences within CONTROLS only
-            # In controls: rate = exp(β₀ + β_cat)
-            # So the difference between categories in controls is just β_cat
-            # This is what we already tested above (β_syn = 0, β_nonsyn = 0)
-            # But let's add explicit tests for within-controls comparisons
-            
-            # Test: Synonymous vs intergenic WITHIN controls
-            # Control synonymous rate = exp(β₀ + β_syn)
-            # Control intergenic rate = exp(β₀)
-            # Ratio = exp(β_syn)
-            # This is the same as the overall test, but let's label it clearly
-            if 'cat_synonymous' in result.params.index and np.isfinite(beta_syn):
-                beta_syn_se = result.bse.get('cat_synonymous', np.nan)
-                if np.isfinite(beta_syn_se) and beta_syn_se > 0:
-                    test_results.append({
-                        'test': 'synonymous vs intergenic (within controls)',
-                        'coefficient': 'β_syn',
-                        'estimate': beta_syn,
-                        'SE': beta_syn_se,
-                        'z': beta_syn / beta_syn_se,
-                        'p_value': 2 * (1 - stats.norm.cdf(abs(beta_syn / beta_syn_se))),
-                        'rate_ratio': np.exp(beta_syn),
-                        'rate_ratio_CI_low': np.exp(beta_syn - 1.96 * beta_syn_se),
-                        'rate_ratio_CI_high': np.exp(beta_syn + 1.96 * beta_syn_se),
-                    })
-            
-            # Test: Non-synonymous vs intergenic WITHIN controls
-            if 'cat_non_synonymous' in result.params.index and np.isfinite(beta_nonsyn):
-                beta_nonsyn_se = result.bse.get('cat_non_synonymous', np.nan)
-                if np.isfinite(beta_nonsyn_se) and beta_nonsyn_se > 0:
-                    test_results.append({
-                        'test': 'non_synonymous vs intergenic (within controls)',
-                        'coefficient': 'β_nonsyn',
-                        'estimate': beta_nonsyn,
-                        'SE': beta_nonsyn_se,
-                        'z': beta_nonsyn / beta_nonsyn_se,
-                        'p_value': 2 * (1 - stats.norm.cdf(abs(beta_nonsyn / beta_nonsyn_se))),
-                        'rate_ratio': np.exp(beta_nonsyn),
-                        'rate_ratio_CI_low': np.exp(beta_nonsyn - 1.96 * beta_nonsyn_se),
-                        'rate_ratio_CI_high': np.exp(beta_nonsyn + 1.96 * beta_nonsyn_se),
-                    })
-            
-            # Test: Synonymous vs non-synonymous WITHIN controls
-            # Control synonymous rate = exp(β₀ + β_syn)
-            # Control non-synonymous rate = exp(β₀ + β_nonsyn)
-            # Ratio = exp(β_syn - β_nonsyn)
-            if ('cat_synonymous' in result.params.index and 
-                'cat_non_synonymous' in result.params.index and vcov is not None):
-                diff = beta_syn - beta_nonsyn
-                try:
-                    var_diff = (vcov.loc['cat_synonymous', 'cat_synonymous'] + 
-                               vcov.loc['cat_non_synonymous', 'cat_non_synonymous'] -
-                               2 * vcov.loc['cat_synonymous', 'cat_non_synonymous'])
-                    se_diff = np.sqrt(var_diff) if var_diff > 0 else np.nan
-                    if np.isfinite(se_diff) and se_diff > 0:
-                        z_diff = diff / se_diff
-                        p_diff = 2 * (1 - stats.norm.cdf(abs(z_diff)))
-                        test_results.append({
-                            'test': 'synonymous vs non_synonymous (within controls)',
-                            'coefficient': 'β_syn - β_nonsyn',
-                            'estimate': diff,
-                            'SE': se_diff,
-                            'z': z_diff,
-                            'p_value': p_diff,
-                            'rate_ratio': np.exp(diff),
-                            'rate_ratio_CI_low': np.exp(diff - 1.96 * se_diff),
-                            'rate_ratio_CI_high': np.exp(diff + 1.96 * se_diff),
-                        })
-                except Exception:
-                    pass
-            
-            # Test: Category differences WITHIN TREATED only
-            # In treated: rate = exp(β₀ + β_treatment + β_cat)
-            # So the difference between categories in treated is also β_cat
-            # The category effects are the same in controls and treated (no interaction)
-            # So these tests would be the same as the within-controls tests
-            # But let's add them for clarity and to show they're the same
-            
-            # Test: Treatment effect WITHIN each category
-            # This tests if treatment has the same effect in each category
-            # Treatment effect in intergenic: exp(β_treatment)
-            # Treatment effect in synonymous: exp(β_treatment) [same, no interaction]
-            # Treatment effect in non-synonymous: exp(β_treatment) [same, no interaction]
-            # Since there's no interaction term, treatment effect is the same in all categories
-            # But let's add explicit tests for each category
-            if use_treatment_covariate and 'treatment' in result.params.index:
-                beta_treatment_se = result.bse.get('treatment', np.nan)
-                if np.isfinite(beta_treatment) and np.isfinite(beta_treatment_se) and beta_treatment_se > 0:
-                    z_treatment = beta_treatment / beta_treatment_se
-                    p_treatment = 2 * (1 - stats.norm.cdf(abs(z_treatment)))
-                    for cat in categories:
-                        test_results.append({
-                            'test': f'treatment effect (within {cat})',
-                            'coefficient': 'β_treatment',
-                            'estimate': beta_treatment,
-                            'SE': beta_treatment_se,
-                            'z': z_treatment,
-                            'p_value': p_treatment,
-                            'rate_ratio': np.exp(beta_treatment),
-                            'rate_ratio_CI_low': np.exp(beta_treatment - 1.96 * beta_treatment_se),
-                            'rate_ratio_CI_high': np.exp(beta_treatment + 1.96 * beta_treatment_se),
-                        })
-            
-            # Reorder test results: EMS effect tests first (primary tests of interest)
-            test_results_ordered = []
-            # First: EMS effect tests (primary)
-            for test in test_results:
-                if 'EMS effect on category difference' in test.get('test', ''):
-                    test_results_ordered.append(test)
-            # Then: Other tests
-            for test in test_results:
-                if 'EMS effect on category difference' not in test.get('test', ''):
-                    test_results_ordered.append(test)
-            
-            test_df = pd.DataFrame(test_results_ordered)
-            
-            # Create summary DataFrame
-            summary_rows = []
-            for cat in categories:
-                for is_control in [True, False]:
-                    key = f"{cat}_{'control' if is_control else 'treated'}"
-                    summary_rows.append({
-                        'category': cat,
-                        'treatment': 'control' if is_control else 'treated',
-                        'rate': rates[key],
-                        'CI_low': cis[key][0],
-                        'CI_high': cis[key][1],
-                    })
-            
-            # Calculate coding rate directly from site-level data (same approach as other categories)
-            # Just sum all coding mutations and bases, then calculate rate
-            for is_control in [True, False]:
-                treatment_mask = df['is_control'] if is_control else ~df['is_control']
-                subset_df = df[treatment_mask].copy()
-                
-                # Get all coding sites (synonymous OR non_synonymous)
-                coding_mask = (subset_df['category'] == 'synonymous') | (subset_df['category'] == 'non_synonymous')
-                coding_df = subset_df[coding_mask]
-                
-                if len(coding_df) > 0:
-                    mutations_coding = coding_df['ems_count'].sum()
-                    bases_coding = coding_df['depth'].sum()
-                    
-                    if bases_coding > 0:
-                        coding_rate = mutations_coding / bases_coding
-                        
-                        # Calculate CI using Poisson approximation (same as would be done for simple rate)
-                        # For Poisson: CI = rate ± 1.96 * sqrt(rate / n)
-                        # Using normal approximation for log rate
-                        if mutations_coding > 0:
-                            se_log_rate = 1.0 / np.sqrt(mutations_coding)
-                            z = 1.96
-                            coding_ci_low = coding_rate * np.exp(-z * se_log_rate)
-                            coding_ci_high = coding_rate * np.exp(z * se_log_rate)
-                        else:
-                            # No mutations: use Poisson exact CI or simple approximation
-                            coding_ci_low = 0.0
-                            # Upper bound: 3.69 / bases_coding (Poisson 95% CI for 0 events)
-                            coding_ci_high = 3.69 / bases_coding
-                        
-                        summary_rows.append({
-                            'category': 'coding',
-                            'treatment': 'control' if is_control else 'treated',
-                            'rate': coding_rate,
-                            'CI_low': coding_ci_low,
-                            'CI_high': coding_ci_high,
-                    })
-            
-            summary_df = pd.DataFrame(summary_rows)
-            
-            # Save summary and test results
-            os.makedirs(output_dir, exist_ok=True)
-            summary_path = os.path.join(output_dir, 'category_rates_summary.tsv')
-            summary_df.to_csv(summary_path, sep='\t', index=False)
-            print(f"Category rates summary saved to {summary_path}")
-            
-            if not test_df.empty:
-                test_path = os.path.join(output_dir, 'category_statistical_tests.tsv')
-                test_df.to_csv(test_path, sep='\t', index=False)
-                print(f"Statistical tests saved to {test_path}")
-                print(f"  NOTE: Tests are ordered with EMS effect tests (primary) first")
-            
-            # Extract p-values for key comparisons
-            # PRIORITY: EMS effect tests (tests if treatment causes category differences)
-            pvalues_dict = {}
-            if not test_df.empty:
-                for _, row in test_df.iterrows():
-                    test_name = row['test']
-                    # Primary tests: EMS effect on category differences
-                    if 'EMS effect on category difference' in test_name:
-                        if 'synonymous vs intergenic' in test_name:
-                            pvalues_dict['ems_effect_syn_vs_intergenic'] = row['p_value']
-                        elif 'non_synonymous vs intergenic' in test_name:
-                            pvalues_dict['ems_effect_nonsyn_vs_intergenic'] = row['p_value']
-                        elif 'synonymous vs non_synonymous' in test_name:
-                            pvalues_dict['ems_effect_syn_vs_nonsyn'] = row['p_value']
-                        elif 'coding vs intergenic' in test_name:
-                            pvalues_dict['ems_effect_coding_vs_intergenic'] = row['p_value']
-                    # Secondary tests: Category differences within treated
-                    elif 'IN TREATED' in test_name:
-                        if 'synonymous vs intergenic' in test_name:
-                            pvalues_dict['syn_vs_intergenic_treated'] = row['p_value']
-                        elif 'non_synonymous vs intergenic' in test_name:
-                            pvalues_dict['nonsyn_vs_intergenic_treated'] = row['p_value']
-                        elif 'synonymous vs non_synonymous' in test_name:
-                            pvalues_dict['syn_vs_nonsyn_treated'] = row['p_value']
-                        elif 'coding (syn+non-syn) vs intergenic' in test_name:
-                            pvalues_dict['coding_vs_intergenic_treated'] = row['p_value']
-            
-            # All plotting is now done by regenerate_rate_plots.py
-            # Data has been saved to TSV files above
-            
-            # Create report
-            report_path = os.path.join(output_dir, 'category_rates_report.txt')
-            with open(report_path, 'w') as f:
-                f.write("=== Mutation Rate Comparison by Category ===\n\n")
-                f.write(f"Model: GLM with category and treatment covariates\n")
-                f.write(f"Method: {method}\n")
-                f.write(f"Treatment covariate: {use_treatment_covariate}\n")
-                if alpha > 0:
-                    f.write(f"Alpha subtracted: {alpha:.2e}\n")
-                f.write(f"\nTotal sites: {len(df):,}\n")
-                f.write(f"Category distribution:\n")
-                f.write(str(df['category'].value_counts()) + "\n\n")
-                
-                f.write("Model coefficients:\n")
-                f.write(f"  Intercept (β₀): {beta0:.6f}\n")
-                if use_treatment_covariate:
-                    f.write(f"  Treatment (β_treatment): {beta_treatment:.6f}\n")
-                f.write(f"  Synonymous (β_syn): {beta_syn:.6f}\n")
-                f.write(f"  Non-synonymous (β_nonsyn): {beta_nonsyn:.6f}\n")
-                if use_treatment_covariate:
-                    f.write(f"  Treatment × Synonymous (β_treatment_syn): {beta_treatment_syn:.6f}\n")
-                    f.write(f"  Treatment × Non-synonymous (β_treatment_nonsyn): {beta_treatment_nonsyn:.6f}\n")
-                f.write("\n")
-                
-                f.write("Rates by category:\n")
-                f.write(f"{'Category':<15} {'Treatment':<10} {'Rate':<15} {'CI_low':<15} {'CI_high':<15}\n")
-                f.write("-" * 70 + "\n")
-                for _, row in summary_df.iterrows():
-                    f.write(f"{row['category']:<15} {row['treatment']:<10} {row['rate']:<15.6e} {row['CI_low']:<15.6e} {row['CI_high']:<15.6e}\n")
-                
-                f.write(f"\n=== STATISTICAL TESTS ===\n\n")
-                if not test_df.empty:
-                    f.write(f"{'Test':<35} {'Coefficient':<20} {'Estimate':<12} {'SE':<12} {'z':<10} {'p_value':<12} {'Rate_Ratio':<15}\n")
-                    f.write("-" * 120 + "\n")
-                    for _, row in test_df.iterrows():
-                        sig = "***" if row['p_value'] < 0.001 else "**" if row['p_value'] < 0.01 else "*" if row['p_value'] < 0.05 else ""
-                        f.write(f"{row['test']:<35} {row['coefficient']:<20} {row['estimate']:<12.6f} {row['SE']:<12.6f} {row['z']:<10.3f} {row['p_value']:<12.6e} {row['rate_ratio']:<15.6f} {sig}\n")
-                    f.write("\nSignificance: *** p<0.001, ** p<0.01, * p<0.05\n\n")
-                    
-                    f.write("Rate ratios with 95% CI:\n")
-                    for _, row in test_df.iterrows():
-                        f.write(f"  {row['test']}: {row['rate_ratio']:.4f} (95% CI: {row['rate_ratio_CI_low']:.4f} - {row['rate_ratio_CI_high']:.4f})\n")
-                else:
-                    f.write("No statistical tests performed.\n")
-                
-                f.write(f"\nModel fit statistics:\n")
-                f.write(f"  AIC: {result.aic:.2f}\n")
-                f.write(f"  Log-likelihood: {result.llf:.2f}\n")
-            
-            print(f"Category rates report saved to {report_path}")
-            
-            return summary_df, result
-            
-    except Exception as e:
-        print(f"Error in category rate comparison: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    # Calculate rates and CIs
+    # Use absolute_effect_result if available, otherwise control_baseline_result
+    baseline_result = absolute_effect_result if absolute_effect_result is not None else control_baseline_result
+    rates, cis = _calculate_rates_and_cis(result, categories, use_treatment_covariate, baseline_result, mean_expected_rates)
+    
+    # Run statistical tests
+    test_results = _run_statistical_tests(result, df, rates, cis, use_treatment_covariate, 
+                                          control_baseline_result, absolute_effect_result)
+    
+    # Create summary DataFrames
+    summary_rows = []
+    for cat in categories:
+        for treatment in ['control', 'treated']:
+            key = f"{cat}_{treatment}"
+            if key in rates:
+                summary_rows.append({
+                    'category': cat,
+                    'treatment': treatment,
+                    'rate': rates[key],
+                    'CI_low': cis[key][0],
+                    'CI_high': cis[key][1]
+                })
+    
+    summary_df = pd.DataFrame(summary_rows)
+    test_df = pd.DataFrame(test_results)
+    
+    # Add 5mer normalization flag to summary
+    summary_df['5mer_normalized'] = mean_expected_rates is not None
+    
+    # Add absolute effect values to summary if available
+    if 'absolute_effect_intergenic' in rates:
+        summary_df['absolute_effect'] = np.nan
+        for idx, row in summary_df.iterrows():
+            if row['treatment'] == 'treated':
+                cat = row['category']
+                if cat == 'intergenic':
+                    summary_df.loc[idx, 'absolute_effect'] = rates.get('absolute_effect_intergenic', np.nan)
+                elif cat == 'synonymous':
+                    summary_df.loc[idx, 'absolute_effect'] = rates.get('absolute_effect_synonymous', np.nan)
+                elif cat == 'non_synonymous':
+                    summary_df.loc[idx, 'absolute_effect'] = rates.get('absolute_effect_nonsyn', np.nan)
+    
+    # Save results
+    _save_results(summary_df, test_df, result, output_dir, 
+                  kmer5_normalized=(mean_expected_rates is not None),
+                  absolute_effects=rates if 'absolute_effect_intergenic' in rates else None)
+    
+    return summary_df, result
 
 
 def compare_treatment_day_rates(site_df: pd.DataFrame, output_dir: str, method: str = "negative_binomial", 
@@ -3535,7 +3832,7 @@ def calculate_window_rates_5mer_normalized(
         total_depth_all = window_sites['depth'].sum()
         
         if total_depth_all == 0:
-            continue
+                continue
             
         expected_rate_control = total_expected_control / total_depth_all
         expected_rate_treated = total_expected_treated / total_depth_all
@@ -4043,45 +4340,45 @@ def plot_regional_rates_manhattan(
     )
     
     # Determine significance using statistical tests
-    # Test if treated rate is significantly different from control rate WITHIN each window
+    # Test if each window's rate is significantly different from the overall mean rate
+    # This identifies regions with unusually high or low mutation rates (hotspots/coldspots)
     if use_treatment_covariate:
-        # Calculate fold-change
-        windows_rates_df['fold_change'] = (
-            windows_rates_df['rate_treated'] / windows_rates_df['rate_control']
-        ).replace([np.inf, -np.inf], np.nan)
+        # Use treated rate for comparison (since that's what we're interested in)
+        rate_col = 'rate_treated'
         
-        # For each window, test if treated rate differs from control rate
-        # Use direct p-value from GLM treatment coefficient if available (best method)
-        # Otherwise fall back to CI-based test
+        # Calculate overall mean treated rate across all windows
+        overall_mean = windows_rates_df[rate_col].dropna().mean()
         
+        print(f"Comparing each window's treated rate to overall mean treated rate: {overall_mean:.6e}")
+        
+        # For each window, test if treated rate differs from overall mean
         windows_rates_df['p_value'] = np.nan
         
         for idx, row in windows_rates_df.iterrows():
             p_val = np.nan
             
-            # First, try to use direct p-value from GLM (most accurate)
-            if 'treatment_pvalue' in windows_rates_df.columns and not pd.isna(row.get('treatment_pvalue')):
-                p_val = row['treatment_pvalue']
-            
-            # Fall back to CI-based test if direct p-value not available
-            elif (not pd.isna(row['rate_treated']) and not pd.isna(row['rate_control']) and
-                  row['rate_control'] > 0 and row['rate_treated'] > 0 and
-                  not pd.isna(row['CI_low_treated']) and not pd.isna(row['CI_high_treated']) and
-                  not pd.isna(row['CI_low_control']) and not pd.isna(row['CI_high_control'])):
+            # Test if window rate differs from overall mean using CI-based test
+            if (not pd.isna(row[rate_col]) and not pd.isna(overall_mean) and
+                row[rate_col] > 0 and
+                not pd.isna(row.get('CI_low_treated')) and not pd.isna(row.get('CI_high_treated'))):
                 
-                # Calculate SEs on log scale from CIs
+                # Calculate SE on log scale from CI
                 # For log-normal: SE_log ≈ (log(CI_high) - log(CI_low)) / (2 * 1.96)
-                se_log_treated = (np.log(row['CI_high_treated']) - np.log(row['CI_low_treated'])) / (2 * 1.96)
-                se_log_control = (np.log(row['CI_high_control']) - np.log(row['CI_low_control'])) / (2 * 1.96)
+                se_log_rate = (np.log(row['CI_high_treated']) - np.log(row['CI_low_treated'])) / (2 * 1.96)
                 
-                if se_log_treated > 0 and se_log_control > 0 and np.isfinite(se_log_treated) and np.isfinite(se_log_control):
-                    # Log fold-change and its SE
-                    log_fc = np.log(row['rate_treated']) - np.log(row['rate_control'])
-                    se_log_fc = np.sqrt(se_log_treated**2 + se_log_control**2)
+                if se_log_rate > 0 and np.isfinite(se_log_rate):
+                    # Test if log(rate) differs from log(overall_mean)
+                    log_rate = np.log(row[rate_col])
+                    log_mean = np.log(overall_mean)
+                    log_diff = log_rate - log_mean
                     
-                    # Test if log_fc is significantly different from 0 (i.e., fold-change ≠ 1)
-                    if se_log_fc > 0 and np.isfinite(se_log_fc):
-                        z = log_fc / se_log_fc
+                    # SE of the difference (assuming independence)
+                    # Approximate SE of overall mean (using median absolute deviation as proxy)
+                    # For simplicity, use the window's own SE (conservative)
+                    se_log_diff = se_log_rate
+                    
+                    if se_log_diff > 0 and np.isfinite(se_log_diff):
+                        z = log_diff / se_log_diff
                         if np.isfinite(z):
                             p_val = 2 * (1 - stats.norm.cdf(abs(z)))
             
@@ -4089,8 +4386,10 @@ def plot_regional_rates_manhattan(
             if np.isfinite(p_val) and not pd.isna(p_val):
                 windows_rates_df.at[idx, 'p_value'] = p_val
         
-        # Use treated rate for plotting
-        rate_col = 'rate_treated'
+        # Calculate fold-change relative to overall mean (for coloring)
+        windows_rates_df['fold_change'] = (
+            windows_rates_df[rate_col] / overall_mean
+        ).replace([np.inf, -np.inf], np.nan)
     else:
         # Single rate per window - compare to overall mean
         overall_mean = windows_rates_df['rate_control'].dropna().mean()
@@ -4156,29 +4455,23 @@ def plot_regional_rates_manhattan(
     # Plot significant windows
     sig = windows_rates_df[windows_rates_df['is_significant']]
     if len(sig) > 0:
+        # Color by whether rate is above or below overall mean (identifies hotspots/coldspots)
         if use_treatment_covariate:
-            # Color by fold-change direction (treated vs control)
-            increased = sig[sig['fold_change'] > 1.0]
-            decreased = sig[sig['fold_change'] < 1.0]
-            
-            if len(increased) > 0:
-                ax.scatter(increased['x_pos'], increased[rate_col],
-                          c='red', alpha=0.7, s=30, label=f'Significantly increased (p<{significance_threshold})')
-            if len(decreased) > 0:
-                ax.scatter(decreased['x_pos'], decreased[rate_col],
-                          c='blue', alpha=0.7, s=30, label=f'Significantly decreased (p<{significance_threshold})')
-        else:
-            # Color by whether rate is above or below mean
             overall_mean = windows_rates_df[rate_col].dropna().mean()
+        else:
+            overall_mean = windows_rates_df[rate_col].dropna().mean()
+        
             increased = sig[sig[rate_col] > overall_mean]
             decreased = sig[sig[rate_col] < overall_mean]
             
             if len(increased) > 0:
                 ax.scatter(increased['x_pos'], increased[rate_col],
-                          c='red', alpha=0.7, s=30, label=f'Significantly increased (p<{significance_threshold})')
+                      c='red', alpha=0.7, s=30, 
+                      label=f'Hotspot: significantly above mean (FDR<{significance_threshold})')
             if len(decreased) > 0:
                 ax.scatter(decreased['x_pos'], decreased[rate_col],
-                          c='blue', alpha=0.7, s=30, label=f'Significantly decreased (p<{significance_threshold})')
+                      c='blue', alpha=0.7, s=30, 
+                      label=f'Coldspot: significantly below mean (FDR<{significance_threshold})')
     
     # Add chromosome boundaries
     for i, chrom in enumerate(chrom_order):
@@ -4186,10 +4479,23 @@ def plot_regional_rates_manhattan(
         if i > 0:
             ax.axvline(x=offset, color='black', linestyle='--', alpha=0.3, linewidth=0.5)
     
+    # Add horizontal line at overall mean
+    if use_treatment_covariate:
+        overall_mean = windows_rates_df[rate_col].dropna().mean()
+    else:
+        overall_mean = windows_rates_df[rate_col].dropna().mean()
+    ax.axhline(y=overall_mean, color='green', linestyle='--', linewidth=1.5, 
+               alpha=0.7, label=f'Overall mean: {overall_mean:.2e}')
+    
     # Labels
     ax.set_xlabel('Genomic Position', fontsize=12)
     ax.set_ylabel('Mutation Rate (per base)', fontsize=12)
-    ax.set_title('Mutation Rates Across Genome (GC-Normalized Windows)', fontsize=14, fontweight='bold')
+    if use_treatment_covariate:
+        ax.set_title('Treated Mutation Rates Across Genome\n(compared to overall mean; FDR-corrected)', 
+                    fontsize=14, fontweight='bold')
+    else:
+        ax.set_title('Mutation Rates Across Genome\n(compared to overall mean; FDR-corrected)', 
+                    fontsize=14, fontweight='bold')
     ax.set_yscale('log')
     ax.legend()
     ax.grid(alpha=0.3, axis='y')
@@ -4900,7 +5206,10 @@ def main():
                         category_df, category_dir, 
                         method="negative_binomial",
                         use_treatment_covariate=use_treatment_covariate,
-                        alpha=alpha if not use_treatment_covariate else 0.0
+                        alpha=alpha if not use_treatment_covariate else 0.0,
+                        use_control_baseline=True,  # Use control-baseline approach to test if category matters
+                        kmer5_model_path=args.kmer5_model_path,  # 5mer normalization for sequence context
+                        genome_fasta=args.genome_fasta
                     )
                     if category_results:
                         print("✓ Category comparison analysis complete")
