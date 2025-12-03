@@ -913,17 +913,58 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
         print(f"ERROR: No C-centered 5mers found!")
         return
     
-    # Extract position-specific rates
+    # Extract position-specific rates and dinucleotide rates first
     position_rates = extract_position_specific_rates(aggregate_rates)
+    upstream_dinuc_rates, downstream_dinuc_rates = extract_dinucleotide_rates(aggregate_rates)
+    
+    # Calculate median mutation rate for enrichment calculation
+    all_rate_values = list(c_centered_rates.values())
+    median_rate = np.median(all_rate_values)
+    
+    # Calculate enrichment (deviation from median) for all rates
+    enrichments = {kmer: rate - median_rate for kmer, rate in c_centered_rates.items()}
     
     # Sort by rate in ascending order (lowest to highest, left to right)
     sorted_kmers = sorted(c_centered_rates.items(), key=lambda x: x[1], reverse=False)
     kmers = [k[0] for k in sorted_kmers]
     rates = [k[1] for k in sorted_kmers]
+    enrichments_list = [enrichments[kmer] for kmer in kmers]
     
     # Get top 3 enriched (highest rates) and top 3 depleted (lowest rates)
     top_3_enriched = sorted(c_centered_rates.items(), key=lambda x: x[1], reverse=True)[:3]
     top_3_depleted = sorted(c_centered_rates.items(), key=lambda x: x[1], reverse=False)[:3]
+    
+    # Determine global enrichment range for consistent color scale across all panels
+    all_enrichment_values = list(enrichments.values())
+    # Also include enrichments from position-specific and dinucleotide rates
+    for pos in position_rates.values():
+        for rate in pos.values():
+            all_enrichment_values.append(rate - median_rate)
+    for rate in upstream_dinuc_rates.values():
+        all_enrichment_values.append(rate - median_rate)
+    for rate in downstream_dinuc_rates.values():
+        all_enrichment_values.append(rate - median_rate)
+    
+    # Use percentiles instead of absolute max to avoid washed-out colors from outliers
+    # Use 98th percentile to capture most of the range while excluding extreme outliers
+    if all_enrichment_values:
+        abs_enrichments = [abs(e) for e in all_enrichment_values]
+        max_enrichment = np.percentile(abs_enrichments, 98)
+        # Ensure we have a reasonable minimum range
+        if max_enrichment < 1e-8:
+            max_enrichment = 1e-6
+    else:
+        max_enrichment = 1e-6
+    vmin_enrichment = -max_enrichment
+    vmax_enrichment = max_enrichment
+    
+    # Create blue-to-orange diverging colormap
+    import matplotlib.colors as mcolors
+    # Blue (low) to white (median) to orange (high)
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        'blue_orange_diverging',
+        ['#2166AC', '#4393C3', '#92C5DE', '#D1E5F0', '#F7F7F7', '#FDDBC7', '#F4A582', '#FF8C42', '#FF6B00']
+    )
     
     # Create multi-panel figure with GridSpec
     # Layout: 3 rows, 1 column
@@ -931,13 +972,18 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
     # Row 2: Sequence logo-style heatmap (nucleotides)
     # Row 3: Dinucleotide pair heatmap
     fig = plt.figure(figsize=(fig_width, fig_height * 3.5))
-    gs = GridSpec(3, 1, height_ratios=[1.5, 1, 1.2], hspace=0.35, top=0.97, bottom=0.08)
+    gs = GridSpec(3, 1, height_ratios=[1.5, 1, 1.2], hspace=0.35, top=0.97, bottom=0.08, right=0.85)
     
     # Panel 1: 5mer enrichment rates
     ax1 = fig.add_subplot(gs[0])
     
-    # Create bar plot
-    ax1.bar(range(len(kmers)), rates, width=0.95, color='orange', alpha=0.7)
+    # Create bar plot with colors based on enrichment
+    bars = ax1.bar(range(len(kmers)), rates, width=0.95)
+    # Color bars based on enrichment
+    norm = mcolors.Normalize(vmin=vmin_enrichment, vmax=vmax_enrichment)
+    for i, (bar, enrichment) in enumerate(zip(bars, enrichments_list)):
+        bar.set_facecolor(cmap(norm(enrichment)))
+        bar.set_edgecolor('none')
     ax1.set_xlabel('5mer Context', fontsize=20, fontweight='bold')
     ax1.set_ylabel('Depth-Normalized Rate\n(EMS - Control)', fontsize=20, fontweight='bold')
     ax1.set_title('5mer Mutation Rate', fontsize=22, fontweight='bold', pad=15)
@@ -995,13 +1041,12 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
                 else:
                     row_data = table_data[i-1]
                     if row_data[0] in ['Top 3 Enriched', 'Top 3 Depleted']:
-                        # Use colors matching regenerate_rate_plots.py
-                        # Lighter red for enriched header, light cream orange (#FFB366) for depleted
+                        # Use blue and orange colors matching the colormap
                         if row_data[0] == 'Top 3 Enriched':
-                            cell.set_facecolor('#FF6B35')  # Lighter red for enriched header
+                            cell.set_facecolor('#FF8C42')  # Orange for enriched (above median)
                             cell.set_text_props(weight='bold', color='black', size=13)
                         else:
-                            cell.set_facecolor('#FFB366')  # Light cream orange for low mutation rates
+                            cell.set_facecolor('#92C5DE')  # Blue for depleted (below median)
                             cell.set_text_props(weight='bold', color='black', size=13)
                         cell.set_edgecolor('#1A1A1A')
                         cell.set_linewidth(0.8)
@@ -1086,37 +1131,26 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
     # Panel 2: Sequence logo-style heatmap showing nucleotide enrichment
     ax2 = fig.add_subplot(gs[1])
     if position_rates:
-        import matplotlib.colors as mcolors
-        
         positions = [-2, -1, +1, +2]
         bases = ['A', 'T', 'G', 'C']
         
         # Prepare data matrix for heatmap: rows = positions, columns = bases
+        # Convert rates to enrichments (deviation from median)
         heatmap_data = []
         for pos in positions:
             row = []
             for base in bases:
                 rate = position_rates.get(pos, {}).get(base, 0.0)
-                row.append(rate)
+                enrichment = rate - median_rate
+                row.append(enrichment)
             heatmap_data.append(row)
         
         # Convert to numpy array for heatmap
         heatmap_array = np.array(heatmap_data)
         
-        # Determine color scale for mutation rates - use actual data range for better color dispersion
-        min_value = heatmap_array.min()
-        max_value = heatmap_array.max()
-        vmin = min_value  # Use actual minimum, not 0, for better color dispersion
-        vmax = max_value if max_value > 0 else 1e-6
-        
-        # Create heatmap with single-hue intensity gradient (slightly more red than orange)
-        # Just intensity variation, no color changes - light orange-red to dark red-orange
-        cmap = mcolors.LinearSegmentedColormap.from_list(
-            'orange_red_intensity', 
-            ['#FFF5E6', '#FFE5D4', '#FFD4C2', '#FFC2B0', '#FFB09E', '#FF9E8C', '#FF8C7A', '#FF7A68']
-        )
+        # Use same color scale as Panel A
         im = ax2.imshow(heatmap_array, cmap=cmap, aspect='auto', 
-                       vmin=vmin, vmax=vmax, interpolation='nearest')
+                       vmin=vmin_enrichment, vmax=vmax_enrichment, interpolation='nearest')
         
         # Set ticks and labels
         ax2.set_xticks(np.arange(len(bases)))
@@ -1124,31 +1158,12 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
         ax2.set_xticklabels(bases, fontsize=18, fontweight='bold')
         ax2.set_yticklabels([f'{p:+d}' for p in positions], fontsize=18, fontweight='bold')
         
-        # Add text annotations showing values
-        for i in range(len(positions)):
-            for j in range(len(bases)):
-                value = heatmap_array[i, j]
-                # Always use black text for rates
-                text_color = 'black'
-                # Format value for display
-                if abs(value) < 1e-6:
-                    text_str = '0'
-                elif abs(value) < 0.01:
-                    text_str = f'{value:.2e}'
-                else:
-                    text_str = f'{value:.3f}'
-                ax2.text(j, i, text_str, ha='center', va='center', 
-                        color=text_color, fontsize=14, fontweight='bold')
-        
-        # Add colorbar
-        cbar = plt.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
-        cbar.set_label('Mutation Rate', fontsize=16, fontweight='bold')
-        cbar.ax.tick_params(labelsize=14)
+        # Remove text annotations from heatmap (values not shown)
         
         # Labels and title
         ax2.set_xlabel('Nucleotide', fontsize=18, fontweight='bold')
         ax2.set_ylabel('Position Relative to Mutation', fontsize=18, fontweight='bold')
-        ax2.set_title('Nucleotide Mutation Rates at Flanking Positions', fontsize=20, fontweight='bold', pad=15)
+        ax2.set_title('Nucleotide Enrichment at Flanking Positions', fontsize=20, fontweight='bold', pad=15)
         
         # Add horizontal line to separate upstream from downstream
         ax2.axhline(y=1.5, color='black', linestyle='--', linewidth=2, alpha=0.5)
@@ -1159,42 +1174,28 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
     upstream_dinuc_rates, downstream_dinuc_rates = extract_dinucleotide_rates(aggregate_rates)
     
     if upstream_dinuc_rates or downstream_dinuc_rates:
-        import matplotlib.colors as mcolors
-        
         bases = ['A', 'T', 'G', 'C']
         
         # Create two 4x4 heatmaps side by side (upstream and downstream)
         # Prepare data matrices: rows = first base, columns = second base
+        # Convert rates to enrichments (deviation from median)
         upstream_data = np.zeros((4, 4))
         downstream_data = np.zeros((4, 4))
         
         for i, base1 in enumerate(bases):
             for j, base2 in enumerate(bases):
                 dinuc = base1 + base2
-                upstream_data[i, j] = upstream_dinuc_rates.get(dinuc, 0.0)
-                downstream_data[i, j] = downstream_dinuc_rates.get(dinuc, 0.0)
+                upstream_enrichment = upstream_dinuc_rates.get(dinuc, 0.0) - median_rate
+                downstream_enrichment = downstream_dinuc_rates.get(dinuc, 0.0) - median_rate
+                upstream_data[i, j] = upstream_enrichment
+                downstream_data[i, j] = downstream_enrichment
         
         # Combine into single array (upstream on left, downstream on right)
         combined_data = np.hstack([upstream_data, downstream_data])
         
-        # Determine color scale - use actual data range
-        all_values = list(upstream_dinuc_rates.values()) + list(downstream_dinuc_rates.values())
-        if all_values:
-            min_value = min(all_values)
-            max_value = max(all_values)
-            vmin = min_value
-            vmax = max_value if max_value > 0 else 1e-6
-        else:
-            vmin = 0.0
-            vmax = 1e-6
-        
-        # Use same colormap as panel 2
-        cmap = mcolors.LinearSegmentedColormap.from_list(
-            'orange_red_intensity', 
-            ['#FFF5E6', '#FFE5D4', '#FFD4C2', '#FFC2B0', '#FFB09E', '#FF9E8C', '#FF8C7A', '#FF7A68']
-        )
+        # Use same color scale as other panels
         im = ax3.imshow(combined_data, cmap=cmap, aspect='auto', 
-                       vmin=vmin, vmax=vmax, interpolation='nearest')
+                       vmin=vmin_enrichment, vmax=vmax_enrichment, interpolation='nearest')
         
         # Set ticks and labels
         # X-axis: two sets of 4 ticks (one for upstream, one for downstream)
@@ -1208,41 +1209,32 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
         ax3.set_yticks(np.arange(4))
         ax3.set_yticklabels(bases, fontsize=18, fontweight='bold')
         
-        # Add text annotations showing values
-        for i in range(4):
-            for j in range(8):
-                if j < 4:
-                    value = upstream_data[i, j]
-                else:
-                    value = downstream_data[i, j - 4]
-                text_color = 'black'
-                # Format value for display
-                if abs(value) < 1e-6:
-                    text_str = '0'
-                elif abs(value) < 0.01:
-                    text_str = f'{value:.2e}'
-                else:
-                    text_str = f'{value:.3f}'
-                ax3.text(j, i, text_str, ha='center', va='center', 
-                        color=text_color, fontsize=12, fontweight='bold')
+        # Remove text annotations from heatmap (values not shown)
         
         # Add vertical line to separate upstream from downstream
         ax3.axvline(x=3.5, color='black', linestyle='--', linewidth=2, alpha=0.5)
-        
-        # Add colorbar
-        cbar = plt.colorbar(im, ax=ax3, fraction=0.046, pad=0.04)
-        cbar.set_label('Mutation Rate', fontsize=16, fontweight='bold')
-        cbar.ax.tick_params(labelsize=14)
         
         # Labels (no title)
         ax3.set_xlabel('Second Base of Dinucleotide', fontsize=18, fontweight='bold')
         ax3.set_ylabel('First Base of Dinucleotide', fontsize=18, fontweight='bold')
         
         # Add section labels as plain text (no boxes)
-        ax3.text(1.5, -0.9, 'Upstream (-2, -1)', ha='center', va='top', 
-                fontsize=14, fontweight='bold')
-        ax3.text(5.5, -0.9, 'Downstream (+1, +2)', ha='center', va='top', 
-                fontsize=14, fontweight='bold')
+        ax3.text(1.5, -0.15, 'Upstream (-2, -1)', ha='center', va='top', 
+                fontsize=18, fontweight='bold')
+        ax3.text(5.5, -0.15, 'Downstream (+1, +2)', ha='center', va='top', 
+                fontsize=18, fontweight='bold')
+    
+    # Add shared colorbar for all panels (positioned on the right side, 70% of figure height)
+    # Calculate 70% of figure height: bottom=0.08, top=0.97, so height=0.89, 70% = 0.623
+    # Center it vertically: bottom = 0.08 + (0.89 - 0.623) / 2 = 0.08 + 0.1335 = 0.2135
+    cbar_height = 0.89 * 0.7  # 70% of available height
+    cbar_bottom = 0.08 + (0.89 - cbar_height) / 2  # Center vertically
+    cbar_ax = fig.add_axes([0.87, cbar_bottom, 0.02, cbar_height])  # [left, bottom, width, height]
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=vmin_enrichment, vmax=vmax_enrichment))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, cax=cbar_ax)
+    cbar.set_label('Enrichment from Median\nMutation Rate', fontsize=16, fontweight='bold')
+    cbar.ax.tick_params(labelsize=14)
     
     # Add panel labels
     fig.text(0.02, 0.98, 'A', fontsize=24, fontweight='bold', va='top', ha='left')
