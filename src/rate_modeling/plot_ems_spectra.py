@@ -710,7 +710,7 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
     
     # Create figure if ax not provided
     if ax is None:
-        plt.figure(figsize=(14, 6))
+        plt.figure(figsize=(14, 8))
         ax = plt.gca()
         save_figure = True
     else:
@@ -811,8 +811,8 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
     ylabel = "Proportion of sites with mutant alleles"
     
             
-    ax.set_ylabel(ylabel, fontsize=18)
-    ax.tick_params(axis='y', labelsize=14)
+    ax.set_ylabel(ylabel, fontsize=20)
+    ax.tick_params(axis='y', labelsize=16)
     ax.set_yscale('log')  # Log scale for y-axis
     ax.set_ylim(bottom=1e-4)  # Set minimum y value to 10^-4
     
@@ -820,7 +820,7 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
     current_ylim = ax.get_ylim()
     ax.set_ylim(top=current_ylim[1] * 1.3)  # Increase upper limit by 30%
     
-    ax.tick_params(axis='x', rotation=45, labelsize=14)
+    ax.tick_params(axis='x', rotation=45, labelsize=16)
     ax.set_xlabel('')  # Remove x-axis label
     
     # Create custom legend that groups NT controls (unless suppressed)
@@ -845,7 +845,7 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
                 legend_labels.append(label)
         
         if legend_handles:
-            ax.legend(legend_handles, legend_labels, fontsize=12, bbox_to_anchor=(1.05, 1), loc="upper left")
+            ax.legend(legend_handles, legend_labels, fontsize=14, bbox_to_anchor=(1.05, 0.5), loc="center left")
     
     # Add p-value annotations below the title but above the bars
     y_max = ax.get_ylim()[1]
@@ -879,12 +879,12 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
             weight = 'normal'
         
         ax.text(i, y_pos, p_text, ha='center', va='bottom', 
-                fontsize=10, color=color, fontweight=weight,
+                fontsize=9, color=color, fontweight=weight,
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor=color))
     
     # Set title if provided
     if title:
-        ax.set_title(title, fontsize=20, fontweight='bold')
+        ax.set_title(title, fontsize=22, fontweight='bold')
     
     # Save figure if standalone plot
     if save_figure:
@@ -1095,7 +1095,7 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
     
     # Create figure if ax not provided
     if ax is None:
-        plt.figure(figsize=(14, 6))
+        plt.figure(figsize=(14, 8))
         ax = plt.gca()
         save_figure = True
     else:
@@ -1166,8 +1166,8 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
             ax.get_legend().remove()
     
     # Set y-axis label for finite-sites model
-    ax.set_ylabel("finite-sites model mutation rate", fontsize=18)
-    ax.tick_params(axis='y', labelsize=14)
+    ax.set_ylabel("Finite-sites model mutation rate", fontsize=20)
+    ax.tick_params(axis='y', labelsize=16)
     ax.set_yscale('log')  # Log scale for y-axis
     
     # Set y-axis bounds to match data ranges
@@ -1190,7 +1190,7 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
         ax.set_ylim(bottom=1e-6, top=1e-2)
         print("  Y-axis bounds set to default (all rates are zero)")
     
-    ax.tick_params(axis='x', rotation=45, labelsize=14)
+    ax.tick_params(axis='x', rotation=45, labelsize=16)
     ax.set_xlabel('')  # Remove x-axis label
     
     # Create custom legend that groups NT controls (unless suppressed)
@@ -1216,7 +1216,7 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
                 legend_labels.append(label)
         
         if legend_handles:
-            ax.legend(legend_handles, legend_labels, fontsize=12, bbox_to_anchor=(1.05, 1), loc="upper left")
+            ax.legend(legend_handles, legend_labels, fontsize=14, bbox_to_anchor=(1.05, 0.5), loc="center left")
     
     # Add p-value annotations below the title but above the bars
     y_max_plot = ax.get_ylim()[1]
@@ -1250,12 +1250,12 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
             weight = 'normal'
         
         ax.text(i, y_pos, p_text, ha='center', va='bottom', 
-                fontsize=10, color=color, fontweight=weight,
+                fontsize=9, color=color, fontweight=weight,
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor=color))
     
     # Set title if provided
     if title:
-        ax.set_title(title, fontsize=20, fontweight='bold')
+        ax.set_title(title, fontsize=22, fontweight='bold')
     
     # Save figure if standalone plot
     if save_figure:
@@ -1372,7 +1372,7 @@ def plot_spectra_comparison(sample_to_rates1: Dict[str, Dict[str, float]],
     
     # Create shared legend on the figure
     if legend_handles:
-        fig.legend(legend_handles, legend_labels, fontsize=12, bbox_to_anchor=(1.02, 0.5), loc="center left")
+        fig.legend(legend_handles, legend_labels, fontsize=14, bbox_to_anchor=(1.02, 0.5), loc="center left")
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -1703,7 +1703,7 @@ def main():
             
             # Create shared legend on the figure
             if legend_handles:
-                fig.legend(legend_handles, legend_labels, fontsize=12, bbox_to_anchor=(1.02, 0.5), loc="center left")
+                fig.legend(legend_handles, legend_labels, fontsize=14, bbox_to_anchor=(1.02, 0.5), loc="center left")
             
             plt.tight_layout()
             plt.savefig(args.out, dpi=300, bbox_inches='tight')

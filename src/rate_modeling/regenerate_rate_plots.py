@@ -107,13 +107,24 @@ def load_data(output_dir):
         data['glm_per_sample'] = None
     
     # Load category rates
-    # Prefer category_rates_summary.tsv which has 5mer-normalized rates if computed
-    category_path = os.path.join(output_dir, 'category_comparison', 'category_rates_summary.tsv')
+    # Prefer category_rates_nb_glm.tsv which has actual mutation rates (not log/model coefficients)
+    # The summary file with 5mer normalization may have values on log scale that aren't directly plottable
+    category_path = os.path.join(output_dir, 'category_comparison', 'category_rates_nb_glm.tsv')
     if not os.path.exists(category_path):
-        # Fall back to NB GLM results (may not have 5mer normalization)
-        category_path = os.path.join(output_dir, 'category_comparison', 'category_rates_nb_glm.tsv')
+        # Fall back to summary file
+        category_path = os.path.join(output_dir, 'category_comparison', 'category_rates_summary.tsv')
     if os.path.exists(category_path):
         data['category_rates'] = pd.read_csv(category_path, sep='\t')
+        # Check if rates are on log scale (negative values) - if so, use nb_glm for plotting
+        if 'rate' in data['category_rates'].columns:
+            treated_rates = data['category_rates'][data['category_rates']['treatment'] == 'treated']['rate']
+            if len(treated_rates) > 0 and (treated_rates < 0).any():
+                # Rates are on log scale (from 5mer normalization), use nb_glm for actual rates
+                alt_path = os.path.join(output_dir, 'category_comparison', 'category_rates_nb_glm.tsv')
+                if alt_path != category_path and os.path.exists(alt_path):
+                    print(f"Note: {category_path} has 5mer-normalized log-scale values, using {alt_path} for plotting")
+                    data['category_rates'] = pd.read_csv(alt_path, sep='\t')
+                    category_path = alt_path
         print(f"Loaded category rates from: {category_path}")
     else:
         print(f"Warning: Category rates file not found in {output_dir}/category_comparison/")
@@ -222,18 +233,21 @@ def plot_glm_per_sample(ax, df):
     ax.set_yticks(y_pos)
     ax.set_yticklabels(labels, fontsize=20)
     
-    # Format x-axis with ticks at 1e-4 and 3e-4
+    # Format x-axis with more ticks for better readability
     ax.set_xlabel('Mutation Rate (per base)', fontsize=28, fontweight='bold', labelpad=25)
     ax.set_xscale('log')
     
-    # Set explicit ticks at 1e-4 and 3e-4
-    ax.set_xticks([1e-4, 3e-4])
+    # Set explicit ticks covering the typical range of mutation rates
+    ax.set_xticks([3e-5, 5e-5, 1e-4, 2e-4, 3e-4, 5e-4])
     
     # Format with scientific notation
     fmt = ScalarFormatter(useMathText=True)
     fmt.set_scientific(True)
     fmt.set_powerlimits((-3, 3))
     ax.xaxis.set_major_formatter(fmt)
+    
+    # Add minor ticks for finer resolution
+    ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=20))
     
     ax.tick_params(axis='x', labelsize=20, pad=12, which='major')
     ax.tick_params(axis='y', labelsize=20, pad=10)
@@ -683,12 +697,12 @@ def plot_control_baseline_comparison(ax, tests_df):
 
 
 def plot_category_significances(ax, category_df, tests_df):
-    """Plot mutation category rates with absolute treatment effects.
+    """Plot mutation category rates comparing control vs treated.
     
     Shows:
-    - Bar plot of treated rates by category
-    - Absolute treatment effect annotations (if available)
-    - Significance table
+    - Grouped bar plot with control and treated rates by category
+    - Error bars for confidence intervals
+    - Significance annotations
     """
     if category_df is None or category_df.empty:
         ax.text(0.5, 0.5, 'No category data available', 
@@ -698,7 +712,7 @@ def plot_category_significances(ax, category_df, tests_df):
     # Check if we have absolute effect data
     has_absolute_effects = 'absolute_effect' in category_df.columns
     
-    # Filter to treated samples only for main comparison
+    # Filter to treated and control samples
     treated_df = category_df[category_df['treatment'] == 'treated'].copy()
     control_df = category_df[category_df['treatment'] == 'control'].copy()
     
@@ -716,103 +730,130 @@ def plot_category_significances(ax, category_df, tests_df):
                 ha='center', va='center', transform=ax.transAxes, fontsize=24)
         return
     
-    # Sort by rate (lowest to highest) - darker colors will be on higher rates
-    treated_df = treated_df.sort_values('rate', ascending=True)
+    # Sort both dataframes by category to ensure alignment
+    # Use a consistent order: intergenic, synonymous, non_synonymous
+    category_order = ['intergenic', 'synonymous', 'non_synonymous']
+    treated_df['cat_order'] = treated_df['category'].apply(lambda x: category_order.index(x) if x in category_order else 99)
+    control_df['cat_order'] = control_df['category'].apply(lambda x: category_order.index(x) if x in category_order else 99)
+    treated_df = treated_df.sort_values('cat_order')
+    control_df = control_df.sort_values('cat_order')
     
-    # Create x positions - squeeze boundaries by reducing spacing
-    n_bars = len(treated_df)
-    # Use much thinner bars - make them half the previous width
-    bar_width = 0.1  # Much thinner bars
-    # Calculate x positions with minimal spacing - pack bars closer together
-    if n_bars > 1:
-        # Use tighter spacing: bars are closer together
-        spacing = 0.25  # Reduced spacing between bars
-        total_width = (n_bars - 1) * spacing
-        x_pos = np.linspace(0, total_width, n_bars)
-    else:
-        x_pos = np.array([0])
+    # Get categories present in both
+    categories = treated_df['category'].tolist()
+    n_categories = len(categories)
     
-    # Map categories to colors - darker colors for higher rates
-    # Since we sorted ascending, assign colors based on rate order (darker = higher rate)
-    # Use blue-to-purple gradient for middle panel (complements orange-to-red used elsewhere)
-    colors = []
-    n_categories = len(treated_df)
+    # Set up grouped bar positions - bars should fill the plot
+    bar_width = 0.35  # Width of each bar
+    group_spacing = 1.0  # Space between category groups
+    x_pos = np.arange(n_categories) * group_spacing  # Category group centers
     
-    if n_categories == 1:
-        colors.append(CATEGORY_COLORS[1])  # Medium blue for single bar
-    else:
-        # Create gradient from light to dark based on position (darker = higher rate)
-        # Use blue-to-purple gradient instead of orange-to-red
-        for i in range(n_categories):
-            # Map position to color gradient (0 = lightest, n-1 = darkest)
-            color_idx = int((i / (n_categories - 1)) * (len(CATEGORY_COLORS) - 1))
-            color_idx = min(color_idx, len(CATEGORY_COLORS) - 1)
-            colors.append(CATEGORY_COLORS[color_idx])
+    # Colors: grey for control, orange-red gradient for treated
+    control_color = NT_GREY  # Grey for controls
+    # Use distinct orange-red colors for treated (darker orange to make it pop)
+    treated_colors = ['#FF8C00', '#FF6B35', '#E63946']  # Dark orange, orange-red, red
     
-    # Plot bars - make them much thinner and closer together
-    bars = ax.bar(x_pos, treated_df['rate'], color=colors, alpha=0.7,
-                  edgecolor='black', linewidth=0.5, width=bar_width)
+    # Plot control bars (left side of each group)
+    if not control_df.empty:
+        control_rates = []
+        control_ci_low = []
+        control_ci_high = []
+        for cat in categories:
+            cat_data = control_df[control_df['category'] == cat]
+            if not cat_data.empty:
+                control_rates.append(cat_data['rate'].values[0])
+                if 'CI_low' in cat_data.columns:
+                    control_ci_low.append(cat_data['CI_low'].values[0])
+                    control_ci_high.append(cat_data['CI_high'].values[0])
+                else:
+                    control_ci_low.append(np.nan)
+                    control_ci_high.append(np.nan)
+            else:
+                control_rates.append(np.nan)
+                control_ci_low.append(np.nan)
+                control_ci_high.append(np.nan)
+        
+        control_rates = np.array(control_rates)
+        bars_ctrl = ax.bar(x_pos - bar_width/2, control_rates, bar_width, 
+                          color=control_color, alpha=0.8,
+                          edgecolor='black', linewidth=1.5, label='Control')
+        
+        # Add error bars for control
+        if not all(np.isnan(control_ci_low)):
+            yerr_low = control_rates - np.array(control_ci_low)
+            yerr_high = np.array(control_ci_high) - control_rates
+            ax.errorbar(x_pos - bar_width/2, control_rates,
+                       yerr=[yerr_low, yerr_high], fmt='none',
+                       color='black', capsize=4, capthick=1.5, elinewidth=1.5, alpha=0.8)
     
-    # Add error bars
+    # Plot treated bars (right side of each group) with gradient colors
+    treated_rates = treated_df['rate'].values
+    bars_treated = ax.bar(x_pos + bar_width/2, treated_rates, bar_width,
+                         color=treated_colors[1], alpha=0.8,  # Use medium orange-red
+                         edgecolor='black', linewidth=1.5, label='Treated')
+    
+    # Add error bars for treated
     if 'CI_low' in treated_df.columns and 'CI_high' in treated_df.columns:
-        yerr_low = treated_df['rate'] - treated_df['CI_low']
-        yerr_high = treated_df['CI_high'] - treated_df['rate']
-        ax.errorbar(x_pos, treated_df['rate'],
+        yerr_low = treated_df['rate'].values - treated_df['CI_low'].values
+        yerr_high = treated_df['CI_high'].values - treated_df['rate'].values
+        ax.errorbar(x_pos + bar_width/2, treated_rates,
                    yerr=[yerr_low, yerr_high], fmt='none',
                    color='black', capsize=4, capthick=1.5, elinewidth=1.5, alpha=0.8)
     
-    # Add absolute effect annotations on bars if available
-    if has_absolute_effects:
-        for i, (bar, (_, row)) in enumerate(zip(bars, treated_df.iterrows())):
-            abs_eff = row.get('absolute_effect', np.nan)
-            if np.isfinite(abs_eff):
-                height = bar.get_height()
-                # Add absolute effect text above the bar
-                ax.text(bar.get_x() + bar.get_width()/2., height * 1.1,
-                       f'+{abs_eff:.2e}',
-                       ha='center', va='bottom', fontsize=14, fontweight='bold',
-                       color='darkgreen',
-                       bbox=dict(boxstyle='round,pad=0.2', facecolor='lightgreen', 
-                                alpha=0.7, edgecolor='darkgreen', linewidth=1))
-    
-    # Format category labels - use shorter labels to avoid overlap
+    # Format category labels
     category_labels = {
         'intergenic': 'Intergenic',
         'synonymous': 'Synonymous',
         'non_synonymous': 'Non-syn',
         'coding': 'Coding'
     }
-    labels = [category_labels.get(cat, cat) for cat in treated_df['category']]
+    labels = [category_labels.get(cat, cat) for cat in categories]
     ax.set_xticks(x_pos)
-    ax.set_xticklabels(labels, fontsize=20, fontweight='bold', rotation=15, ha='right')
+    ax.set_xticklabels(labels, fontsize=18, fontweight='bold', rotation=0, ha='center')
     
-    # Squeeze plot boundaries - reduce padding on left and right to bring bars closer
+    # Set x-axis limits to fill the plot - minimal padding
     if len(x_pos) > 0:
-        padding = 0.15  # Minimal padding
+        padding = 0.5  # Small padding on sides
         ax.set_xlim(left=x_pos[0] - padding, right=x_pos[-1] + padding)
     
     # Format y-axis
-    ylabel = 'Mutation Rate (per base)'
-    if has_absolute_effects:
-        ylabel += '\n(+abs. effect)'
-    ax.set_ylabel(ylabel, fontsize=28, fontweight='bold', labelpad=25)
+    ax.set_ylabel('Mutation Rate (per base)', fontsize=24, fontweight='bold', labelpad=20)
     ax.set_yscale('log')
+    
     # Set y-axis range to include all rates and their CI bounds
-    min_rate = treated_df['rate'].min() * 0.9  # Slightly below minimum rate
-    # Get maximum rate including CI_high bounds to ensure all error bars are visible
-    max_rate = treated_df['rate'].max()
+    all_rates = list(treated_rates)
+    if not control_df.empty:
+        all_rates.extend([r for r in control_rates if not np.isnan(r)])
+    min_rate = min(all_rates) * 0.7  # Slightly below minimum rate
+    max_rate = max(all_rates)
     if 'CI_high' in treated_df.columns:
         max_ci_high = treated_df['CI_high'].max()
         max_rate = max(max_rate, max_ci_high)
-    # Add padding above the maximum (more if showing absolute effects)
-    padding_mult = 1.6 if has_absolute_effects else 1.3
+    if not control_df.empty and 'CI_high' in control_df.columns:
+        ctrl_max_ci = max([h for h in control_ci_high if not np.isnan(h)]) if any(not np.isnan(h) for h in control_ci_high) else max_rate
+        max_rate = max(max_rate, ctrl_max_ci)
+    
+    # Add padding above for legend
+    padding_mult = 1.8
     ax.set_ylim(min_rate, max_rate * padding_mult)
+    
+    # Set explicit y-axis ticks for log scale
+    # Cover typical range from ~1e-5 to ~3e-4
+    ax.set_yticks([2e-5, 3e-5, 5e-5, 1e-4, 2e-4, 3e-4])
+    
     fmt = ScalarFormatter(useMathText=True)
     fmt.set_scientific(True)
     fmt.set_powerlimits((-3, 3))
     ax.yaxis.set_major_formatter(fmt)
-    ax.tick_params(axis='y', labelsize=20, pad=12)
-    ax.tick_params(axis='x', labelsize=20, pad=14)
+    
+    # Add minor ticks
+    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=20))
+    
+    ax.tick_params(axis='y', labelsize=18, pad=10)
+    ax.tick_params(axis='x', labelsize=18, pad=12)
+    
+    # Add legend
+    ax.legend(loc='upper right', fontsize=16, frameon=True, fancybox=True, 
+              shadow=True, framealpha=0.9)
     
     # Create significance table if tests available
     if tests_df is not None and not tests_df.empty:
@@ -840,55 +881,23 @@ def plot_category_significances(ax, category_df, tests_df):
             symbol, label = format_pvalue(p)
             table_data.append(['Syn vs Nonsyn', symbol, label])
         
-        # Display significance values in the center of the plot
+        # Display significance values in the lower right of the plot
         if table_data:
-            ax_pos = ax.get_position()
-            text_x_center = (ax_pos.x0 + ax_pos.x1) / 2  # Center of the plot area
-            
-            # Collect significance data with p-values for color coding
-            sig_data = []
+            # Build compact significance text
+            sig_lines = []
             for comp, symbol, p_str in table_data:
-                # Extract p-value for color coding
-                p_val = 1.0
-                try:
-                    if 'p=' in p_str:
-                        p_val = float(p_str.split('p=')[1].strip())
-                    elif 'p<' in p_str:
-                        p_val = float(p_str.split('p<')[1].strip())
-                except (ValueError, IndexError):
-                    pass
-                sig_data.append((comp, symbol, p_str, p_val))
+                sig_lines.append(f'{comp}: {symbol} ({p_str})')
             
-            # Add significance text boxes at the top of the plot
-            y_start = ax_pos.y1 - 0.05  # Start near top of plot
-            for i, (comp, symbol, p_str, p_val) in enumerate(sig_data):
-                sig_text = f'{comp}:\n{symbol} {p_str}'
-                
-                # Determine color based on significance
-                if p_val < 0.001:
-                    text_color = 'red'
-                    bg_color = '#FFE6E6'
-                elif p_val < 0.01:
-                    text_color = 'darkorange'
-                    bg_color = '#FFE6CC'
-                elif p_val < 0.05:
-                    text_color = 'orange'
-                    bg_color = '#FFF4E6'
-                else:
-                    text_color = 'gray'
-                    bg_color = '#F5F5F5'
-                
-                fig = ax.get_figure()
-                fig.text(text_x_center, y_start - i * 0.08, sig_text, 
-                        fontsize=18, fontweight='bold', color=text_color,
-                        bbox=dict(boxstyle='round,pad=0.5', facecolor=bg_color, alpha=0.8, edgecolor=text_color),
-                        ha='center', va='top', transform=fig.transFigure)
+            sig_text = '\n'.join(sig_lines)
+            ax.text(0.98, 0.02, sig_text, transform=ax.transAxes,
+                   ha='right', va='bottom', fontsize=14,
+                   bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9, edgecolor='gray', linewidth=1),
+                   family='monospace')
     
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, axis='y')
     
-    # Add title indicating model type if using absolute effects
-    if has_absolute_effects:
-        ax.set_title('Treated Rates\n(Identity Link Model)', fontsize=22, fontweight='bold', pad=10)
+    # Add title
+    ax.set_title('Rates by Category', fontsize=20, fontweight='bold', pad=10)
 
 
 def plot_treatment_day_rates(ax, summary_df, per_sample_df, tests_df, sample_color_dict=None):
@@ -992,13 +1001,21 @@ def plot_treatment_day_rates(ax, summary_df, per_sample_df, tests_df, sample_col
         padding = max(0.5, (x_max - x_min) * 0.3) if x_max > x_min else 0.5
         ax.set_xlim(left=x_min - padding, right=x_max + padding)
     
-    # Format y-axis
+    # Format y-axis with more ticks
     ax.set_ylabel('Mutation Rate (per base)', fontsize=28, fontweight='bold', labelpad=25)
     ax.set_yscale('log')
+    
+    # Set explicit y-axis ticks for log scale
+    ax.set_yticks([3e-5, 5e-5, 1e-4, 2e-4, 3e-4, 5e-4])
+    
     fmt = ScalarFormatter(useMathText=True)
     fmt.set_scientific(True)
     fmt.set_powerlimits((-3, 3))
     ax.yaxis.set_major_formatter(fmt)
+    
+    # Add minor ticks
+    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=20))
+    
     ax.tick_params(axis='y', labelsize=20, pad=12)
     ax.tick_params(axis='x', labelsize=20, pad=14)
     
@@ -1501,6 +1518,21 @@ def plot_regional_rates_manhattan(
         axis=1
     )
     
+    # Filter out windows where control rate > treated rate (these are likely artifacts)
+    if use_treatment_covariate and 'rate_control' in windows_rates_df.columns and 'rate_treated' in windows_rates_df.columns:
+        n_before = len(windows_rates_df)
+        # Keep only windows where treated rate >= control rate (or either is NaN)
+        valid_mask = (
+            (windows_rates_df['rate_treated'] >= windows_rates_df['rate_control']) |
+            windows_rates_df['rate_treated'].isna() |
+            windows_rates_df['rate_control'].isna()
+        )
+        windows_rates_df = windows_rates_df[valid_mask].copy()
+        n_after = len(windows_rates_df)
+        n_filtered = n_before - n_after
+        if n_filtered > 0:
+            print(f"Filtered out {n_filtered} windows where control rate > treated rate ({n_after} remaining)")
+    
     # Determine significance using statistical tests
     # Test if each window's rate is significantly different from the overall mean rate
     # This identifies regions with unusually high or low mutation rates (hotspots/coldspots)
@@ -1865,13 +1897,12 @@ def create_multiplot(output_dir, output_path=None):
     data = load_data(output_dir)
     
     # Create figure with subplots - larger size to accommodate larger fonts and significance boxes
-    fig = plt.figure(figsize=(32, 12))  # Slightly wider to accommodate significance text boxes
+    fig = plt.figure(figsize=(36, 12))  # Wider to accommodate grouped bars in center panel
     # Adjust grid spec to give more space for larger fonts and prevent overlap
-    # Make center panel narrower since we removed coding bar - more space for significance boxes on left
-    # Use width_ratios to make center panel thinner
-    gs = fig.add_gridspec(1, 3, hspace=0.75, wspace=0.5, 
-                         left=0.10, right=0.92, top=0.90, bottom=0.15,
-                         width_ratios=[1.2, 0.6, 1.2])  # Center panel is 0.6x width (thinner), sides are 1.2x
+    # Center panel now has grouped bars (control + treated) so needs more space
+    gs = fig.add_gridspec(1, 3, hspace=0.75, wspace=0.4, 
+                         left=0.08, right=0.94, top=0.90, bottom=0.15,
+                         width_ratios=[1.0, 1.0, 1.0])  # Equal width panels
     
     # Panel 1: Per-sample GLM rates
     ax1 = fig.add_subplot(gs[0, 0])
