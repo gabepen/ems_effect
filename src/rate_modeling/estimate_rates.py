@@ -31,6 +31,8 @@ import gzip
 from collections import defaultdict
 import pickle
 from Bio.Seq import Seq
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 
 
@@ -1390,48 +1392,55 @@ def fit_category_rates_nb_glm(site_df: pd.DataFrame, use_treatment_covariate: bo
         return None, None
 
 
-def _fit_absolute_effect_model(df, categories, method, alpha, log_5mer_offset=None):
+def _fit_absolute_effect_model(df, categories, method, alpha, log_5mer_offset=None, log_5mer_offset_control=None):
     """
     Fit constant absolute effect model.
     
     Tests if treatment adds the same absolute number of mutations per base
     across all categories (not proportional to baseline).
     
-    Step 1: Estimate control rates by category (with optional 5mer normalization)
+    Step 1: Estimate control rates by category (WITHOUT 5mer normalization - raw background rates)
     Step 2: Calculate excess mutations = observed - expected_control
     Step 3: Fit GLM to excess mutations with identity link
     Step 4: LRT comparing simple vs interaction models
+    
+    NOTE: 5mer normalization only applies to TREATED samples, not controls.
+    Control samples represent background/sequencing error which is not EMS-biased.
+    The 5mer model captures EMS-specific sequence bias.
     
     Args:
         df: DataFrame with site-level data
         categories: List of category names
         method: GLM method ('poisson' or 'negative_binomial')
         alpha: Background rate subtraction
-        log_5mer_offset: Optional Series of log(expected_rate_5mer) for sequence context normalization
+        log_5mer_offset: Optional Series of log(expected_rate_5mer) for TREATED samples only
+                        (captures EMS sequence bias for normalization)
+        log_5mer_offset_control: Not used - control samples should NOT be 5mer normalized
     
     Returns:
         dict with absolute_effect_result or None if failed
     """
     print("\n=== Using absolute effect model ===")
     print("Step 1: Fitting control-only model to get category-specific baseline rates")
+    print("  NOTE: Control samples are NOT 5mer normalized (they represent raw background rates)")
     
     control_df = df[df['is_control']].copy()
     if len(control_df) == 0:
         print("Warning: No control samples found")
         return None
     
-    # Fit control model
+    # Fit control model WITHOUT 5mer offset
+    # Control samples represent background/sequencing error which is not EMS-biased
     X_control = control_df[[f'cat_{cat}' for cat in categories[1:]]]
     design_control = sm.add_constant(X_control, has_constant='add')
     y_control = control_df['ems_count'].values
-    offset_control = control_df['log_depth'].values
+    offset_control = control_df['log_depth'].values  # Only depth offset, NO 5mer
     
-    # Add 5mer offset for control samples if provided
-    if log_5mer_offset is not None:
-        valid_5mer_control = ~pd.isna(log_5mer_offset.loc[control_df.index])
-        if valid_5mer_control.sum() > 0:
-            offset_control = offset_control + log_5mer_offset.loc[control_df.index].fillna(0.0).values
-            print(f"  Using 5mer normalization for {valid_5mer_control.sum()} control sites")
+    # Track whether 5mer normalization is being used (for treated samples)
+    using_5mer = log_5mer_offset is not None and (~pd.isna(log_5mer_offset)).sum() > 0
+    if using_5mer:
+        print(f"  5mer normalization will be applied to TREATED samples only")
+        df['log_5mer_offset'] = log_5mer_offset
     
     if alpha > 0:
         y_control = np.maximum(0.0, y_control - alpha * control_df['depth'].values)
@@ -1448,36 +1457,42 @@ def _fit_absolute_effect_model(df, categories, method, alpha, log_5mer_offset=No
             nb_model = NBDiscrete(y_control, design_control, exposure=exposure_control)
             result_control = nb_model.fit(start_params=start_params, disp=False)
         
-        # Extract control rates
+        # Extract control coefficients 
+        # Since we DON'T 5mer normalize controls, these are direct log-rates (not multipliers)
         beta0_control = result_control.params.get('const', np.nan)
         beta_syn_control = result_control.params.get('cat_synonymous', 0.0)
         beta_nonsyn_control = result_control.params.get('cat_non_synonymous', 0.0)
         
-        print(f"  Control rates: intergenic={np.exp(beta0_control):.2e}, "
+        # Control rates are raw (no 5mer normalization)
+        print(f"  Control rates (raw, no 5mer): intergenic={np.exp(beta0_control):.2e}, "
               f"syn={np.exp(beta0_control + beta_syn_control):.2e}, "
               f"nonsyn={np.exp(beta0_control + beta_nonsyn_control):.2e}")
         
         # Step 2: Calculate excess mutations for ALL samples (control and treated)
+        # Expected control count is based on RAW control rates (no 5mer)
         print("Step 2: Calculating excess mutations (observed - expected_control)")
-        df['expected_control_count'] = 0.0
-        for idx, row in df.iterrows():
-            cat = row['category']
-            if cat == 'intergenic':
-                log_rate = beta0_control
-            elif cat == 'synonymous':
-                log_rate = beta0_control + beta_syn_control
-            elif cat == 'non_synonymous':
-                log_rate = beta0_control + beta_nonsyn_control
-            else:
-                log_rate = beta0_control
-            
-            expected_rate = np.exp(log_rate)
-            df.loc[idx, 'expected_control_count'] = expected_rate * row['depth']
+        print("  Expected counts use RAW control rates (no 5mer normalization)")
         
+        # Vectorized calculation (faster than loop)
+        df['log_rate_coef'] = beta0_control  # Default for intergenic
+        df.loc[df['category'] == 'synonymous', 'log_rate_coef'] = beta0_control + beta_syn_control
+        df.loc[df['category'] == 'non_synonymous', 'log_rate_coef'] = beta0_control + beta_nonsyn_control
+        
+        # Expected control count = exp(log_rate_coef) * depth
+        # NO 5mer offset - control rates are raw background rates
+        df['expected_control_count'] = np.exp(df['log_rate_coef']) * df['depth']
         df['excess_count'] = df['ems_count'] - df['expected_control_count']
         
-        print(f"  Mean excess in controls: {df[df['is_control']]['excess_count'].mean():.2e}")
-        print(f"  Mean excess in treated: {df[~df['is_control']]['excess_count'].mean():.2e}")
+        # Diagnostic: show mean expected counts and excess
+        mean_expected_ctrl = df[df['is_control']]['expected_control_count'].mean()
+        mean_observed_ctrl = df[df['is_control']]['ems_count'].mean()
+        mean_expected_treat = df[~df['is_control']]['expected_control_count'].mean()
+        mean_observed_treat = df[~df['is_control']]['ems_count'].mean()
+        
+        print(f"  Controls: mean_observed={mean_observed_ctrl:.4f}, mean_expected={mean_expected_ctrl:.4f}")
+        print(f"  Treated:  mean_observed={mean_observed_treat:.4f}, mean_expected={mean_expected_treat:.4f}")
+        print(f"  Mean excess in controls: {df[df['is_control']]['excess_count'].mean():.4f}")
+        print(f"  Mean excess in treated: {df[~df['is_control']]['excess_count'].mean():.4f}")
         
         # Step 3: Fit models to excess counts using Gaussian family with identity link
         # (excess can be negative, so we use Gaussian not Poisson)
@@ -1579,18 +1594,14 @@ def _fit_control_baseline_model(df, categories, method, alpha, log_5mer_offset=N
         print("Warning: No control samples found")
         return None
     
-    # Fit control model
+    # Fit control model WITHOUT 5mer offset
+    # Control samples represent background/sequencing error which is not EMS-biased
     X_control = control_df[[f'cat_{cat}' for cat in categories[1:]]]
     design_control = sm.add_constant(X_control, has_constant='add')
     y_control = control_df['ems_count'].values
-    offset_control = control_df['log_depth'].values
+    offset_control = control_df['log_depth'].values  # NO 5mer offset for controls
     
-    # Add 5mer offset for control samples if provided
-    if log_5mer_offset is not None:
-        valid_5mer_control = ~pd.isna(log_5mer_offset.loc[control_df.index])
-        if valid_5mer_control.sum() > 0:
-            offset_control = offset_control + log_5mer_offset.loc[control_df.index].fillna(0.0).values
-            print(f"  Using 5mer normalization for {valid_5mer_control.sum()} control sites")
+    print("  NOTE: Control samples are NOT 5mer normalized (they represent raw background rates)")
     
     if alpha > 0:
         y_control = np.maximum(0.0, y_control - alpha * control_df['depth'].values)
@@ -1638,12 +1649,17 @@ def _fit_control_baseline_model(df, categories, method, alpha, log_5mer_offset=N
         y_all = df['ems_count'].values
         offset_treatment = df['log_depth'].values + df['log_expected_control_rate'].values
         
-        # Add 5mer offset for all samples if provided
+        # Add 5mer offset ONLY FOR TREATED samples
+        # Control samples are NOT 5mer normalized (they represent background, not EMS mutations)
         if log_5mer_offset is not None:
-            valid_5mer_all = ~pd.isna(log_5mer_offset)
-            if valid_5mer_all.sum() > 0:
-                offset_treatment = offset_treatment + log_5mer_offset.fillna(0.0).values
-                print(f"  Using 5mer normalization for {valid_5mer_all.sum()} sites in treatment model")
+            is_treated = df['treatment'].values == 1
+            valid_5mer = ~pd.isna(log_5mer_offset)
+            treated_with_5mer = is_treated & valid_5mer
+            if treated_with_5mer.sum() > 0:
+                # Only add 5mer offset for treated samples
+                offset_5mer = log_5mer_offset.fillna(0.0).values
+                offset_treatment = np.where(is_treated, offset_treatment + offset_5mer, offset_treatment)
+                print(f"  Using 5mer normalization for {treated_with_5mer.sum()} TREATED sites only")
         
         if alpha > 0:
             y_all = np.maximum(0.0, y_all - alpha * df['depth'].values)
@@ -1724,13 +1740,17 @@ def _fit_standard_model(df, categories, method, alpha, use_treatment_covariate, 
     """
     Fit standard interaction model.
     
+    NOTE: 5mer normalization only applies to TREATED samples. Control samples represent
+    background/sequencing error which is not EMS-biased. The 5mer model captures EMS-specific
+    sequence bias for normalization.
+    
     Args:
         df: DataFrame with site-level data
         categories: List of category names
         method: GLM method ('poisson' or 'negative_binomial')
         alpha: Background rate subtraction
         use_treatment_covariate: Include treatment covariate
-        log_5mer_offset: Optional Series of log(expected_rate_5mer) for sequence context normalization
+        log_5mer_offset: Optional Series of log(expected_rate_5mer) for TREATED samples
     
     Returns:
         fitted model result or None if failed
@@ -1746,14 +1766,20 @@ def _fit_standard_model(df, categories, method, alpha, use_treatment_covariate, 
     
     design = sm.add_constant(X, has_constant='add')
     y = df['ems_count'].values
-    offset = df['log_depth'].values
+    offset = df['log_depth'].values.copy()  # Make a copy to avoid modifying original
     
-    # Add 5mer offset if provided: log(E[Y]) = log(depth) + log(expected_rate_5mer) + X*beta
+    # Add 5mer offset ONLY FOR TREATED samples
+    # Control samples are NOT 5mer normalized (they represent background, not EMS mutations)
     if log_5mer_offset is not None:
+        is_treated = df['treatment'].values == 1
         valid_5mer = ~pd.isna(log_5mer_offset)
-        if valid_5mer.sum() > 0:
-            offset = offset + log_5mer_offset.fillna(0.0).values
-            print(f"  Using 5mer normalization for {valid_5mer.sum()} sites")
+        treated_with_5mer = is_treated & valid_5mer
+        if treated_with_5mer.sum() > 0:
+            # Only add 5mer offset for treated samples
+            offset_5mer = log_5mer_offset.fillna(0.0).values
+            offset = np.where(is_treated, offset + offset_5mer, offset)
+            print(f"  Using 5mer normalization for {treated_with_5mer.sum()} TREATED sites only")
+            print(f"  Control samples ({(~is_treated).sum()}) are NOT 5mer normalized")
     
     if alpha > 0:
         y = np.maximum(0.0, y - alpha * df['depth'].values)
@@ -2567,7 +2593,8 @@ def _save_results(summary_df, test_df, result, output_dir, kmer5_normalized=Fals
     print(f"Category rates report saved to {report_path}")
 
 
-def _compute_5mer_offsets(df: pd.DataFrame, kmer5_model_path: str, genome_fasta: str):
+def _compute_5mer_offsets(df: pd.DataFrame, kmer5_model_path: str, genome_fasta: str, 
+                          force_treatment_value: int = None):
     """
     Compute 5mer-based expected rate offsets for each site.
     
@@ -2578,6 +2605,8 @@ def _compute_5mer_offsets(df: pd.DataFrame, kmer5_model_path: str, genome_fasta:
         df: DataFrame with columns: chrom, pos, depth, treatment
         kmer5_model_path: Path to fitted 5mer model pickle file
         genome_fasta: Path to genome FASTA file
+        force_treatment_value: If provided, use this value for all sites instead of actual treatment
+                              (e.g., use 0 to get CONTROL 5mer rates for all sites)
     
     Returns:
         Series of log(expected_rate_5mer) values, or None if failed
@@ -2607,14 +2636,28 @@ def _compute_5mer_offsets(df: pd.DataFrame, kmer5_model_path: str, genome_fasta:
         df['kmer5'] = kmers
         
         # Compute expected rates (vectorized by unique combinations)
-        print("  Predicting rates from 5mer model...")
+        if force_treatment_value is not None:
+            print(f"  Predicting rates from 5mer model (forcing treatment={force_treatment_value} for all sites)...")
+        else:
+            print("  Predicting rates from 5mer model...")
         valid_mask = df['kmer5'].notna() & df['depth'].notna() & (df['depth'] > 0)
         
         log_expected_rates = pd.Series(np.nan, index=df.index)
         
         if valid_mask.sum() > 0:
             valid_df = df[valid_mask].copy()
-            unique_combos = valid_df[['kmer5', 'treatment', 'depth']].drop_duplicates()
+            
+            # Determine treatment values to use
+            if force_treatment_value is not None:
+                # Use forced value for all sites
+                treatment_values = pd.Series(force_treatment_value, index=valid_df.index)
+                unique_combos = valid_df[['kmer5', 'depth']].copy()
+                unique_combos['treatment'] = force_treatment_value
+                unique_combos = unique_combos.drop_duplicates()
+            else:
+                # Use actual treatment values
+                treatment_values = valid_df['treatment']
+                unique_combos = valid_df[['kmer5', 'treatment', 'depth']].drop_duplicates()
             
             # Build prediction dict
             pred_dict = {}
@@ -2634,7 +2677,10 @@ def _compute_5mer_offsets(df: pd.DataFrame, kmer5_model_path: str, genome_fasta:
             # Map back to all sites
             for idx in valid_df.index:
                 kmer5 = df.loc[idx, 'kmer5']
-                treatment = int(df.loc[idx, 'treatment'])
+                if force_treatment_value is not None:
+                    treatment = force_treatment_value
+                else:
+                    treatment = int(df.loc[idx, 'treatment'])
                 depth = float(df.loc[idx, 'depth'])
                 combo_key = (kmer5, treatment, depth)
                 if combo_key in pred_dict:
@@ -2680,12 +2726,21 @@ def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str =
     
     # Add 5mer normalization if model provided
     log_5mer_offset = None
+    log_5mer_offset_control = None  # Control-only 5mer offsets for absolute effect model
     mean_expected_rates = None  # Will store mean expected rates per category/treatment
     if kmer5_model_path is not None and genome_fasta is not None:
         print("Computing 5mer-based expected rates for sequence context normalization...")
         log_5mer_offset = _compute_5mer_offsets(df, kmer5_model_path, genome_fasta)
         if log_5mer_offset is not None:
             print(f"✓ 5mer offsets computed for {(~pd.isna(log_5mer_offset)).sum()} sites")
+            
+            # Compute CONTROL-only 5mer offsets for absolute effect model
+            # This ensures expected_control_count uses control 5mer rates for ALL sites
+            print("Computing CONTROL 5mer offsets for absolute effect model...")
+            log_5mer_offset_control = _compute_5mer_offsets(df, kmer5_model_path, genome_fasta, 
+                                                            force_treatment_value=0)
+            if log_5mer_offset_control is not None:
+                print(f"✓ Control 5mer offsets computed for {(~pd.isna(log_5mer_offset_control)).sum()} sites")
             
             # Calculate mean expected rates per category and treatment for rate recovery
             # This is needed to convert exp(coefficients) back to actual rates
@@ -2723,7 +2778,9 @@ def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str =
     
     if use_control_baseline and use_treatment_covariate:
         # Try absolute effect model first (answers the constant absolute effect question)
-        absolute_effect_result = _fit_absolute_effect_model(df, categories, method, alpha, log_5mer_offset)
+        # Pass control-only 5mer offsets for computing expected_control_count
+        absolute_effect_result = _fit_absolute_effect_model(df, categories, method, alpha, 
+                                                            log_5mer_offset, log_5mer_offset_control)
         
         # Also fit control-baseline model (for comparison)
         control_baseline_result = _fit_control_baseline_model(df, categories, method, alpha, log_5mer_offset)
@@ -3678,13 +3735,402 @@ def create_fixed_windows(
     return windows_df
 
 
+def create_gene_windows(
+    gff_file: str,
+    genome_fasta: str = None,
+    feature_type: str = "gene",
+    exclusion_mask: set = None
+) -> pd.DataFrame:
+    """
+    Create windows based on gene annotations from GFF file.
+    
+    Each gene becomes a separate window for rate analysis. This is useful for
+    correlating mutation rates with gene-level properties (e.g., expression).
+    
+    Args:
+        gff_file: Path to GFF file with gene annotations
+        genome_fasta: Path to genome FASTA (optional, for validation)
+        feature_type: GFF feature type to use as windows ('gene', 'CDS', or 'mRNA')
+        exclusion_mask: Set of (chrom, pos) tuples to exclude (not used for window creation)
+    
+    Returns:
+        DataFrame with columns: chrom, start, end, window_size, window_id, gene_id, gene_name
+    """
+    print(f"Creating gene-based windows from {gff_file} (feature_type={feature_type})...")
+    
+    windows = []
+    window_id = 0
+    
+    # Parse GFF file
+    with open(gff_file) as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+            
+            fields = line.strip().split('\t')
+            if len(fields) < 9:
+                continue
+            
+            # Check if this is the feature type we want
+            if fields[2] != feature_type:
+                continue
+            
+            chrom = fields[0]
+            start = int(fields[3])  # GFF is 1-based
+            end = int(fields[4])    # GFF end is inclusive
+            strand = fields[6] if len(fields) > 6 else '+'
+            attributes = fields[8]
+            
+            # Extract gene ID and name from attributes
+            gene_id = None
+            gene_name = None
+            
+            for attr in attributes.split(';'):
+                attr = attr.strip()
+                if attr.startswith('ID='):
+                    gene_id = attr.replace('ID=', '')
+                elif attr.startswith('gene_id='):
+                    gene_id = attr.replace('gene_id=', '')
+                elif attr.startswith('Name='):
+                    gene_name = attr.replace('Name=', '')
+                elif attr.startswith('gene='):
+                    gene_name = attr.replace('gene=', '')
+                elif attr.startswith('locus_tag='):
+                    if gene_name is None:
+                        gene_name = attr.replace('locus_tag=', '')
+            
+            # Use gene_id as fallback for gene_name
+            if gene_name is None:
+                gene_name = gene_id
+            
+            # Use a default ID if none found
+            if gene_id is None:
+                gene_id = f"{feature_type}_{window_id}"
+            
+            actual_size = end - start + 1  # GFF end is inclusive
+            
+            windows.append({
+                'chrom': chrom,
+                'start': start,  # 1-based
+                'end': end,      # inclusive
+                'window_size': actual_size,
+                'window_id': window_id,
+                'gene_id': gene_id,
+                'gene_name': gene_name,
+                'strand': strand,
+            })
+            window_id += 1
+    
+    windows_df = pd.DataFrame(windows)
+    
+    if len(windows_df) > 0:
+        print(f"Created {len(windows_df)} gene-based windows")
+        print(f"Window size range: {windows_df['window_size'].min()}-{windows_df['window_size'].max()}bp")
+        print(f"Median window size: {windows_df['window_size'].median():.0f}bp")
+        
+        # Show chromosomes covered
+        chroms = windows_df['chrom'].unique()
+        print(f"Chromosomes: {', '.join(sorted(chroms))}")
+    else:
+        print(f"Warning: No {feature_type} features found in GFF file")
+    
+    return windows_df
+
+
+def _process_single_window(args):
+    """
+    Worker function to process a single window.
+    
+    Args:
+        args: Tuple of (window, site_df_subset, method, use_treatment_covariate)
+        
+    Returns:
+        Dictionary with window results or None if window should be skipped
+    """
+    window, site_df, method, use_treatment_covariate = args
+    
+    chrom = str(window['chrom'])
+    start = int(window['start'])  # 1-based
+    end = int(window['end'])  # 0-based end (exclusive)
+    window_id = window['window_id']
+    window_size = window.get('window_size', end - start + 1)
+    
+    # Get sites within this window (vectorized filtering)
+    window_sites = site_df[
+        (site_df['chrom_str'] == chrom) & 
+        (site_df['pos_int'] >= start) & 
+        (site_df['pos_int'] <= end)
+    ].copy()
+    
+    if window_sites.empty:
+        return None
+    
+    # Calculate window-level expected rates (vectorized)
+    total_expected_control = (window_sites['expected_rate_control'] * window_sites['depth']).sum()
+    total_expected_treated = (window_sites['expected_rate_treated'] * window_sites['depth']).sum()
+    total_depth_all = window_sites['depth'].sum()
+    
+    if total_depth_all == 0:
+        return None
+        
+    expected_rate_control = total_expected_control / total_depth_all
+    expected_rate_treated = total_expected_treated / total_depth_all
+    
+    # Quick check: if window has very few sites or mutations, skip GLM and use simple rates
+    total_mutations_pre = window_sites['ems_count'].sum()
+    n_sites_pre = len(window_sites)
+    
+    # Skip GLM for windows with < 50 sites or < 10 mutations (use simple rate instead)
+    use_simple_rate = (n_sites_pre < 50) or (total_mutations_pre < 10)
+    
+    # Prepare data for GLM
+    if 'treatment' not in window_sites.columns:
+        window_sites['treatment'] = (~window_sites.get('is_control', pd.Series([True] * len(window_sites)))).astype(int)
+    
+    glm_df = window_sites[['pos_int', 'depth', 'ems_count', 'treatment', 
+                           'expected_rate_control', 'expected_rate_treated']].copy()
+    glm_df.columns = ['pos', 'depth', 'ems_count', 'treatment', 
+                      'expected_rate_control', 'expected_rate_treated']
+    
+    # Fit GLM or use simple rates
+    if use_simple_rate:
+        # Use simple observed rates for small windows (skip GLM fitting)
+        control_sites = glm_df[glm_df['treatment'] == 0]
+        treated_sites = glm_df[glm_df['treatment'] == 1]
+        
+        control_depth = control_sites['depth'].sum()
+        treated_depth = treated_sites['depth'].sum()
+        control_mutations = control_sites['ems_count'].sum()
+        treated_mutations = treated_sites['ems_count'].sum()
+        
+        if control_depth > 0:
+            rate_control = control_mutations / control_depth
+        else:
+            rate_control = expected_rate_control
+        
+        if treated_depth > 0:
+            rate_treated = treated_mutations / treated_depth
+        else:
+            rate_treated = expected_rate_treated
+        
+        # Simple Poisson CI for small windows
+        if control_mutations > 0:
+            se_log_control = 1.0 / np.sqrt(control_mutations)
+            ci_low_control = rate_control * np.exp(-1.96 * se_log_control)
+            ci_high_control = rate_control * np.exp(1.96 * se_log_control)
+        else:
+            ci_low_control = 0.0
+            ci_high_control = 3.69 / control_depth if control_depth > 0 else np.nan
+        
+        if treated_mutations > 0:
+            se_log_treated = 1.0 / np.sqrt(treated_mutations)
+            ci_low_treated = rate_treated * np.exp(-1.96 * se_log_treated)
+            ci_high_treated = rate_treated * np.exp(1.96 * se_log_treated)
+        else:
+            ci_low_treated = 0.0
+            ci_high_treated = 3.69 / treated_depth if treated_depth > 0 else np.nan
+    
+    elif use_treatment_covariate:
+        # Fit GLM with treatment covariate
+        try:
+            # Prepare offset
+            glm_df['log_expected_control'] = np.log(glm_df['expected_rate_control'].values) + np.log(glm_df['depth'].values)
+            glm_df['log_expected_treated'] = np.log(glm_df['expected_rate_treated'].values) + np.log(glm_df['depth'].values)
+            
+            glm_df['log_expected'] = np.where(
+                glm_df['treatment'] == 0,
+                glm_df['log_expected_control'],
+                glm_df['log_expected_treated']
+            )
+            
+            # Design matrix
+            X = glm_df[['treatment']]
+            design = sm.add_constant(X, has_constant='add')
+            y = glm_df['ems_count'].values
+            offset = glm_df['log_expected'].values
+            
+            # Fit GLM
+            if method == "negative_binomial":
+                # Use Poisson as warm start
+                pois_model = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset)
+                pois_res = pois_model.fit()
+                start_beta = pois_res.params.values
+                
+                # Fit NB with estimated alpha
+                exposure = np.exp(offset)
+                nb_model = NBDiscrete(y, design, exposure=exposure)
+                start_params_nb = np.r_[start_beta, 0.1]
+                result = nb_model.fit(start_params=start_params_nb, disp=False)
+            else:
+                # Poisson
+                pois_model = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset)
+                result = pois_model.fit()
+            
+            # Extract rates
+            beta0 = result.params.get('const', np.nan)
+            beta_t = result.params.get('treatment', np.nan)
+            
+            # Rates
+            rate_control = expected_rate_control * np.exp(beta0) if np.isfinite(beta0) and np.isfinite(expected_rate_control) else np.nan
+            rate_treated = expected_rate_treated * np.exp(beta0 + beta_t) if np.isfinite(beta0) and np.isfinite(beta_t) and np.isfinite(expected_rate_treated) else np.nan
+            
+            # Calculate CIs
+            ci_low_control, ci_high_control = np.nan, np.nan
+            ci_low_treated, ci_high_treated = np.nan, np.nan
+            
+            try:
+                if np.isfinite(beta0):
+                    ci_beta0 = result.conf_int().loc['const'].values if 'const' in result.conf_int().index else None
+                    if ci_beta0 is not None and len(ci_beta0) == 2:
+                        ci_low_control = expected_rate_control * np.exp(ci_beta0[0])
+                        ci_high_control = expected_rate_control * np.exp(ci_beta0[1])
+                
+                if np.isfinite(beta0) and np.isfinite(beta_t):
+                    vcov = result.cov_params()
+                    var_sum = (vcov.loc['const', 'const'] + 
+                              vcov.loc['treatment', 'treatment'] +
+                              2 * vcov.loc['const', 'treatment'])
+                    se_sum = np.sqrt(var_sum) if var_sum > 0 else np.nan
+                    if np.isfinite(se_sum) and se_sum > 0:
+                        z = 1.96
+                        linear_pred_treated = beta0 + beta_t
+                        ci_low_treated = expected_rate_treated * np.exp(linear_pred_treated - z * se_sum)
+                        ci_high_treated = expected_rate_treated * np.exp(linear_pred_treated + z * se_sum)
+            except Exception:
+                pass
+            
+        except Exception:
+            # Fallback: simple rate calculation
+            rate_control = expected_rate_control
+            rate_treated = expected_rate_treated
+            ci_low_control, ci_high_control = np.nan, np.nan
+            ci_low_treated, ci_high_treated = np.nan, np.nan
+    else:
+        # Intercept-only: fit separately for control and treated
+        rate_control, ci_low_control, ci_high_control = expected_rate_control, np.nan, np.nan
+        rate_treated, ci_low_treated, ci_high_treated = expected_rate_treated, np.nan, np.nan
+        
+        control_sites = glm_df[glm_df['treatment'] == 0]
+        treated_sites = glm_df[glm_df['treatment'] == 1]
+        
+        if not control_sites.empty:
+            try:
+                X_ctrl = pd.DataFrame({'const': [1.0] * len(control_sites)})
+                design_ctrl = sm.add_constant(X_ctrl, has_constant='add')
+                y_ctrl = control_sites['ems_count'].values
+                offset_ctrl = np.log(control_sites['expected_rate_control'].values) + np.log(control_sites['depth'].values)
+                
+                if method == "negative_binomial":
+                    exposure_ctrl = np.exp(offset_ctrl)
+                    nb_model_ctrl = NBDiscrete(y_ctrl, design_ctrl, exposure=exposure_ctrl)
+                    result_ctrl = nb_model_ctrl.fit(disp=False)
+                else:
+                    pois_model_ctrl = sm.GLM(y_ctrl, design_ctrl, family=sm.families.Poisson(), offset=offset_ctrl)
+                    result_ctrl = pois_model_ctrl.fit()
+                
+                beta0_ctrl = result_ctrl.params.get('const', 0.0)
+                rate_control = expected_rate_control * np.exp(beta0_ctrl) if np.isfinite(beta0_ctrl) else expected_rate_control
+            except Exception:
+                pass
+        
+        if not treated_sites.empty:
+            try:
+                X_treat = pd.DataFrame({'const': [1.0] * len(treated_sites)})
+                design_treat = sm.add_constant(X_treat, has_constant='add')
+                y_treat = treated_sites['ems_count'].values
+                offset_treat = np.log(treated_sites['expected_rate_treated'].values) + np.log(treated_sites['depth'].values)
+                
+                if method == "negative_binomial":
+                    exposure_treat = np.exp(offset_treat)
+                    nb_model_treat = NBDiscrete(y_treat, design_treat, exposure=exposure_treat)
+                    result_treat = nb_model_treat.fit(disp=False)
+                else:
+                    pois_model_treat = sm.GLM(y_treat, design_treat, family=sm.families.Poisson(), offset=offset_treat)
+                    result_treat = pois_model_treat.fit()
+                
+                beta0_treat = result_treat.params.get('const', 0.0)
+                rate_treated = expected_rate_treated * np.exp(beta0_treat) if np.isfinite(beta0_treat) else expected_rate_treated
+            except Exception:
+                pass
+    
+    # Aggregate statistics
+    total_mutations = glm_df['ems_count'].sum()
+    total_depth = glm_df['depth'].sum()
+    
+    # Get control/treated depths and mutations
+    control_depth = glm_df[glm_df['treatment'] == 0]['depth'].sum()
+    treated_depth = glm_df[glm_df['treatment'] == 1]['depth'].sum()
+    control_mutations = glm_df[glm_df['treatment'] == 0]['ems_count'].sum()
+    treated_mutations = glm_df[glm_df['treatment'] == 1]['ems_count'].sum()
+    
+    if not use_simple_rate:
+        # Calculate simple rates for sanity check when using GLM
+        simple_rate_control = control_mutations / control_depth if control_depth > 0 else 0.0
+        simple_rate_treated = treated_mutations / treated_depth if treated_depth > 0 else 0.0
+    else:
+        simple_rate_control = rate_control
+        simple_rate_treated = rate_treated
+    
+    # If no mutations observed, set rates to 0
+    if total_mutations == 0:
+        rate_control = 0.0
+        rate_treated = 0.0
+        ci_low_control = 0.0
+        ci_high_control = 0.0
+        ci_low_treated = 0.0
+        ci_high_treated = 0.0
+    elif not use_simple_rate:
+        # Sanity check: if calculated rate is way off from simple rate, use simple rate
+        if control_depth > 0 and np.isfinite(rate_control) and np.isfinite(simple_rate_control):
+            if rate_control > simple_rate_control * 10 or rate_control < simple_rate_control / 10:
+                rate_control = simple_rate_control
+                ci_low_control = np.nan
+                ci_high_control = np.nan
+        
+        if treated_depth > 0 and np.isfinite(rate_treated) and np.isfinite(simple_rate_treated):
+            if rate_treated > simple_rate_treated * 10 or rate_treated < simple_rate_treated / 10:
+                rate_treated = simple_rate_treated
+                ci_low_treated = np.nan
+                ci_high_treated = np.nan
+    
+    result = {
+        'window_id': window_id,
+        'chrom': chrom,
+        'start': start,
+        'end': end,
+        'window_size': window_size,
+        'rate_control': rate_control,
+        'rate_treated': rate_treated,
+        'expected_rate_control': expected_rate_control,
+        'expected_rate_treated': expected_rate_treated,
+        'CI_low_control': ci_low_control,
+        'CI_high_control': ci_high_control,
+        'CI_low_treated': ci_low_treated,
+        'CI_high_treated': ci_high_treated,
+        'n_sites': len(glm_df),
+        'total_depth': total_depth,
+        'total_mutations': total_mutations,
+    }
+    
+    # Add gene metadata if present (for gene-based windows)
+    if 'gene_id' in window:
+        result['gene_id'] = window['gene_id']
+    if 'gene_name' in window:
+        result['gene_name'] = window['gene_name']
+    if 'strand' in window:
+        result['strand'] = window['strand']
+    
+    return result
+
+
 def calculate_window_rates_5mer_normalized(
     windows_df: pd.DataFrame,
     site_df: pd.DataFrame,
     genome_fasta: str,
     model_5mer,
     method: str = "negative_binomial",
-    use_treatment_covariate: bool = True
+    use_treatment_covariate: bool = True,
+    n_processes: int = None
 ) -> pd.DataFrame:
     """
     Calculate 5mer-normalized mutation rates for each fixed window.
@@ -3708,6 +4154,7 @@ def calculate_window_rates_5mer_normalized(
         model_5mer: Fitted 5mer model (statsmodels GLM result)
         method: GLM method ('poisson' or 'negative_binomial')
         use_treatment_covariate: If True, fit with treatment covariate; else intercept-only
+        n_processes: Number of processes to use for parallel processing (default: cpu_count())
     
     Returns:
         DataFrame with columns: window_id, chrom, start, end, window_size,
@@ -3800,294 +4247,32 @@ def calculate_window_rates_5mer_normalized(
     
     print(f"  Processed {len(site_df)} sites with valid 5mer contexts")
     
-    window_rates = []
+    # Set up multiprocessing
+    if n_processes is None:
+        n_processes = cpu_count()
     
-    # Process windows (now much faster since 5mer contexts are pre-computed)
-    # Add progress reporting
     total_windows = len(windows_df)
-    print(f"  Processing {total_windows} windows...")
+    print(f"  Processing {total_windows} windows using {n_processes} processes...")
     
-    # Use itertuples instead of iterrows for better performance
-    for window_idx, window in enumerate(windows_df.itertuples(), 1):
-        if window_idx % 100 == 0 or window_idx == total_windows:
-            print(f"    Progress: {window_idx}/{total_windows} windows ({100*window_idx/total_windows:.1f}%)")
+    # Convert windows to list of dicts for easier passing to worker function
+    windows_list = windows_df.to_dict('records')
+    
+    # Prepare arguments for each window
+    args_list = [(window, site_df, method, use_treatment_covariate) for window in windows_list]
+    
+    # Process windows in parallel
+    window_rates = []
+    with Pool(processes=n_processes) as pool:
+        # Use imap_unordered for progress reporting
+        results = pool.imap_unordered(_process_single_window, args_list, chunksize=10)
         
-        chrom = str(window.chrom)
-        start = int(window.start)  # 1-based
-        end = int(window.end)  # 0-based end (exclusive)
-        
-        # Get sites within this window (vectorized filtering)
-        window_sites = site_df[
-            (site_df['chrom_str'] == chrom) & 
-            (site_df['pos_int'] >= start) & 
-            (site_df['pos_int'] <= end)
-        ].copy()
-        
-        if window_sites.empty:
-            continue
-        
-        # Calculate window-level expected rates (vectorized)
-        total_expected_control = (window_sites['expected_rate_control'] * window_sites['depth']).sum()
-        total_expected_treated = (window_sites['expected_rate_treated'] * window_sites['depth']).sum()
-        total_depth_all = window_sites['depth'].sum()
-        
-        if total_depth_all == 0:
-                continue
-            
-        expected_rate_control = total_expected_control / total_depth_all
-        expected_rate_treated = total_expected_treated / total_depth_all
-        
-        # Quick check: if window has very few sites or mutations, skip GLM and use simple rates
-        total_mutations_pre = window_sites['ems_count'].sum()
-        n_sites_pre = len(window_sites)
-        
-        # Skip GLM for windows with < 50 sites or < 10 mutations (use simple rate instead)
-        # This is more aggressive to speed up processing - GLM is only worth it for windows with substantial data
-        use_simple_rate = (n_sites_pre < 50) or (total_mutations_pre < 10)
-        
-        # Prepare data for GLM (much faster now)
-        # Ensure treatment column exists
-        if 'treatment' not in window_sites.columns:
-            window_sites['treatment'] = (~window_sites.get('is_control', pd.Series([True] * len(window_sites)))).astype(int)
-        
-        glm_df = window_sites[['pos_int', 'depth', 'ems_count', 'treatment', 
-                               'expected_rate_control', 'expected_rate_treated']].copy()
-        glm_df.columns = ['pos', 'depth', 'ems_count', 'treatment', 
-                          'expected_rate_control', 'expected_rate_treated']
-        
-        # Step 2: Fit site-level GLM with 5mer-expected rate as offset
-        # Skip GLM for small windows and use simple rates instead (much faster)
-        
-        if use_simple_rate:
-            # Use simple observed rates for small windows (skip GLM fitting)
-            control_sites = glm_df[glm_df['treatment'] == 0]
-            treated_sites = glm_df[glm_df['treatment'] == 1]
-            
-            control_depth = control_sites['depth'].sum()
-            treated_depth = treated_sites['depth'].sum()
-            control_mutations = control_sites['ems_count'].sum()
-            treated_mutations = treated_sites['ems_count'].sum()
-            
-            if control_depth > 0:
-                rate_control = control_mutations / control_depth
-            else:
-                rate_control = expected_rate_control
-            
-            if treated_depth > 0:
-                rate_treated = treated_mutations / treated_depth
-            else:
-                rate_treated = expected_rate_treated
-            
-            # Simple Poisson CI for small windows
-            if control_mutations > 0:
-                se_log_control = 1.0 / np.sqrt(control_mutations)
-                ci_low_control = rate_control * np.exp(-1.96 * se_log_control)
-                ci_high_control = rate_control * np.exp(1.96 * se_log_control)
-            else:
-                ci_low_control = 0.0
-                ci_high_control = 3.69 / control_depth if control_depth > 0 else np.nan
-            
-            if treated_mutations > 0:
-                se_log_treated = 1.0 / np.sqrt(treated_mutations)
-                ci_low_treated = rate_treated * np.exp(-1.96 * se_log_treated)
-                ci_high_treated = rate_treated * np.exp(1.96 * se_log_treated)
-            else:
-                ci_low_treated = 0.0
-                ci_high_treated = 3.69 / treated_depth if treated_depth > 0 else np.nan
-        
-        elif use_treatment_covariate:
-            # Fit GLM: log(E[Y]) = log(expected_rate_from_5mer) + β₀ + β_treatment × treatment
-            # The offset accounts for 5mer-expected rate, so coefficients give deviations from expected
-            try:
-                # Prepare data
-                # Offset should be log(expected_rate * depth) because:
-                # E[Y] = expected_rate * depth * exp(X*beta)
-                # So offset = log(expected_rate * depth) = log(expected_rate) + log(depth)
-                glm_df['log_expected_control'] = np.log(glm_df['expected_rate_control'].values) + np.log(glm_df['depth'].values)
-                glm_df['log_expected_treated'] = np.log(glm_df['expected_rate_treated'].values) + np.log(glm_df['depth'].values)
-                
-                # Use appropriate expected rate offset based on treatment
-                glm_df['log_expected'] = np.where(
-                    glm_df['treatment'] == 0,
-                    glm_df['log_expected_control'],
-                    glm_df['log_expected_treated']
-                )
-                
-                # Design matrix
-                X = glm_df[['treatment']]
-                design = sm.add_constant(X, has_constant='add')
-                y = glm_df['ems_count'].values
-                offset = glm_df['log_expected'].values
-                
-                # Fit GLM
-                if method == "negative_binomial":
-                    # Use Poisson as warm start
-                    pois_model = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset)
-                    pois_res = pois_model.fit()
-                    start_beta = pois_res.params.values
-                    
-                    # Fit NB with estimated alpha
-                    exposure = np.exp(offset)
-                    nb_model = NBDiscrete(y, design, exposure=exposure)
-                    start_params_nb = np.r_[start_beta, 0.1]
-                    result = nb_model.fit(start_params=start_params_nb, disp=False)
-                else:
-                    # Poisson
-                    pois_model = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset)
-                    result = pois_model.fit()
-                
-                # Extract rates
-                beta0 = result.params.get('const', np.nan)
-                beta_t = result.params.get('treatment', np.nan)
-                
-                # Rates are: expected_rate × exp(β₀) for control, expected_rate × exp(β₀ + β_t) for treated
-                rate_control = expected_rate_control * np.exp(beta0) if np.isfinite(beta0) and np.isfinite(expected_rate_control) else np.nan
-                rate_treated = expected_rate_treated * np.exp(beta0 + beta_t) if np.isfinite(beta0) and np.isfinite(beta_t) and np.isfinite(expected_rate_treated) else np.nan
-                
-                # Calculate CIs
-                ci_low_control, ci_high_control = np.nan, np.nan
-                ci_low_treated, ci_high_treated = np.nan, np.nan
-                
-                try:
-                    if np.isfinite(beta0):
-                        ci_beta0 = result.conf_int().loc['const'].values if 'const' in result.conf_int().index else None
-                        if ci_beta0 is not None and len(ci_beta0) == 2:
-                            ci_low_control = expected_rate_control * np.exp(ci_beta0[0])
-                            ci_high_control = expected_rate_control * np.exp(ci_beta0[1])
-                    
-                    if np.isfinite(beta0) and np.isfinite(beta_t):
-                        vcov = result.cov_params()
-                        var_sum = (vcov.loc['const', 'const'] + 
-                                  vcov.loc['treatment', 'treatment'] +
-                                  2 * vcov.loc['const', 'treatment'])
-                        se_sum = np.sqrt(var_sum) if var_sum > 0 else np.nan
-                        if np.isfinite(se_sum) and se_sum > 0:
-                            z = 1.96
-                            linear_pred_treated = beta0 + beta_t
-                            ci_low_treated = expected_rate_treated * np.exp(linear_pred_treated - z * se_sum)
-                            ci_high_treated = expected_rate_treated * np.exp(linear_pred_treated + z * se_sum)
-                except Exception:
-                    pass
-                
-            except Exception as e:
-                # Fallback: simple rate calculation
-                rate_control = expected_rate_control
-                rate_treated = expected_rate_treated
-                ci_low_control, ci_high_control = np.nan, np.nan
-                ci_low_treated, ci_high_treated = np.nan, np.nan
-        else:
-            # Intercept-only: fit separately for control and treated
-            rate_control, ci_low_control, ci_high_control = expected_rate_control, np.nan, np.nan
-            rate_treated, ci_low_treated, ci_high_treated = expected_rate_treated, np.nan, np.nan
-            
-            control_sites = glm_df[glm_df['treatment'] == 0]
-            treated_sites = glm_df[glm_df['treatment'] == 1]
-            
-            if not control_sites.empty:
-                try:
-                    X_ctrl = pd.DataFrame({'const': [1.0] * len(control_sites)})
-                    design_ctrl = sm.add_constant(X_ctrl, has_constant='add')
-                    y_ctrl = control_sites['ems_count'].values
-                    # Offset should include depth: log(expected_rate * depth)
-                    offset_ctrl = np.log(control_sites['expected_rate_control'].values) + np.log(control_sites['depth'].values)
-                    
-                    if method == "negative_binomial":
-                        exposure_ctrl = np.exp(offset_ctrl)
-                        nb_model_ctrl = NBDiscrete(y_ctrl, design_ctrl, exposure=exposure_ctrl)
-                        result_ctrl = nb_model_ctrl.fit(disp=False)
-                    else:
-                        pois_model_ctrl = sm.GLM(y_ctrl, design_ctrl, family=sm.families.Poisson(), offset=offset_ctrl)
-                        result_ctrl = pois_model_ctrl.fit()
-                    
-                    beta0_ctrl = result_ctrl.params.get('const', 0.0)
-                    rate_control = expected_rate_control * np.exp(beta0_ctrl) if np.isfinite(beta0_ctrl) else expected_rate_control
-                except Exception:
-                    pass
-            
-            if not treated_sites.empty:
-                try:
-                    X_treat = pd.DataFrame({'const': [1.0] * len(treated_sites)})
-                    design_treat = sm.add_constant(X_treat, has_constant='add')
-                    y_treat = treated_sites['ems_count'].values
-                    # Offset should include depth: log(expected_rate * depth)
-                    offset_treat = np.log(treated_sites['expected_rate_treated'].values) + np.log(treated_sites['depth'].values)
-                    
-                    if method == "negative_binomial":
-                        exposure_treat = np.exp(offset_treat)
-                        nb_model_treat = NBDiscrete(y_treat, design_treat, exposure=exposure_treat)
-                        result_treat = nb_model_treat.fit(disp=False)
-                    else:
-                        pois_model_treat = sm.GLM(y_treat, design_treat, family=sm.families.Poisson(), offset=offset_treat)
-                        result_treat = pois_model_treat.fit()
-                    
-                    beta0_treat = result_treat.params.get('const', 0.0)
-                    rate_treated = expected_rate_treated * np.exp(beta0_treat) if np.isfinite(beta0_treat) else expected_rate_treated
-                except Exception:
-                    pass
-        
-        # Aggregate statistics
-        total_mutations = glm_df['ems_count'].sum()
-        total_depth = glm_df['depth'].sum()
-        
-        # Calculate simple observed rates for sanity check (only if we used GLM)
-        # Get control/treated depths and mutations (needed for sanity check and zero-mutation handling)
-        control_depth = glm_df[glm_df['treatment'] == 0]['depth'].sum()
-        treated_depth = glm_df[glm_df['treatment'] == 1]['depth'].sum()
-        control_mutations = glm_df[glm_df['treatment'] == 0]['ems_count'].sum()
-        treated_mutations = glm_df[glm_df['treatment'] == 1]['ems_count'].sum()
-        
-        if not use_simple_rate:
-            # Calculate simple rates for sanity check when using GLM
-            simple_rate_control = control_mutations / control_depth if control_depth > 0 else 0.0
-            simple_rate_treated = treated_mutations / treated_depth if treated_depth > 0 else 0.0
-        else:
-            # Already calculated above for simple rate case
-            simple_rate_control = rate_control
-            simple_rate_treated = rate_treated
-        
-        # If no mutations observed, set rates to 0
-        if total_mutations == 0:
-            rate_control = 0.0
-            rate_treated = 0.0
-            ci_low_control = 0.0
-            ci_high_control = 0.0
-            ci_low_treated = 0.0
-            ci_high_treated = 0.0
-        elif not use_simple_rate:
-            # Sanity check: if calculated rate is way off from simple rate, use simple rate
-            # This can happen if GLM fails or gives unreasonable coefficients
-            if control_depth > 0 and np.isfinite(rate_control) and np.isfinite(simple_rate_control):
-                if rate_control > simple_rate_control * 10 or rate_control < simple_rate_control / 10:
-                    # Rate is way off, use simple rate instead
-                    rate_control = simple_rate_control
-                    ci_low_control = np.nan
-                    ci_high_control = np.nan
-            
-            if treated_depth > 0 and np.isfinite(rate_treated) and np.isfinite(simple_rate_treated):
-                if rate_treated > simple_rate_treated * 10 or rate_treated < simple_rate_treated / 10:
-                    # Rate is way off, use simple rate instead
-                    rate_treated = simple_rate_treated
-                    ci_low_treated = np.nan
-                    ci_high_treated = np.nan
-        
-        window_rates.append({
-            'window_id': window.window_id,
-            'chrom': chrom,
-            'start': start,
-            'end': end,
-            'window_size': getattr(window, 'window_size', end - start + 1),
-            'rate_control': rate_control,
-            'rate_treated': rate_treated,
-            'expected_rate_control': expected_rate_control,
-            'expected_rate_treated': expected_rate_treated,
-            'CI_low_control': ci_low_control,
-            'CI_high_control': ci_high_control,
-            'CI_low_treated': ci_low_treated,
-            'CI_high_treated': ci_high_treated,
-            'n_sites': len(glm_df),
-            'total_depth': total_depth,
-            'total_mutations': total_mutations,
-        })
+        processed = 0
+        for result in results:
+            if result is not None:
+                window_rates.append(result)
+            processed += 1
+            if processed % 100 == 0 or processed == total_windows:
+                print(f"    Progress: {processed}/{total_windows} windows ({100*processed/total_windows:.1f}%)")
     
     rates_df = pd.DataFrame(window_rates)
     print(f"Calculated 5mer-normalized rates for {len(rates_df)} windows")
@@ -4621,6 +4806,10 @@ def main():
                         help="Analyze mutation rates using 5mer-normalized fixed-size windows")
     parser.add_argument("--window-size", type=int, default=5000,
                         help="Fixed window size in bp for 5mer-normalized analysis (default: 5000)")
+    parser.add_argument("--window-mode", type=str, default="fixed", choices=["fixed", "gene"],
+                        help="Window mode: 'fixed' for fixed-size windows, 'gene' for gene-based windows (default: fixed)")
+    parser.add_argument("--gene-feature-type", type=str, default="gene", choices=["gene", "CDS", "mRNA"],
+                        help="GFF feature type to use for gene-based windows (default: gene)")
     parser.add_argument("--kmer5-model-path", type=str, default=None,
                         help="Path to fitted 5mer model pickle file (required for --kmer5-normalized-windows)")
     parser.add_argument("--min-alt-c", type=int, default=None,
@@ -5277,13 +5466,31 @@ def main():
                 model_5mer = load_5mer_model(args.kmer5_model_path)
                 print("✓ 5mer model loaded")
                 
-                # Create fixed-size windows
+                # Create windows based on mode
                 excluded_sites_set = excluded_sites if excluded_sites else None
-                windows_df = create_fixed_windows(
-                    args.genome_fasta,
-                    window_size=args.window_size,
-                    exclusion_mask=excluded_sites_set
-                )
+                window_mode = getattr(args, 'window_mode', 'fixed')
+                
+                if window_mode == 'gene':
+                    if not args.gff_file:
+                        print("Warning: --window-mode gene requires --gff-file")
+                        print("Skipping 5mer-normalized window analysis")
+                        windows_df = None
+                    else:
+                        print(f"Creating gene-based windows from {args.gff_file}...")
+                        feature_type = getattr(args, 'gene_feature_type', 'gene')
+                        windows_df = create_gene_windows(
+                            args.gff_file,
+                            genome_fasta=args.genome_fasta,
+                            feature_type=feature_type,
+                            exclusion_mask=excluded_sites_set
+                        )
+                else:
+                    # Fixed-size windows (default)
+                    windows_df = create_fixed_windows(
+                        args.genome_fasta,
+                        window_size=args.window_size,
+                        exclusion_mask=excluded_sites_set
+                    )
                 
                 if windows_df is not None and not windows_df.empty:
                     # Load site-level data
@@ -5306,13 +5513,25 @@ def main():
                         )
                         
                         if windows_rates_df is not None and not windows_rates_df.empty:
-                            # Save window rates
-                            window_dir = os.path.join(output_dir, "5mer_normalized_windows")
+                            # Save window rates with appropriate naming
+                            if window_mode == 'gene':
+                                window_dir = os.path.join(output_dir, "5mer_normalized_gene_windows")
+                                window_rates_filename = "gene_mutation_rates.tsv"
+                            else:
+                                window_dir = os.path.join(output_dir, "5mer_normalized_windows")
+                                window_rates_filename = "window_rates.tsv"
+                            
                             os.makedirs(window_dir, exist_ok=True)
                             
-                            windows_rates_path = os.path.join(window_dir, "window_rates.tsv")
+                            windows_rates_path = os.path.join(window_dir, window_rates_filename)
                             windows_rates_df.to_csv(windows_rates_path, sep='\t', index=False)
                             print(f"Window rates saved to {windows_rates_path}")
+                            
+                            if window_mode == 'gene':
+                                print(f"✓ Gene-based analysis complete: {len(windows_rates_df)} genes with mutation rates")
+                                print(f"  Output includes: gene_id, gene_name, chrom, start, end")
+                                print(f"  Rate columns: rate_control, rate_treated, expected_rate_control, expected_rate_treated")
+                                print(f"  Useful for expression correlation analysis")
                             
                             # Create Manhattan plot (using normalized rates)
                             manhattan_path = os.path.join(window_dir, "manhattan_plot.png")
@@ -5324,14 +5543,15 @@ def main():
                                 rate_threshold_multiplier=2.0
                             )
                             
-                            # Regional comparison
-                            regional_df = compare_regional_rates_gc_normalized(
-                                windows_rates_df,
-                                region_type="chromosome",
-                                output_dir=window_dir,
-                                method="negative_binomial",
-                                use_treatment_covariate=use_treatment_covariate
-                            )
+                            # Regional comparison (skip for gene mode as it doesn't make sense)
+                            if window_mode != 'gene':
+                                regional_df = compare_regional_rates_gc_normalized(
+                                    windows_rates_df,
+                                    region_type="chromosome",
+                                    output_dir=window_dir,
+                                    method="negative_binomial",
+                                    use_treatment_covariate=use_treatment_covariate
+                                )
                             
                             print("✓ 5mer-normalized window analysis complete")
                         else:
