@@ -2246,10 +2246,8 @@ def mutation_type_barplot_consensus_comparison(
         output_dir (str): Directory to save output plot
     '''
     
-    # Count mutations across all samples for both datasets
-    # Consensus: count alternate alleles (actual mutation frequency)
-    # Nonconsensus: count unique sites (avoid counting false positives multiple times)
-    consensus_freqs = count_mutations_alt_alleles(consensus_json_files)
+    # Use unique sites for both datasets to ensure consistent counting
+    consensus_freqs = count_mutations_unique_sites(consensus_json_files)
     nonconsensus_freqs = count_mutations_unique_sites(nonconsensus_json_files)
     
     # Normalize using provided base counts and generate CSVs
@@ -2752,14 +2750,19 @@ def plot_ems_5mer_signature_average_colored_by_enrichment(context_counts: dict, 
     plt.figure(figsize=(12, 8))  # Fixed width instead of dynamic scaling
     x_c2t = np.arange(len(c2t_kmers))
     x_g2a = np.arange(len(g2a_kmers)) + len(c2t_kmers)  # Offset G>A after C>T
-    
+
     # Get enrichment values for coloring
     c2t_enrichment_values = [c2t_enrichment.get(kmer, 1.0) for kmer in c2t_kmers]
     g2a_enrichment_values = [g2a_enrichment.get(kmer, 1.0) for kmer in g2a_kmers]
-    
-    # Create color maps for enrichment values
-    max_enrichment = max(max(c2t_enrichment_values), max(g2a_enrichment_values))
-    min_enrichment = min(min(c2t_enrichment_values), min(g2a_enrichment_values))
+
+    # If no enrichment values at all, skip plotting gracefully
+    if not c2t_enrichment_values and not g2a_enrichment_values:
+        plt.close()
+        return
+
+    # Create color maps for enrichment values (use safe defaults if one side is empty)
+    max_enrichment = max(max(c2t_enrichment_values or [1.0]), max(g2a_enrichment_values or [1.0]))
+    min_enrichment = min(min(c2t_enrichment_values or [1.0]), min(g2a_enrichment_values or [1.0]))
     
     # Normalize enrichment values for coloring (1.0 = white, higher = more saturated)
     def normalize_enrichment(e, max_e):

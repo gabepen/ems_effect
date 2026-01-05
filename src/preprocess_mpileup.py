@@ -95,6 +95,7 @@ def analyze_read_position_bias(reads, alt):
     # Not enough data points for meaningful test
     return 1.0, 0.0  # Return values indicating no significant bias
 
+
 def get_most_common_alt(reads, ref):
     """
     Find the most common alternate allele in the reads.
@@ -136,6 +137,7 @@ def get_most_common_alt(reads, ref):
     # Return the most common alternate allele and its count
     return max(counts.items(), key=lambda x: x[1])
 
+
 def get_depth_threshold(mpileup_file: str, percentile: float = 5.0) -> int:
     """
     Calculate depth threshold based on distribution of depths in mpileup file.
@@ -165,6 +167,7 @@ def get_depth_threshold(mpileup_file: str, percentile: float = 5.0) -> int:
     else:
         print("Warning: Could not calculate depth distribution, using default threshold of 1")
         return 1
+
 
 def count_bases(reads, ref):
     """
@@ -209,6 +212,7 @@ def count_bases(reads, ref):
     
     return counts, most_common_alt[0], total_alt_count
 
+
 def analyze_n_alt_ratios(plot_data):
     """
     Analyze the ratios between N and Alt frequencies to identify common patterns.
@@ -252,6 +256,7 @@ def analyze_n_alt_ratios(plot_data):
         'common_ratios': ratio_counts_dict,
         'ratio_quality': ratio_quality_dict
     }
+
 
 def plot_n_vs_alt_distributions(sample_data, output_dir):
     """
@@ -387,6 +392,7 @@ def plot_n_vs_alt_distributions(sample_data, output_dir):
             for sample, ratios in all_samples_ratios.items()
         }, f, indent=2)
 
+
 def load_config(config_path):
     """
     Load configuration file to get paths for genome FASTA and GFF.
@@ -403,6 +409,7 @@ def load_config(config_path):
     genome_fasta = config['references']['genomic_fna']
     genome_gff = config['references']['annotation']
     return genome_fasta, genome_gff
+
 
 def filter_genic_positions(filtered_positions: Set[int], seq_context: SeqContext) -> Dict[str, List[int]]:
     """
@@ -438,8 +445,9 @@ def filter_genic_positions(filtered_positions: Set[int], seq_context: SeqContext
     
     return genic_positions
 
-def process_line(line, depth_threshold, seq_context):
-    """Modified to return filtered positions with reasons"""
+
+def process_line(line, depth_threshold, seq_context, keep_low_alt=False, alt_threshold=3):
+    """Modified to optionally retain low-alt sites (1-2 alt reads) that pass other filters."""
     fields = line.strip().split('\t')
     if len(fields) < 6:
         return None, (set(), set(), set()), None  # (depth_filtered, n_filtered, bias_filtered)
@@ -460,9 +468,25 @@ def process_line(line, depth_threshold, seq_context):
     if not alt or alt_base_count == 0:  # No alternate allele found
         return None, (set(), set(), set()), None
 
-    if alt_base_count < 3:
-        n_filtered = set([pos])
-        return None, (set(), n_filtered, set()), None
+    if alt_base_count < alt_threshold:
+        if not keep_low_alt:
+            n_filtered = set([pos])
+            return None, (set(), n_filtered, set()), None
+        # Evaluate remaining filters and keep if pass (as non-mutation)
+        
+        # N contamination filter
+        if base_counts['N'] > alt_base_count * 10:
+            n_filtered = set([pos])
+            return None, (set(), n_filtered, set()), None
+        
+        # Position bias test
+        pvalue, statistic = analyze_read_position_bias(reads, alt)
+        if (pvalue == -1 and statistic == -1) or (statistic < 0.25 and pvalue > 0.01):
+            # Keep in filtered output, but no mutation_type
+            return (chrom, pos, ref, fields[3], reads, fields[5], None), (set(), set(), set()), None
+        else:
+            bias_filtered = set([pos])
+            return None, (set(), set(), bias_filtered), None
     
     # Initialize filter sets
     depth_filtered = set()
@@ -502,6 +526,7 @@ def process_line(line, depth_threshold, seq_context):
     else:
         bias_filtered.add(pos)
         return None, (depth_filtered, n_filtered, bias_filtered), measurement
+
 
 def analyze_high_n_ratios(sample_data, output_dir):
     """
@@ -589,7 +614,8 @@ def analyze_high_n_ratios(sample_data, output_dir):
     
     return stats
 
-def main(mpileup_dir, output_dir, config_path):
+
+def main(mpileup_dir, output_dir, config_path, keep_low_alt=False, write_sites=False, alt_threshold=3):
     """
     Process all mpileup files in a directory and detect sequence bias.
     
@@ -597,6 +623,9 @@ def main(mpileup_dir, output_dir, config_path):
         mpileup_dir (str): Path to directory containing mpileup files
         output_dir (str): Path to output directory
         config_path (str): Path to configuration file
+        keep_low_alt (bool): If True, keep sites with 1-2 alt reads that pass other filters in filtered output
+        write_sites (bool): If True, write a sites file listing all positions with depth >= threshold regardless of alternate evidence
+        alt_threshold (int): Minimum number of alternate alleles to consider a mutation (default: 3)
     """
     # Load genome paths from config
     genome_fasta, genome_gff = load_config(config_path)
@@ -616,6 +645,7 @@ def main(mpileup_dir, output_dir, config_path):
         sample_name = os.path.basename(mpileup_file).replace(".txt", "")
         output_file = os.path.join(output_dir, f"{sample_name}_filtered.txt")
         mutation_file = os.path.join(output_dir, f"{sample_name}_mutations.txt")
+        sites_file = os.path.join(output_dir, f"{sample_name}_sites.txt") if write_sites else None
         
         print(f"\nProcessing {sample_name}...")
         
@@ -634,14 +664,44 @@ def main(mpileup_dir, output_dir, config_path):
         
         with open(mpileup_file) as f_in, \
              open(output_file, 'w') as f_out, \
-             open(mutation_file, 'w') as f_mut:
+             open(mutation_file, 'w') as f_mut, \
+             (open(sites_file, 'w') if write_sites else open(os.devnull, 'w')) as f_sites:
             
             lines = f_in.readlines()
+            
+            # Write sites file: callable positions = pass coverage and, if alt present, pass N-content and bias filters
+            if write_sites:
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) < 6:
+                        continue
+                    try:
+                        depth = int(parts[3])
+                    except ValueError:
+                        continue
+                    if depth < depth_threshold:
+                        continue
+                    ref = parts[2]
+                    reads = parts[4]
+                    # Count bases and alt evidence
+                    base_counts, alt_base, alt_count = count_bases(reads, ref)
+                    if alt_count == 0:
+                        # No alt evidence: include as callable (passed coverage)
+                        f_sites.write(line)
+                        continue
+                    # N-content filter relative to alt evidence
+                    if base_counts.get('N', 0) > alt_count * 10:
+                        continue
+                    # Positional bias filter
+                    pvalue, statistic = analyze_read_position_bias(reads, alt_base if alt_base else '')
+                    passes_bias = (pvalue == -1 and statistic == -1) or (statistic < 0.25 and pvalue > 0.01)
+                    if passes_bias:
+                        f_sites.write(line)
             
             with Pool(cpu_count()) as pool:
                 results = pool.starmap(
                     process_line,
-                    [(line, depth_threshold, seq_context) for line in lines]
+                    [(line, depth_threshold, seq_context, keep_low_alt, alt_threshold) for line in lines]
                 )
             
             # Counter for lines with mutations written to output
@@ -705,12 +765,16 @@ def main(mpileup_dir, output_dir, config_path):
         print(f"  Percentage of total positions: {stats['percentage']:.2f}%")
         print(f"  Median N:Alt ratio: {stats['ratio_stats']['median']:.2f}")
 
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Process mpileup files to detect sequence bias')
     parser.add_argument('mpileup_dir', help='Path to directory containing mpileup files')
     parser.add_argument('output_dir', help='Path to output directory')
     parser.add_argument('config_path', help='Path to configuration file')
+    parser.add_argument('--keep-low-alt', action='store_true', help='Keep sites with 1-2 alt reads that pass other filters in filtered output')
+    parser.add_argument('--write-sites', action='store_true', help='Also write <sample>_sites.txt containing all positions with depth >= threshold regardless of alternate evidence')
+    parser.add_argument('--alt-threshold', type=int, default=3, help='Minimum number of alternate alleles to consider a mutation (default: 3) (for bias and n-content filters)')
     args = parser.parse_args()
     
-    main(args.mpileup_dir, args.output_dir, args.config_path)
+    main(args.mpileup_dir, args.output_dir, args.config_path, keep_low_alt=args.keep_low_alt, write_sites=args.write_sites, alt_threshold=args.alt_threshold)
