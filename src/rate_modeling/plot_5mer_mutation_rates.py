@@ -945,26 +945,36 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
     for rate in downstream_dinuc_rates.values():
         all_enrichment_values.append(rate - median_rate)
     
-    # Use percentiles instead of absolute max to avoid washed-out colors from outliers
-    # Use 98th percentile to capture most of the range while excluding extreme outliers
+    # Use actual maximum to ensure colorbar covers full data range
     if all_enrichment_values:
         abs_enrichments = [abs(e) for e in all_enrichment_values]
-        max_enrichment = np.percentile(abs_enrichments, 98)
+        max_enrichment = np.max(abs_enrichments)
         # Ensure we have a reasonable minimum range
         if max_enrichment < 1e-8:
             max_enrichment = 1e-6
     else:
         max_enrichment = 1e-6
-    vmin_enrichment = -max_enrichment
-    vmax_enrichment = max_enrichment
+    
+    # Extend the colorbar range beyond the data extremes to use more of the color spectrum
+    # This improves contrast by compressing the data range within the colormap
+    # Extend by 30% to give better color distribution
+    extended_max = max_enrichment * 1.3
+    vmin_enrichment = -extended_max
+    vmax_enrichment = extended_max
     
     # Create blue-to-orange diverging colormap
     import matplotlib.colors as mcolors
     # Blue (low) to white (median) to orange (high)
+    # Removed colors near center to compress white region and improve contrast
+    # This spreads data across more of the blue/orange spectrum
     cmap = mcolors.LinearSegmentedColormap.from_list(
         'blue_orange_diverging',
-        ['#2166AC', '#4393C3', '#92C5DE', '#D1E5F0', '#F7F7F7', '#FDDBC7', '#F4A582', '#FF8C42', '#FF6B00']
+        ['#2166AC', '#4393C3', '#92C5DE', '#F7F7F7', '#F4A582', '#FF8C42', '#FF6B00']
     )
+    
+    # Use linear normalization with extended range for better contrast
+    # The extended range compresses the data within the colormap, using more of the spectrum
+    norm = mcolors.Normalize(vmin=vmin_enrichment, vmax=vmax_enrichment)
     
     # Create multi-panel figure with GridSpec
     # Layout: 3 rows, 1 column
@@ -979,8 +989,7 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
     
     # Create bar plot with colors based on enrichment
     bars = ax1.bar(range(len(kmers)), rates, width=0.95)
-    # Color bars based on enrichment
-    norm = mcolors.Normalize(vmin=vmin_enrichment, vmax=vmax_enrichment)
+    # Color bars based on enrichment (using PowerNorm for better contrast)
     for i, (bar, enrichment) in enumerate(zip(bars, enrichments_list)):
         bar.set_facecolor(cmap(norm(enrichment)))
         bar.set_edgecolor('none')
@@ -1145,18 +1154,51 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
                 row.append(enrichment)
             heatmap_data.append(row)
         
-        # Convert to numpy array for heatmap
-        heatmap_array = np.array(heatmap_data)
+        # Create arrays for upstream and downstream separately
+        upstream_array = np.array([heatmap_data[0], heatmap_data[1]])  # -2, -1
+        downstream_array = np.array([heatmap_data[2], heatmap_data[3]])  # +1, +2
         
-        # Use same color scale as Panel A
-        im = ax2.imshow(heatmap_array, cmap=cmap, aspect='auto', 
-                       vmin=vmin_enrichment, vmax=vmax_enrichment, interpolation='nearest')
+        # Calculate gap size: 1/3 of a row height
+        gap_size = 1.0 / 3.0
+        
+        # Create coordinate arrays for pcolormesh
+        # Upstream: rows 0-1, columns 0-3
+        # Gap: row 2 (1/3 size), columns 0-3
+        # Downstream: rows 2+gap to 3+gap, columns 0-3
+        
+        # X coordinates (same for all): column edges
+        x_edges = np.arange(len(bases) + 1) - 0.5
+        
+        # Y coordinates: row edges with gap
+        # Upstream rows: 0 to 2
+        # Gap: 2 to 2+gap_size (1/3 size)
+        # Downstream rows: 2+gap_size to 4+gap_size
+        y_edges = np.array([0, 1, 2, 2+gap_size, 3+gap_size, 4+gap_size])
+        
+        # Combine data with gap row
+        combined_data = np.vstack([
+            upstream_array,
+            np.full((1, len(bases)), np.nan),  # Gap row
+            downstream_array
+        ])
+        
+        # Use pcolormesh for precise control over cell sizes
+        X, Y = np.meshgrid(x_edges, y_edges)
+        im = ax2.pcolormesh(X, Y, combined_data, cmap=cmap, norm=norm, 
+                           shading='flat', edgecolors='none')
         
         # Set ticks and labels
+        # Y-axis: positions at center of each data row (skip gap)
+        y_positions = [0.5, 1.5, 2.5+gap_size, 3.5+gap_size]
+        y_labels = [f'{p:+d}' for p in positions]
         ax2.set_xticks(np.arange(len(bases)))
-        ax2.set_yticks(np.arange(len(positions)))
+        ax2.set_yticks(y_positions)
         ax2.set_xticklabels(bases, fontsize=18, fontweight='bold')
-        ax2.set_yticklabels([f'{p:+d}' for p in positions], fontsize=18, fontweight='bold')
+        ax2.set_yticklabels(y_labels, fontsize=18, fontweight='bold')
+        
+        # Set axis limits
+        ax2.set_xlim(-0.5, len(bases)-0.5)
+        ax2.set_ylim(4+gap_size, 0)
         
         # Remove text annotations from heatmap (values not shown)
         
@@ -1164,9 +1206,6 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
         ax2.set_xlabel('Nucleotide', fontsize=18, fontweight='bold')
         ax2.set_ylabel('Position Relative to Mutation', fontsize=18, fontweight='bold')
         ax2.set_title('Nucleotide Enrichment at Flanking Positions', fontsize=20, fontweight='bold', pad=15)
-        
-        # Add horizontal line to separate upstream from downstream
-        ax2.axhline(y=1.5, color='black', linestyle='--', linewidth=2, alpha=0.5)
     
     # Panel 3: Dinucleotide pair heatmap
     ax3 = fig.add_subplot(gs[2])
@@ -1190,38 +1229,66 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
                 upstream_data[i, j] = upstream_enrichment
                 downstream_data[i, j] = downstream_enrichment
         
-        # Combine into single array (upstream on left, downstream on right)
-        combined_data = np.hstack([upstream_data, downstream_data])
+        # Calculate gap size: smaller gap (about 1/5 of a column width)
+        gap_size = 1.0 / 5.0
         
-        # Use same color scale as other panels
-        im = ax3.imshow(combined_data, cmap=cmap, aspect='auto', 
-                       vmin=vmin_enrichment, vmax=vmax_enrichment, interpolation='nearest')
+        # Create coordinate arrays for pcolormesh
+        # Upstream: columns 0-3, rows 0-3
+        # Gap: column 4 (1/3 size), rows 0-3
+        # Downstream: columns 4+gap to 7+gap, rows 0-3
+        
+        # X coordinates: column edges with gap
+        # Upstream columns: 0 to 4 (each column is 1 unit wide)
+        # Gap: 4 to 4+gap_size (1/3 size)
+        # Downstream columns: 4+gap_size to 8+gap_size (each column is 1 unit wide)
+        # Subtract 0.5 to center boxes at integer positions
+        x_edges = np.array([0, 1, 2, 3, 4, 4+gap_size, 5+gap_size, 6+gap_size, 7+gap_size, 8+gap_size]) - 0.5
+        # Box centers are at midpoints: 0, 1, 2, 3, 4+gap_size, 5+gap_size, 6+gap_size, 7+gap_size
+        
+        # Y coordinates: row edges
+        y_edges = np.arange(5) - 0.5
+        
+        # Combine data with gap column
+        gap_column = np.full((4, 1), np.nan)
+        combined_data = np.hstack([upstream_data, gap_column, downstream_data])
+        
+        # Use pcolormesh for precise control over cell sizes
+        X, Y = np.meshgrid(x_edges, y_edges)
+        im = ax3.pcolormesh(X, Y, combined_data, cmap=cmap, norm=norm, 
+                           shading='flat', edgecolors='none')
         
         # Set ticks and labels
         # X-axis: two sets of 4 ticks (one for upstream, one for downstream)
-        # Position ticks at integer positions (0, 1, 2, 3, 4, 5, 6, 7) to center on cells
-        x_ticks = np.arange(8)
+        # Calculate box centers directly from x_edges to ensure perfect alignment
+        # Upstream boxes: edges at indices 0-4, centers are midpoints
+        x_ticks_upstream = [(x_edges[i] + x_edges[i+1]) / 2 for i in range(4)]
+        # Downstream boxes: edges at indices 5-9, centers are midpoints
+        x_ticks_downstream = [(x_edges[i] + x_edges[i+1]) / 2 for i in range(5, 9)]
+        x_ticks = x_ticks_upstream + x_ticks_downstream
         x_labels = bases + bases
         ax3.set_xticks(x_ticks)
         ax3.set_xticklabels(x_labels, fontsize=16, fontweight='bold')
         
         # Y-axis: bases (first base of dinucleotide)
-        ax3.set_yticks(np.arange(4))
+        # Position ticks at center of each row
+        # With y_edges = [-0.5, 0.5, 1.5, 2.5, 3.5], row centers are at [0, 1, 2, 3]
+        y_tick_positions = [0, 1, 2, 3]  # Centers of each row
+        ax3.set_yticks(y_tick_positions)
         ax3.set_yticklabels(bases, fontsize=18, fontweight='bold')
         
-        # Remove text annotations from heatmap (values not shown)
-        
-        # Add vertical line to separate upstream from downstream
-        ax3.axvline(x=3.5, color='black', linestyle='--', linewidth=2, alpha=0.5)
+        # Set axis limits
+        ax3.set_xlim(-0.5, 8+gap_size-0.5)
+        ax3.set_ylim(3.5, -0.5)
         
         # Labels (no title)
         ax3.set_xlabel('Second Base of Dinucleotide', fontsize=18, fontweight='bold')
         ax3.set_ylabel('First Base of Dinucleotide', fontsize=18, fontweight='bold')
         
         # Add section labels as plain text (no boxes)
+        # Adjust positions to account for gap: upstream center is at 1.5, downstream center is at 6.5
         ax3.text(1.5, -0.15, 'Upstream (-2, -1)', ha='center', va='top', 
                 fontsize=18, fontweight='bold')
-        ax3.text(5.5, -0.15, 'Downstream (+1, +2)', ha='center', va='top', 
+        ax3.text(6.5, -0.15, 'Downstream (+1, +2)', ha='center', va='top', 
                 fontsize=18, fontweight='bold')
     
     # Add shared colorbar for all panels (positioned on the right side, 70% of figure height)
@@ -1230,16 +1297,21 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
     cbar_height = 0.89 * 0.7  # 70% of available height
     cbar_bottom = 0.08 + (0.89 - cbar_height) / 2  # Center vertically
     cbar_ax = fig.add_axes([0.87, cbar_bottom, 0.02, cbar_height])  # [left, bottom, width, height]
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=vmin_enrichment, vmax=vmax_enrichment))
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = plt.colorbar(sm, cax=cbar_ax)
     cbar.set_label('Enrichment from Median\nMutation Rate', fontsize=16, fontweight='bold')
     cbar.ax.tick_params(labelsize=14)
     
     # Add panel labels
-    fig.text(0.02, 0.98, 'A', fontsize=24, fontweight='bold', va='top', ha='left')
-    fig.text(0.02, 0.65, 'B', fontsize=24, fontweight='bold', va='top', ha='left')
-    fig.text(0.02, 0.28, 'C', fontsize=24, fontweight='bold', va='top', ha='left')
+    # Get panel positions to align labels properly
+    pos_top = ax1.get_position()
+    pos_middle = ax2.get_position()
+    pos_bottom = ax3.get_position()
+    
+    fig.text(0.02, pos_top.y1 - 0.02, 'A', fontsize=24, fontweight='bold', va='top', ha='left')
+    fig.text(0.02, pos_middle.y1 - 0.02, 'B', fontsize=24, fontweight='bold', va='top', ha='left')
+    fig.text(0.02, pos_bottom.y1 - 0.02, 'C', fontsize=24, fontweight='bold', va='top', ha='left')
     
     output_file = os.path.join(output_dir, f'{plot_prefix}_5mer_enrichment_rates_single_panel.png')
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
