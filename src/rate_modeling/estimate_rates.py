@@ -1392,6 +1392,248 @@ def fit_category_rates_nb_glm(site_df: pd.DataFrame, use_treatment_covariate: bo
         return None, None
 
 
+def _fit_clean_absolute_analysis(df, categories, method, alpha, kmer5_model, genome_seqs):
+    """
+    Clean absolute category analysis with 5mer baseline.
+    
+    This directly answers: "Does EMS disproportionately affect intergenic vs coding regions?"
+    
+    Model:
+        For each category:
+            control_rate = raw background (no 5mer)
+            5mer_baseline = mean(μ_5mer) for sites in this category
+            treated_rate = control_rate + 5mer_baseline + β_EMS
+            
+    Tests: Is β_EMS the same across categories?
+    
+    Args:
+        df: DataFrame with site-level data
+        categories: List of category names
+        method: GLM method ('poisson' or 'negative_binomial')
+        alpha: Background rate subtraction
+        kmer5_model: Loaded 5mer model object
+        genome_seqs: Loaded genome sequences dict
+        
+    Returns:
+        dict with results or None if failed
+    """
+    print("\n=== Clean Absolute Category Analysis ===")
+    print("Testing: Does EMS add the same absolute mutations/base across categories?")
+    print()
+    
+    # Step 1: Fit control model (NO 5mer) - raw background rates
+    print("Step 1: Estimating control baseline rates (no 5mer normalization)")
+    control_df = df[df['treatment'] == 0].copy()
+    
+    if control_df.empty:
+        print("  No control samples found")
+        return None
+    
+    # Build design matrix for control model
+    X_control = pd.DataFrame({'const': np.ones(len(control_df))})
+    for cat in categories[1:]:  # Skip intergenic (reference)
+        X_control[f'cat_{cat}'] = control_df[f'cat_{cat}'].values
+    
+    y_control = control_df['ems_count'].values
+    offset_control = np.log(control_df['depth'].values)
+    
+    print(f"  Control data check:")
+    print(f"    Total mutations (y_control.sum()): {y_control.sum()}")
+    print(f"    Total depth: {control_df['depth'].sum()}")
+    print(f"    Naive rate: {y_control.sum() / control_df['depth'].sum():.6e}")
+    
+    # Fit control model - use same approach as per-sample GLM
+    try:
+        if method == "negative_binomial":
+            fam = sm.families.NegativeBinomial()
+        else:
+            fam = sm.families.Poisson()
+        
+        model = sm.GLM(y_control, X_control, family=fam, offset=offset_control)
+        result_control = model.fit()
+    except Exception as e:
+        print(f"  Control model fitting failed: {e}")
+        return None
+    
+    # Extract control rates
+    beta0_control = result_control.params.get('const', 0.0)
+    print(f"  Model intercept (beta0): {beta0_control:.6f}")
+    print(f"  exp(beta0) = rate: {np.exp(beta0_control):.6e}")
+    
+    control_rates = {'intergenic': np.exp(beta0_control)}
+    for cat in categories[1:]:
+        beta_cat = result_control.params.get(f'cat_{cat}', 0.0)
+        control_rates[cat] = np.exp(beta0_control + beta_cat)
+    
+    print("  Control rates (raw background):")
+    for cat, rate in control_rates.items():
+        print(f"    {cat}: {rate:.6e}")
+    
+    # Step 2: Calculate 5mer baselines per category (WITHOUT EMS)
+    print("\nStep 2: Computing 5mer baselines for each category (baseline mutability from sequence context, no EMS)")
+    print("  Using treatment=0 to predict baseline mutability")
+    fivemer_baselines = {}
+    
+    for cat in categories:
+        cat_sites = df[df['category'] == cat].copy()
+        if cat_sites.empty:
+            fivemer_baselines[cat] = 0.0
+            continue
+        
+        # Extract 5mer contexts and predict rates for TREATED samples
+        # (5mer model captures EMS-specific sequence bias)
+        kmers = []
+        for chrom, pos in zip(cat_sites['chrom'].values, cat_sites['pos'].values):
+            kmer5 = extract_kmer(genome_seqs, str(chrom), int(pos), 5)
+            if kmer5 is None:
+                kmers.append(None)
+                continue
+            kmer5_canonical = canonical_kmer(kmer5)
+            kmers.append(kmer5_canonical if (kmer5_canonical and len(kmer5_canonical) == 5) else None)
+        
+        cat_sites['kmer5'] = kmers
+        valid_mask = cat_sites['kmer5'].notna()
+        
+        if valid_mask.sum() == 0:
+            fivemer_baselines[cat] = 0.0
+            continue
+        
+        # Predict 5mer baseline rates WITHOUT EMS (treatment=0)
+        # This gives the expected mutability from sequence context alone
+        # Only predict for unique kmer5 values to speed up
+        mean_depth = cat_sites['depth'].mean()
+        valid_sites = cat_sites.loc[valid_mask]
+        unique_kmers = valid_sites['kmer5'].unique()
+        
+        # Build prediction dict for unique kmers
+        kmer_rate_dict = {}
+        for kmer5 in unique_kmers:
+            rate = predict_5mer_rate(kmer5_model, kmer5, treatment=0, depth=mean_depth)
+            if np.isfinite(rate) and rate > 0:
+                kmer_rate_dict[kmer5] = rate
+        
+        if len(kmer_rate_dict) > 0:
+            # Map rates to sites and compute weighted mean by depth
+            valid_sites['predicted_rate'] = valid_sites['kmer5'].map(kmer_rate_dict)
+            valid_with_rates = valid_sites[valid_sites['predicted_rate'].notna()]
+            
+            if len(valid_with_rates) > 0:
+                fivemer_baselines[cat] = np.average(
+                    valid_with_rates['predicted_rate'].values,
+                    weights=valid_with_rates['depth'].values
+                )
+            else:
+                fivemer_baselines[cat] = 0.0
+        else:
+            fivemer_baselines[cat] = 0.0
+    
+    print("  5mer baselines (expected EMS mutability):")
+    for cat, baseline in fivemer_baselines.items():
+        print(f"    {cat}: {baseline:.6e}")
+    
+    # Step 3: Calculate expected counts under "no EMS effect" hypothesis
+    print("\nStep 3: Computing expected counts (control + 5mer baseline)")
+    df['expected_no_EMS'] = 0.0
+    for idx, row in df.iterrows():
+        cat = row['category']
+        if cat not in control_rates:
+            continue
+        
+        if row['treatment'] == 0:
+            # Controls: just background
+            df.loc[idx, 'expected_no_EMS'] = control_rates[cat] * row['depth']
+        else:
+            # Treated: background + 5mer baseline (but NO EMS effect yet)
+            df.loc[idx, 'expected_no_EMS'] = (control_rates[cat] + fivemer_baselines[cat]) * row['depth']
+    
+    # Step 4: Calculate excess (this is the EMS effect)
+    print("\nStep 4: Computing excess mutations (observed - expected)")
+    df['excess_EMS'] = df['ems_count'] - df['expected_no_EMS']
+    
+    # Check excess statistics
+    treated_excess = df[df['treatment'] == 1]['excess_EMS']
+    control_excess = df[df['treatment'] == 0]['excess_EMS']
+    print(f"  Treated excess: mean={treated_excess.mean():.2e}, median={treated_excess.median():.2e}")
+    print(f"  Control excess: mean={control_excess.mean():.2e}, median={control_excess.median():.2e}")
+    
+    # Step 5: Fit identity-link models to excess
+    print("\nStep 5: Fitting identity-link GLMs to excess mutations")
+    print("  (Testing if absolute EMS effect is constant across categories)")
+    
+    # Prepare design matrices - use depth as exposure
+    # Model: excess = depth * (β_treatment + β_treatment*cat)
+    df['depth_treatment'] = df['depth'] * df['treatment']
+    
+    # Simple model: constant EMS effect
+    X_simple = pd.DataFrame({
+        'depth_treatment': df['depth_treatment'].values
+    })
+    
+    # Interaction model: category-specific EMS effect
+    X_interaction = X_simple.copy()
+    for cat in categories[1:]:
+        X_interaction[f'depth_treatment_x_cat_{cat}'] = df['depth_treatment'] * df[f'cat_{cat}']
+    
+    y_excess = df['excess_EMS'].values
+    
+    try:
+        # Fit Gaussian GLM with identity link
+        model_simple = sm.GLM(y_excess, X_simple, family=sm.families.Gaussian())
+        result_simple = model_simple.fit()
+        
+        model_interaction = sm.GLM(y_excess, X_interaction, family=sm.families.Gaussian())
+        result_interaction = model_interaction.fit()
+        
+        print(f"  Simple model log-likelihood: {result_simple.llf:.2f}")
+        print(f"  Interaction model log-likelihood: {result_interaction.llf:.2f}")
+        
+        # Step 6: LRT test
+        print("\nStep 6: Likelihood Ratio Test (simple vs interaction)")
+        lr_stat = 2 * (result_interaction.llf - result_simple.llf)
+        df_diff = len(result_interaction.params) - len(result_simple.params)
+        p_value = stats.chi2.sf(lr_stat, df_diff)
+        
+        print(f"  LR statistic: {lr_stat:.4f}")
+        print(f"  df: {df_diff}")
+        print(f"  p-value: {p_value:.4e}")
+        
+        if p_value > 0.05:
+            print("  → Absolute EMS effect is CONSTANT across categories")
+        else:
+            print("  → Absolute EMS effect DIFFERS across categories")
+        
+        # Extract absolute effects per category
+        beta_treatment = result_interaction.params.get('depth_treatment', 0.0)
+        absolute_effects = {'intergenic': beta_treatment}
+        
+        for cat in categories[1:]:
+            beta_interaction = result_interaction.params.get(f'depth_treatment_x_cat_{cat}', 0.0)
+            absolute_effects[cat] = beta_treatment + beta_interaction
+        
+        print("\n  Absolute EMS effects (mutations per base added by EMS):")
+        for cat, effect in absolute_effects.items():
+            treated_rate = control_rates[cat] + fivemer_baselines[cat] + effect
+            print(f"    {cat}: {effect:.6e} (treated_rate = {treated_rate:.6e})")
+        
+        return {
+            'result_simple': result_simple,
+            'result_interaction': result_interaction,
+            'control_rates': control_rates,
+            'fivemer_baselines': fivemer_baselines,
+            'absolute_effects': absolute_effects,
+            'lrt_statistic': lr_stat,
+            'lrt_df': df_diff,
+            'lrt_p_value': p_value,
+            'df_modified': df
+        }
+        
+    except Exception as e:
+        print(f"  Identity-link model fitting failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def _fit_absolute_effect_model(df, categories, method, alpha, log_5mer_offset=None, log_5mer_offset_control=None):
     """
     Fit constant absolute effect model.
@@ -1848,20 +2090,17 @@ def _calculate_rates_and_cis(result, categories, use_treatment_covariate, contro
         beta_syn_control = control_baseline_result['beta_syn_control']
         beta_nonsyn_control = control_baseline_result['beta_nonsyn_control']
         
-        # Control rates
-        # If 5mer normalization was used, multiply by mean expected rate to get actual rates
+        # Control rates (RAW - no 5mer normalization applied to controls)
+        # Controls represent background/sequencing error, not EMS mutations
         control_rates = {
             'intergenic': np.exp(beta0_control),
             'synonymous': np.exp(beta0_control + beta_syn_control),
             'non_synonymous': np.exp(beta0_control + beta_nonsyn_control)
         }
         
-        # Apply 5mer normalization scaling if available
-        if mean_expected_rates is not None:
-            for cat in control_rates:
-                key = f'{cat}_control'
-                if key in mean_expected_rates and np.isfinite(mean_expected_rates[key]):
-                    control_rates[cat] = control_rates[cat] * mean_expected_rates[key]
+        # DON'T apply 5mer normalization to control rates!
+        # The control model was fit WITHOUT 5mer offset, so exp(beta) gives actual rates
+        # Only treated samples are 5mer normalized in our approach
         
         # Control CIs (from result_control)
         try:
@@ -2580,15 +2819,35 @@ def _save_results(summary_df, test_df, result, output_dir, kmer5_normalized=Fals
         
         f.write(f"\n=== STATISTICAL TESTS ===\n\n")
         if not test_df.empty:
-            f.write(f"{'Test':<35} {'Coefficient':<20} {'Estimate':<12} {'SE':<12} {'z':<10} {'p_value':<12} {'Rate_Ratio':<15}\n")
-            f.write("-" * 120 + "\n")
-            for _, row in test_df.iterrows():
-                sig = "***" if row['p_value'] < 0.001 else "**" if row['p_value'] < 0.01 else "*" if row['p_value'] < 0.05 else ""
-                f.write(f"{row['test']:<35} {row['coefficient']:<20} {row['estimate']:<12.6f} {row['SE']:<12.6f} {row['z']:<10.3f} {row['p_value']:<12.6e} {row['rate_ratio']:<15.6f} {sig}\n")
+            # Check if this is clean absolute analysis format (has 'statistic' column) or old format (has 'coefficient' column)
+            is_clean_absolute = 'statistic' in test_df.columns and 'coefficient' not in test_df.columns
+            
+            if is_clean_absolute:
+                # Clean absolute analysis format
+                f.write(f"{'Test':<60} {'LR_Statistic':<15} {'df':<8} {'p_value':<12}\n")
+                f.write("-" * 100 + "\n")
+                for _, row in test_df.iterrows():
+                    sig = "***" if row['p_value'] < 0.001 else "**" if row['p_value'] < 0.01 else "*" if row['p_value'] < 0.05 else ""
+                    f.write(f"{row['test']:<60} {row.get('statistic', np.nan):<15.4f} {row.get('df', 0):<8d} {row['p_value']:<12.6e} {sig}\n")
+                    # Add absolute effects if present
+                    if 'absolute_effect_intergenic' in row:
+                        f.write(f"  Absolute effects (mutations/base added by EMS):\n")
+                        f.write(f"    Intergenic:     {row['absolute_effect_intergenic']:.6e}\n")
+                        f.write(f"    Synonymous:     {row['absolute_effect_synonymous']:.6e}\n")
+                        f.write(f"    Non-synonymous: {row['absolute_effect_non_synonymous']:.6e}\n")
+            else:
+                # Old format
+                f.write(f"{'Test':<35} {'Coefficient':<20} {'Estimate':<12} {'SE':<12} {'z':<10} {'p_value':<12} {'Rate_Ratio':<15}\n")
+                f.write("-" * 120 + "\n")
+                for _, row in test_df.iterrows():
+                    sig = "***" if row['p_value'] < 0.001 else "**" if row['p_value'] < 0.01 else "*" if row['p_value'] < 0.05 else ""
+                    f.write(f"{row['test']:<35} {row['coefficient']:<20} {row['estimate']:<12.6f} {row['SE']:<12.6f} {row['z']:<10.3f} {row['p_value']:<12.6e} {row['rate_ratio']:<15.6f} {sig}\n")
         
-        f.write(f"\nModel fit statistics:\n")
-        f.write(f"  AIC: {result.aic:.2f}\n")
-        f.write(f"  Log-likelihood: {result.llf:.2f}\n")
+        # Model fit statistics (only if result object has these attributes)
+        if result is not None and hasattr(result, 'aic') and hasattr(result, 'llf'):
+            f.write(f"\nModel fit statistics:\n")
+            f.write(f"  AIC: {result.aic:.2f}\n")
+            f.write(f"  Log-likelihood: {result.llf:.2f}\n")
     
     print(f"Category rates report saved to {report_path}")
 
@@ -2697,7 +2956,8 @@ def _compute_5mer_offsets(df: pd.DataFrame, kmer5_model_path: str, genome_fasta:
 
 def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str = "poisson", 
                             use_treatment_covariate: bool = True, alpha: float = 0.0,
-                            use_control_baseline: bool = False, 
+                            use_control_baseline: bool = False,
+                            use_absolute_analysis: bool = False,
                             kmer5_model_path: str = None, genome_fasta: str = None):
     """
     Compare mutation rates across categories (intergenic, synonymous, non-synonymous).
@@ -2711,6 +2971,7 @@ def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str =
         use_treatment_covariate: Include treatment covariate in model
         alpha: Background rate subtraction
         use_control_baseline: Use control-baseline modeling approach
+        use_absolute_analysis: Use clean absolute effect model with 5mer baseline (requires kmer5_model_path)
         kmer5_model_path: Path to fitted 5mer model (optional, for sequence context normalization)
         genome_fasta: Path to genome FASTA file (required if kmer5_model_path provided)
     """
@@ -2724,95 +2985,170 @@ def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str =
     df['log_depth'] = np.log(df['depth'].values)
     df['treatment'] = (~df['is_control']).astype(int).values
     
-    # Add 5mer normalization if model provided
-    log_5mer_offset = None
-    log_5mer_offset_control = None  # Control-only 5mer offsets for absolute effect model
-    mean_expected_rates = None  # Will store mean expected rates per category/treatment
-    if kmer5_model_path is not None and genome_fasta is not None:
-        print("Computing 5mer-based expected rates for sequence context normalization...")
-        log_5mer_offset = _compute_5mer_offsets(df, kmer5_model_path, genome_fasta)
-        if log_5mer_offset is not None:
-            print(f"✓ 5mer offsets computed for {(~pd.isna(log_5mer_offset)).sum()} sites")
-            
-            # Compute CONTROL-only 5mer offsets for absolute effect model
-            # This ensures expected_control_count uses control 5mer rates for ALL sites
-            print("Computing CONTROL 5mer offsets for absolute effect model...")
-            log_5mer_offset_control = _compute_5mer_offsets(df, kmer5_model_path, genome_fasta, 
-                                                            force_treatment_value=0)
-            if log_5mer_offset_control is not None:
-                print(f"✓ Control 5mer offsets computed for {(~pd.isna(log_5mer_offset_control)).sum()} sites")
-            
-            # Calculate mean expected rates per category and treatment for rate recovery
-            # This is needed to convert exp(coefficients) back to actual rates
-            df['log_5mer_offset'] = log_5mer_offset
-            mean_expected_rates = {}
-            categories_for_mean = ['intergenic', 'synonymous', 'non_synonymous']
-            for cat in categories_for_mean:
-                for is_control in [True, False]:
-                    treatment_label = 'control' if is_control else 'treated'
-                    mask = (df['category'] == cat) & (df['is_control'] == is_control) & df['log_5mer_offset'].notna()
-                    if mask.sum() > 0:
-                        # Weighted mean of expected rates (weighted by depth)
-                        weights = df.loc[mask, 'depth'].values
-                        log_offsets = df.loc[mask, 'log_5mer_offset'].values
-                        # Mean of log gives geometric mean; use weighted arithmetic mean of exp
-                        expected_rates = np.exp(log_offsets)
-                        mean_expected_rate = np.average(expected_rates, weights=weights)
-                        mean_expected_rates[f'{cat}_{treatment_label}'] = mean_expected_rate
-                        print(f"  Mean expected rate for {cat} ({treatment_label}): {mean_expected_rate:.6e}")
-                    else:
-                        mean_expected_rates[f'{cat}_{treatment_label}'] = np.nan
-            print(f"✓ Mean expected rates computed per category/treatment")
-        else:
-            print("⚠ Warning: 5mer offset computation failed, proceeding without normalization")
-    
     # Create category dummy variables (intergenic as reference)
     categories = ['intergenic', 'synonymous', 'non_synonymous']
     for cat in categories[1:]:
         df[f'cat_{cat}'] = (df['category'] == cat).astype(int)
     
-    # Try control-baseline model first if requested
+    # Initialize variables
     control_baseline_result = None
     absolute_effect_result = None
     result = None
+    mean_expected_rates = None
     
-    if use_control_baseline and use_treatment_covariate:
-        # Try absolute effect model first (answers the constant absolute effect question)
-        # Pass control-only 5mer offsets for computing expected_control_count
-        absolute_effect_result = _fit_absolute_effect_model(df, categories, method, alpha, 
-                                                            log_5mer_offset, log_5mer_offset_control)
-        
-        # Also fit control-baseline model (for comparison)
-        control_baseline_result = _fit_control_baseline_model(df, categories, method, alpha, log_5mer_offset)
-        
-        if absolute_effect_result is not None:
-            # Use absolute effect model's interaction result for rate extraction
-            # (it has same structure as control-baseline interaction model)
-            result = absolute_effect_result['result_interaction']
-            df = absolute_effect_result['df_modified']
-            print("✓ Absolute effect model succeeded")
-        elif control_baseline_result is not None:
-            result = control_baseline_result['result_interaction']
-            df = control_baseline_result['df_modified']
-            print("✓ Control-baseline model succeeded")
-        else:
-            print("Both absolute effect and control-baseline models failed, falling back to standard model")
-    
-    # Fit standard model if control-baseline not used or failed
-    if result is None:
-        result = _fit_standard_model(df, categories, method, alpha, use_treatment_covariate, log_5mer_offset)
-        if result is None:
-            print("⚠ Warning: Category comparison failed")
+    # NEW: Clean absolute analysis approach (when flag is set)
+    if use_absolute_analysis:
+        if kmer5_model_path is None or genome_fasta is None:
+            print("ERROR: --absolute-category-analysis requires --kmer5-model-path and --genome-fasta")
             return None
+        
+        print("Using CLEAN ABSOLUTE CATEGORY ANALYSIS approach")
+        print("=" * 70)
+        
+        # Load 5mer model and genome sequences
+        try:
+            kmer5_model = load_5mer_model(kmer5_model_path)
+            genome_seqs = load_genome_sequences(genome_fasta)
+        except Exception as e:
+            print(f"ERROR loading 5mer model or genome: {e}")
+            return None
+        
+        # Run clean absolute analysis
+        clean_result = _fit_clean_absolute_analysis(df, categories, method, alpha, kmer5_model, genome_seqs)
+        
+        if clean_result is None:
+            print("⚠ Warning: Clean absolute analysis failed")
+            return None
+        
+        # Extract results for saving
+        result = clean_result['result_interaction']
+        df = clean_result['df_modified']
+        
+        # Create rates dict from clean analysis results
+        rates = {}
+        cis = {}
+        control_rates = clean_result['control_rates']
+        fivemer_baselines = clean_result['fivemer_baselines']
+        absolute_effects = clean_result['absolute_effects']
+        
+        # For each category, compute control and treated rates
+        for cat in categories:
+            # Control rate (raw background)
+            control_rate = control_rates[cat]
+            rates[f'{cat}_control'] = control_rate
+            cis[f'{cat}_control'] = (np.nan, np.nan)  # TODO: compute CIs
+            
+            # Treated rate = control + 5mer baseline + absolute EMS effect
+            treated_rate = control_rate + fivemer_baselines[cat] + absolute_effects[cat]
+            rates[f'{cat}_treated'] = treated_rate
+            cis[f'{cat}_treated'] = (np.nan, np.nan)  # TODO: compute CIs
+            
+            # Store absolute effect
+            rates[f'absolute_effect_{cat}'] = absolute_effects[cat]
+        
+        # Create test results
+        test_results = [{
+            'test': 'Clean absolute effect model: constant EMS effect across categories',
+            'statistic': clean_result['lrt_statistic'],
+            'p_value': clean_result['lrt_p_value'],
+            'df': clean_result['lrt_df'],
+            'absolute_effect_intergenic': absolute_effects['intergenic'],
+            'absolute_effect_synonymous': absolute_effects['synonymous'],
+            'absolute_effect_non_synonymous': absolute_effects['non_synonymous']
+        }]
+        
+        # Skip to saving results (no need for old approach)
+        control_baseline_result = None
+        absolute_effect_result = clean_result
+        mean_expected_rates = None
+        
+    else:
+        # OLD APPROACH: Use existing logic
+        # Add 5mer normalization if model provided
+        log_5mer_offset = None
+        log_5mer_offset_control = None  # Control-only 5mer offsets for absolute effect model
+        mean_expected_rates = None  # Will store mean expected rates per category/treatment
+        if kmer5_model_path is not None and genome_fasta is not None:
+            print("Computing 5mer-based expected rates for sequence context normalization...")
+            log_5mer_offset = _compute_5mer_offsets(df, kmer5_model_path, genome_fasta)
+            if log_5mer_offset is not None:
+                print(f"✓ 5mer offsets computed for {(~pd.isna(log_5mer_offset)).sum()} sites")
+                
+                # Compute CONTROL-only 5mer offsets for absolute effect model
+                # This ensures expected_control_count uses control 5mer rates for ALL sites
+                print("Computing CONTROL 5mer offsets for absolute effect model...")
+                log_5mer_offset_control = _compute_5mer_offsets(df, kmer5_model_path, genome_fasta, 
+                                                                force_treatment_value=0)
+                if log_5mer_offset_control is not None:
+                    print(f"✓ Control 5mer offsets computed for {(~pd.isna(log_5mer_offset_control)).sum()} sites")
+                
+                # Calculate mean expected rates per category and treatment for rate recovery
+                # This is needed to convert exp(coefficients) back to actual rates
+                df['log_5mer_offset'] = log_5mer_offset
+                mean_expected_rates = {}
+                categories_for_mean = ['intergenic', 'synonymous', 'non_synonymous']
+                for cat in categories_for_mean:
+                    for is_control in [True, False]:
+                        treatment_label = 'control' if is_control else 'treated'
+                        mask = (df['category'] == cat) & (df['is_control'] == is_control) & df['log_5mer_offset'].notna()
+                        if mask.sum() > 0:
+                            # Weighted mean of expected rates (weighted by depth)
+                            weights = df.loc[mask, 'depth'].values
+                            log_offsets = df.loc[mask, 'log_5mer_offset'].values
+                            # Mean of log gives geometric mean; use weighted arithmetic mean of exp
+                            expected_rates = np.exp(log_offsets)
+                            mean_expected_rate = np.average(expected_rates, weights=weights)
+                            mean_expected_rates[f'{cat}_{treatment_label}'] = mean_expected_rate
+                            print(f"  Mean expected rate for {cat} ({treatment_label}): {mean_expected_rate:.6e}")
+                        else:
+                            mean_expected_rates[f'{cat}_{treatment_label}'] = np.nan
+                print(f"✓ Mean expected rates computed per category/treatment")
+            else:
+                print("⚠ Warning: 5mer offset computation failed, proceeding without normalization")
+        
+        # Try control-baseline model first if requested
+        control_baseline_result = None
+        absolute_effect_result = None
+        result = None
+        
+        if use_control_baseline and use_treatment_covariate:
+            # Try absolute effect model first (answers the constant absolute effect question)
+            # Pass control-only 5mer offsets for computing expected_control_count
+            absolute_effect_result = _fit_absolute_effect_model(df, categories, method, alpha, 
+                                                                log_5mer_offset, log_5mer_offset_control)
+            
+            # Also fit control-baseline model (for comparison)
+            control_baseline_result = _fit_control_baseline_model(df, categories, method, alpha, log_5mer_offset)
+            
+            if absolute_effect_result is not None:
+                # Use absolute effect model's interaction result for rate extraction
+                # (it has same structure as control-baseline interaction model)
+                result = absolute_effect_result['result_interaction']
+                df = absolute_effect_result['df_modified']
+                print("✓ Absolute effect model succeeded")
+            elif control_baseline_result is not None:
+                result = control_baseline_result['result_interaction']
+                df = control_baseline_result['df_modified']
+                print("✓ Control-baseline model succeeded")
+            else:
+                print("Both absolute effect and control-baseline models failed, falling back to standard model")
+        
+        # Fit standard model if control-baseline not used or failed
+        if result is None:
+            result = _fit_standard_model(df, categories, method, alpha, use_treatment_covariate, log_5mer_offset)
+            if result is None:
+                print("⚠ Warning: Category comparison failed")
+                return None
+        
+        # Calculate rates and CIs using old approach
+        # Use absolute_effect_result if available, otherwise control_baseline_result
+        baseline_result = absolute_effect_result if absolute_effect_result is not None else control_baseline_result
+        rates, cis = _calculate_rates_and_cis(result, categories, use_treatment_covariate, baseline_result, mean_expected_rates)
+        
+        # Run statistical tests
+        test_results = _run_statistical_tests(result, df, rates, cis, use_treatment_covariate, 
+                                              control_baseline_result, absolute_effect_result)
     
-    # Calculate rates and CIs
-    # Use absolute_effect_result if available, otherwise control_baseline_result
-    baseline_result = absolute_effect_result if absolute_effect_result is not None else control_baseline_result
-    rates, cis = _calculate_rates_and_cis(result, categories, use_treatment_covariate, baseline_result, mean_expected_rates)
-    
-    # Run statistical tests
-    test_results = _run_statistical_tests(result, df, rates, cis, use_treatment_covariate, 
-                                          control_baseline_result, absolute_effect_result)
     
     # Create summary DataFrames
     summary_rows = []
@@ -2832,7 +3168,8 @@ def compare_category_rates(site_df: pd.DataFrame, output_dir: str, method: str =
     test_df = pd.DataFrame(test_results)
     
     # Add 5mer normalization flag to summary
-    summary_df['5mer_normalized'] = mean_expected_rates is not None
+    summary_df['5mer_normalized'] = (mean_expected_rates is not None) or use_absolute_analysis
+    summary_df['clean_absolute_analysis'] = use_absolute_analysis
     
     # Add absolute effect values to summary if available
     if 'absolute_effect_intergenic' in rates:
@@ -4800,6 +5137,8 @@ def main():
                         help="Path to codon table JSON file (optional, defaults to data/references/11.json)")
     parser.add_argument("--compare-categories", action="store_true",
                         help="Compare mutation rates across categories (intergenic, synonymous, non-synonymous)")
+    parser.add_argument("--absolute-category-analysis", action="store_true",
+                        help="Use absolute effect model with 5mer baseline for category analysis (requires --kmer5-model-path)")
     parser.add_argument("--compare-treatment-days", action="store_true",
                         help="Compare mutation rates across treatment days (3d, 7d, no_label) in treated samples")
     parser.add_argument("--kmer5-normalized-windows", action="store_true",
@@ -5189,6 +5528,7 @@ def main():
                         use_treatment_covariate=use_treatment_covariate,
                         alpha=alpha if not use_treatment_covariate else 0.0,
                         use_control_baseline=True,  # Use control-baseline approach to test if category matters
+                        use_absolute_analysis=args.absolute_category_analysis,  # Clean absolute effect model with 5mer baseline
                         kmer5_model_path=args.kmer5_model_path,  # 5mer normalization for sequence context
                         genome_fasta=args.genome_fasta
                     )

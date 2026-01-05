@@ -11,13 +11,14 @@ Creates a single multiplot figure with:
 import argparse
 import os
 import re
+import json
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 from matplotlib import rcParams
-from matplotlib.ticker import ScalarFormatter, LogLocator, MaxNLocator
+from matplotlib.ticker import ScalarFormatter, LogLocator, MaxNLocator, LogFormatterSciNotation
 import seaborn as sns
 import scipy.stats as stats
 from statsmodels.stats.multitest import multipletests
@@ -27,12 +28,12 @@ from collections import defaultdict
 plt.style.use('seaborn-v0_8-whitegrid')
 rcParams['font.family'] = 'sans-serif'
 rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'Helvetica']
-rcParams['font.size'] = 22
-rcParams['axes.labelsize'] = 26
-rcParams['axes.titlesize'] = 30
-rcParams['xtick.labelsize'] = 20
-rcParams['ytick.labelsize'] = 20
-rcParams['legend.fontsize'] = 20
+rcParams['font.size'] = 28
+rcParams['axes.labelsize'] = 32
+rcParams['axes.titlesize'] = 36
+rcParams['xtick.labelsize'] = 24
+rcParams['ytick.labelsize'] = 24
+rcParams['legend.fontsize'] = 24
 rcParams['figure.dpi'] = 300
 rcParams['savefig.dpi'] = 300
 rcParams['savefig.bbox'] = 'tight'
@@ -107,24 +108,25 @@ def load_data(output_dir):
         data['glm_per_sample'] = None
     
     # Load category rates
-    # Prefer category_rates_nb_glm.tsv which has actual mutation rates (not log/model coefficients)
-    # The summary file with 5mer normalization may have values on log scale that aren't directly plottable
-    category_path = os.path.join(output_dir, 'category_comparison', 'category_rates_nb_glm.tsv')
+    # Prefer category_rates_summary.tsv which contains the corrected rates with 5mer normalization
+    # This file is now generated with proper 5mer handling (only applied to treated samples)
+    category_path = os.path.join(output_dir, 'category_comparison', 'category_rates_summary.tsv')
     if not os.path.exists(category_path):
-        # Fall back to summary file
-        category_path = os.path.join(output_dir, 'category_comparison', 'category_rates_summary.tsv')
+        # Fall back to nb_glm file (older format without 5mer normalization)
+        category_path = os.path.join(output_dir, 'category_comparison', 'category_rates_nb_glm.tsv')
     if os.path.exists(category_path):
         data['category_rates'] = pd.read_csv(category_path, sep='\t')
-        # Check if rates are on log scale (negative values) - if so, use nb_glm for plotting
-        if 'rate' in data['category_rates'].columns:
+        # Check for invalid rates (negative or near-zero controls)
+        if 'rate' in data['category_rates'].columns and 'treatment' in data['category_rates'].columns:
+            control_rates = data['category_rates'][data['category_rates']['treatment'] == 'control']['rate']
             treated_rates = data['category_rates'][data['category_rates']['treatment'] == 'treated']['rate']
+            # If control rates are suspiciously low (< 1e-8), data may be corrupted
+            if len(control_rates) > 0 and (control_rates < 1e-8).any():
+                print(f"Warning: {category_path} has suspiciously low control rates (< 1e-8), may indicate a bug")
+                print(f"  Control rate range: {control_rates.min():.2e} to {control_rates.max():.2e}")
+            # If treated rates are negative, data is on wrong scale
             if len(treated_rates) > 0 and (treated_rates < 0).any():
-                # Rates are on log scale (from 5mer normalization), use nb_glm for actual rates
-                alt_path = os.path.join(output_dir, 'category_comparison', 'category_rates_nb_glm.tsv')
-                if alt_path != category_path and os.path.exists(alt_path):
-                    print(f"Note: {category_path} has 5mer-normalized log-scale values, using {alt_path} for plotting")
-                    data['category_rates'] = pd.read_csv(alt_path, sep='\t')
-                    category_path = alt_path
+                print(f"Warning: {category_path} has negative rates, data may be on wrong scale")
         print(f"Loaded category rates from: {category_path}")
     else:
         print(f"Warning: Category rates file not found in {output_dir}/category_comparison/")
@@ -231,10 +233,11 @@ def plot_glm_per_sample(ax, df):
     # Format sample labels using proper function
     labels = df['sample'].apply(derive_sample_label)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=20)
+    ax.set_yticklabels(labels, fontsize=14)
     
     # Format x-axis with more ticks for better readability
-    ax.set_xlabel('Mutation Rate (per base)', fontsize=28, fontweight='bold', labelpad=25)
+    # Reduced labelpad to create space for panel 3 label
+    ax.set_xlabel('Mutation Rate (per base)', fontsize=32, fontweight='bold', labelpad=5)
     ax.set_xscale('log')
     
     # Set explicit ticks covering the typical range of mutation rates
@@ -249,14 +252,14 @@ def plot_glm_per_sample(ax, df):
     # Add minor ticks for finer resolution
     ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=20))
     
-    ax.tick_params(axis='x', labelsize=20, pad=12, which='major')
-    ax.tick_params(axis='y', labelsize=20, pad=10)
+    ax.tick_params(axis='x', labelsize=28, pad=15, which='major')
+    ax.tick_params(axis='y', labelsize=14, pad=8)
     
     # Add legend - use plot_ems_spectra colors
     control_patch = mpatches.Patch(color=NT_GREY, label='Control', alpha=0.8)
     treated_patch = mpatches.Patch(color=TREATED_COLORS[1], label='Treated', alpha=0.8)
     ax.legend(handles=[control_patch, treated_patch], loc='lower right', frameon=True, 
-              fancybox=True, shadow=True, fontsize=20, framealpha=0.9)
+              fancybox=True, shadow=True, fontsize=28, framealpha=0.9)
     
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, axis='x')
     
@@ -329,59 +332,47 @@ def plot_control_baseline_model_comparison(fig, category_df, tests_df):
     ax1.yaxis.set_major_formatter(fmt)
     ax1.tick_params(axis='y', labelsize=18, pad=10)
     
-    # Panel 2: Treatment effects - show BOTH absolute and fold-change
+    # Panel 2: Absolute treatment effects - simple, let data speak
     ax2 = fig.add_subplot(gs[0, 1])
     
-    # Calculate both absolute effects and fold-changes
+    # Calculate absolute effects
     absolute_effects = []
-    fold_changes = []
     categories_ordered = []
+    
     for cat in control_df['category']:
         control_rate = control_df[control_df['category'] == cat]['rate'].values[0]
         treated_rate = treated_df[treated_df['category'] == cat]['rate'].values[0]
         if control_rate > 0:
             absolute_effect = treated_rate - control_rate
-            fold_change = treated_rate / control_rate
             absolute_effects.append(absolute_effect)
-            fold_changes.append(fold_change)
             categories_ordered.append(cat)
     
     x_pos2 = np.arange(len(absolute_effects))
     labels2 = [category_labels.get(cat, cat) for cat in categories_ordered]
     
-    # Plot absolute effects (primary)
-    bars2 = ax2.bar(x_pos2, absolute_effects, color=TREATED_COLORS[1], alpha=0.7,
-                   edgecolor='black', linewidth=1, width=0.6, label='Absolute effect')
+    # Plot absolute effects on log scale
+    bars2 = ax2.bar(x_pos2, absolute_effects, color=TREATED_COLORS[1], alpha=0.8,
+                   edgecolor='black', linewidth=1.5, width=0.6)
     
-    # Add horizontal line at 0 (no change)
-    ax2.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.7)
-    
-    # Add absolute effect values on bars
-    for bar, abs_eff in zip(bars2, absolute_effects):
-        height = bar.get_height()
-        y_pos = height + abs_eff * 0.05 if abs_eff >= 0 else height + abs_eff * 0.05
-        ax2.text(bar.get_x() + bar.get_width()/2., y_pos,
-                f'{abs_eff:.2e}', ha='center', 
-                va='bottom' if abs_eff >= 0 else 'top', 
-                fontsize=14, fontweight='bold')
-    
-    # Also show fold-change as text below bars
-    for i, (bar, fc) in enumerate(zip(bars2, fold_changes)):
-        ax2.text(bar.get_x() + bar.get_width()/2., -max(absolute_effects) * 0.15,
-                f'({fc:.2f}x)', ha='center', va='top', 
-                fontsize=12, style='italic', color='gray')
+    # Set log scale
+    ax2.set_yscale('log')
     
     ax2.set_xticks(x_pos2)
     ax2.set_xticklabels(labels2, fontsize=18, fontweight='bold', rotation=15, ha='right')
-    ax2.set_ylabel('Absolute Effect (Treated - Control)', fontsize=22, fontweight='bold', labelpad=20)
-    ax2.set_title('Treatment Effect\n(Absolute & Fold-change)', fontsize=24, fontweight='bold', pad=15)
-    ax2.legend(fontsize=16)
-    ax2.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, axis='y')
+    ax2.set_ylabel('Absolute Treatment Effect\n(Treated - Control)', fontsize=22, fontweight='bold', labelpad=20)
+    ax2.set_title('Treatment Effect by Category', fontsize=24, fontweight='bold', pad=15)
+    
+    ax2.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, axis='y', which='both')
     ax2.tick_params(axis='y', labelsize=18, pad=10)
     
-    # Adjust y-axis to show both positive and negative space for labels
-    max_abs = max([abs(x) for x in absolute_effects])
-    ax2.set_ylim(bottom=-max_abs * 0.25, top=max_abs * 1.2)
+    # Format y-axis with scientific notation
+    fmt = ScalarFormatter(useMathText=True)
+    fmt.set_scientific(True)
+    fmt.set_powerlimits((-3, 3))
+    ax2.yaxis.set_major_formatter(fmt)
+    
+    # Add minor ticks
+    ax2.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=20))
     
     # Panel 3: Statistical test results - show if treatment effect is constant
     ax3 = fig.add_subplot(gs[0, 2])
@@ -697,22 +688,21 @@ def plot_control_baseline_comparison(ax, tests_df):
 
 
 def plot_category_significances(ax, category_df, tests_df):
-    """Plot mutation category rates comparing control vs treated.
+    """Plot absolute EMS effects by category (from clean absolute analysis).
     
     Shows:
-    - Grouped bar plot with control and treated rates by category
-    - Error bars for confidence intervals
-    - Significance annotations
+    - Bar plot of absolute EMS effects (mutations/base added by EMS) by category
+    - This directly answers: Does EMS add the same absolute mutations/base to intergenic vs genic?
     """
     if category_df is None or category_df.empty:
         ax.text(0.5, 0.5, 'No category data available', 
                 ha='center', va='center', transform=ax.transAxes, fontsize=24)
         return
     
-    # Check if we have absolute effect data
-    has_absolute_effects = 'absolute_effect' in category_df.columns
+    # Check if we have absolute effect data from clean absolute analysis
+    has_absolute_effects = 'absolute_effect' in category_df.columns and category_df['clean_absolute_analysis'].any() if 'clean_absolute_analysis' in category_df.columns else False
     
-    # Filter to treated and control samples
+    # Get treated and control data
     treated_df = category_df[category_df['treatment'] == 'treated'].copy()
     control_df = category_df[category_df['treatment'] == 'control'].copy()
     
@@ -731,53 +721,52 @@ def plot_category_significances(ax, category_df, tests_df):
         return
     
     # Sort both dataframes by category to ensure alignment
-    # Use a consistent order: intergenic, synonymous, non_synonymous
     category_order = ['intergenic', 'synonymous', 'non_synonymous']
     treated_df['cat_order'] = treated_df['category'].apply(lambda x: category_order.index(x) if x in category_order else 99)
     control_df['cat_order'] = control_df['category'].apply(lambda x: category_order.index(x) if x in category_order else 99)
     treated_df = treated_df.sort_values('cat_order')
     control_df = control_df.sort_values('cat_order')
     
-    # Get categories present in both
+    # Get categories present
     categories = treated_df['category'].tolist()
     n_categories = len(categories)
     
-    # Set up grouped bar positions - bars should fill the plot
-    bar_width = 0.35  # Width of each bar
-    group_spacing = 1.0  # Space between category groups
-    x_pos = np.arange(n_categories) * group_spacing  # Category group centers
+    # Set up grouped bar positions
+    bar_width = 0.35
+    group_spacing = 1.0
+    x_pos = np.arange(n_categories) * group_spacing
     
-    # Colors: grey for control, orange-red gradient for treated
-    control_color = NT_GREY  # Grey for controls
-    # Use distinct orange-red colors for treated (darker orange to make it pop)
-    treated_colors = ['#FF8C00', '#FF6B35', '#E63946']  # Dark orange, orange-red, red
+    # Colors
+    control_color = NT_GREY
+    treated_color = TREATED_COLORS[1]  # Orange-red
     
     # Plot control bars (left side of each group)
-    if not control_df.empty:
-        control_rates = []
+    control_rates = []
+    for cat in categories:
+        cat_data = control_df[control_df['category'] == cat]
+        if not cat_data.empty:
+            control_rates.append(cat_data['rate'].values[0])
+        else:
+            control_rates.append(np.nan)
+    
+    control_rates = np.array(control_rates)
+    bars_ctrl = ax.bar(x_pos - bar_width/2, control_rates, bar_width, 
+                      color=control_color, alpha=0.8,
+                      edgecolor='black', linewidth=1.5, label='Control')
+    
+    # Add error bars for control if available
+    if 'CI_low' in control_df.columns and 'CI_high' in control_df.columns:
         control_ci_low = []
         control_ci_high = []
         for cat in categories:
             cat_data = control_df[control_df['category'] == cat]
             if not cat_data.empty:
-                control_rates.append(cat_data['rate'].values[0])
-                if 'CI_low' in cat_data.columns:
-                    control_ci_low.append(cat_data['CI_low'].values[0])
-                    control_ci_high.append(cat_data['CI_high'].values[0])
-                else:
-                    control_ci_low.append(np.nan)
-                    control_ci_high.append(np.nan)
+                control_ci_low.append(cat_data['CI_low'].values[0])
+                control_ci_high.append(cat_data['CI_high'].values[0])
             else:
-                control_rates.append(np.nan)
                 control_ci_low.append(np.nan)
                 control_ci_high.append(np.nan)
         
-        control_rates = np.array(control_rates)
-        bars_ctrl = ax.bar(x_pos - bar_width/2, control_rates, bar_width, 
-                          color=control_color, alpha=0.8,
-                          edgecolor='black', linewidth=1.5, label='Control')
-        
-        # Add error bars for control
         if not all(np.isnan(control_ci_low)):
             yerr_low = control_rates - np.array(control_ci_low)
             yerr_high = np.array(control_ci_high) - control_rates
@@ -785,21 +774,50 @@ def plot_category_significances(ax, category_df, tests_df):
                        yerr=[yerr_low, yerr_high], fmt='none',
                        color='black', capsize=4, capthick=1.5, elinewidth=1.5, alpha=0.8)
     
-    # Plot treated bars (right side of each group) with gradient colors
+    # Plot treated bars (right side of each group)
     treated_rates = treated_df['rate'].values
     bars_treated = ax.bar(x_pos + bar_width/2, treated_rates, bar_width,
-                         color=treated_colors[1], alpha=0.8,  # Use medium orange-red
+                         color=treated_color, alpha=0.8,
                          edgecolor='black', linewidth=1.5, label='Treated')
     
-    # Add error bars for treated
+    # Add error bars for treated if available
     if 'CI_low' in treated_df.columns and 'CI_high' in treated_df.columns:
-        yerr_low = treated_df['rate'].values - treated_df['CI_low'].values
-        yerr_high = treated_df['CI_high'].values - treated_df['rate'].values
+        yerr_low = treated_rates - treated_df['CI_low'].values
+        yerr_high = treated_df['CI_high'].values - treated_rates
         ax.errorbar(x_pos + bar_width/2, treated_rates,
                    yerr=[yerr_low, yerr_high], fmt='none',
                    color='black', capsize=4, capthick=1.5, elinewidth=1.5, alpha=0.8)
     
-    # Format category labels
+    # Set y-axis range to clearly show controls (~10^-5) and treated (~10^-4)
+    all_rates = list(treated_rates)
+    all_rates.extend([r for r in control_rates if not np.isnan(r)])
+    min_rate = min(all_rates)
+    max_rate = max(all_rates)
+    
+    # Format y-axis (linear scale) - shows controls are small, treated are larger
+    # The gaps between them (absolute effects) will look similar across categories
+    ax.set_ylabel('Mutation Rate (per base)', fontsize=32, fontweight='bold', labelpad=25)
+    
+    # Set y-axis limits to span from 0 to above treated rates
+    y_min = 0
+    y_max = 3e-4  # Round number above max treated rate
+    ax.set_ylim(y_min, y_max)
+    
+    # Set explicit ticks at nice round numbers
+    tick_values = [0, 5e-5, 1e-4, 1.5e-4, 2e-4, 2.5e-4, 3e-4]
+    ax.set_yticks(tick_values)
+    
+    # Use ScalarFormatter for scientific notation
+    fmt = ScalarFormatter(useMathText=True)
+    fmt.set_scientific(True)
+    fmt.set_powerlimits((-3, 3))
+    ax.yaxis.set_major_formatter(fmt)
+    
+    # Add legend in top right
+    ax.legend(loc='upper right', fontsize=28, frameon=True, fancybox=True, 
+              shadow=True, framealpha=0.95)
+    
+    # Format category labels (works for both absolute effects and rates)
     category_labels = {
         'intergenic': 'Intergenic',
         'synonymous': 'Synonymous',
@@ -808,96 +826,20 @@ def plot_category_significances(ax, category_df, tests_df):
     }
     labels = [category_labels.get(cat, cat) for cat in categories]
     ax.set_xticks(x_pos)
-    ax.set_xticklabels(labels, fontsize=18, fontweight='bold', rotation=0, ha='center')
+    ax.set_xticklabels(labels, fontsize=28, fontweight='bold', rotation=0, ha='center')
     
-    # Set x-axis limits to fill the plot - minimal padding
+    # Set x-axis limits
     if len(x_pos) > 0:
-        padding = 0.5  # Small padding on sides
+        padding = 0.5
         ax.set_xlim(left=x_pos[0] - padding, right=x_pos[-1] + padding)
     
-    # Format y-axis
-    ax.set_ylabel('Mutation Rate (per base)', fontsize=24, fontweight='bold', labelpad=20)
-    ax.set_yscale('log')
+    ax.tick_params(axis='y', labelsize=28, pad=12)
+    ax.tick_params(axis='x', labelsize=28, pad=14)
     
-    # Set y-axis range to include all rates and their CI bounds
-    all_rates = list(treated_rates)
-    if not control_df.empty:
-        all_rates.extend([r for r in control_rates if not np.isnan(r)])
-    min_rate = min(all_rates) * 0.7  # Slightly below minimum rate
-    max_rate = max(all_rates)
-    if 'CI_high' in treated_df.columns:
-        max_ci_high = treated_df['CI_high'].max()
-        max_rate = max(max_rate, max_ci_high)
-    if not control_df.empty and 'CI_high' in control_df.columns:
-        ctrl_max_ci = max([h for h in control_ci_high if not np.isnan(h)]) if any(not np.isnan(h) for h in control_ci_high) else max_rate
-        max_rate = max(max_rate, ctrl_max_ci)
-    
-    # Add padding above for legend
-    padding_mult = 1.8
-    ax.set_ylim(min_rate, max_rate * padding_mult)
-    
-    # Set explicit y-axis ticks for log scale
-    # Cover typical range from ~1e-5 to ~3e-4
-    ax.set_yticks([2e-5, 3e-5, 5e-5, 1e-4, 2e-4, 3e-4])
-    
-    fmt = ScalarFormatter(useMathText=True)
-    fmt.set_scientific(True)
-    fmt.set_powerlimits((-3, 3))
-    ax.yaxis.set_major_formatter(fmt)
-    
-    # Add minor ticks
-    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=20))
-    
-    ax.tick_params(axis='y', labelsize=18, pad=10)
-    ax.tick_params(axis='x', labelsize=18, pad=12)
-    
-    # Add legend
-    ax.legend(loc='upper right', fontsize=16, frameon=True, fancybox=True, 
-              shadow=True, framealpha=0.9)
-    
-    # Create significance table if tests available
-    if tests_df is not None and not tests_df.empty:
-        # Extract p-values for comparisons
-        table_data = []
-        
-        # syn vs intergenic
-        syn_vs_inter = tests_df[tests_df['test'].str.contains('synonymous vs intergenic.*IN TREATED', regex=True, na=False)]
-        if not syn_vs_inter.empty:
-            p = syn_vs_inter.iloc[0]['p_value']
-            symbol, label = format_pvalue(p)
-            table_data.append(['Syn vs Inter', symbol, label])
-        
-        # nonsyn vs intergenic
-        nonsyn_vs_inter = tests_df[tests_df['test'].str.contains('non_synonymous vs intergenic.*IN TREATED', regex=True, na=False)]
-        if not nonsyn_vs_inter.empty:
-            p = nonsyn_vs_inter.iloc[0]['p_value']
-            symbol, label = format_pvalue(p)
-            table_data.append(['Nonsyn vs Inter', symbol, label])
-        
-        # syn vs nonsyn
-        syn_vs_nonsyn = tests_df[tests_df['test'].str.contains('synonymous vs non_synonymous.*IN TREATED', regex=True, na=False)]
-        if not syn_vs_nonsyn.empty:
-            p = syn_vs_nonsyn.iloc[0]['p_value']
-            symbol, label = format_pvalue(p)
-            table_data.append(['Syn vs Nonsyn', symbol, label])
-        
-        # Display significance values in the lower right of the plot
-        if table_data:
-            # Build compact significance text
-            sig_lines = []
-            for comp, symbol, p_str in table_data:
-                sig_lines.append(f'{comp}: {symbol} ({p_str})')
-            
-            sig_text = '\n'.join(sig_lines)
-            ax.text(0.98, 0.02, sig_text, transform=ax.transAxes,
-                   ha='right', va='bottom', fontsize=14,
-                   bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9, edgecolor='gray', linewidth=1),
-                   family='monospace')
     
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, axis='y')
     
-    # Add title
-    ax.set_title('Rates by Category', fontsize=20, fontweight='bold', pad=10)
+    # No title for panel 2
 
 
 def plot_treatment_day_rates(ax, summary_df, per_sample_df, tests_df, sample_color_dict=None):
@@ -1002,7 +944,7 @@ def plot_treatment_day_rates(ax, summary_df, per_sample_df, tests_df, sample_col
         ax.set_xlim(left=x_min - padding, right=x_max + padding)
     
     # Format y-axis with more ticks
-    ax.set_ylabel('Mutation Rate (per base)', fontsize=28, fontweight='bold', labelpad=25)
+    ax.set_ylabel('Mutation Rate (per base)', fontsize=32, fontweight='bold', labelpad=30)
     ax.set_yscale('log')
     
     # Set explicit y-axis ticks for log scale
@@ -1016,8 +958,8 @@ def plot_treatment_day_rates(ax, summary_df, per_sample_df, tests_df, sample_col
     # Add minor ticks
     ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=20))
     
-    ax.tick_params(axis='y', labelsize=20, pad=12)
-    ax.tick_params(axis='x', labelsize=20, pad=14)
+    ax.tick_params(axis='y', labelsize=28, pad=15)
+    ax.tick_params(axis='x', labelsize=28, pad=16)
     
     # Add significance annotations using letter-based system (cleaner for multiple groups)
     if tests_df is not None and not tests_df.empty:
@@ -1066,14 +1008,14 @@ def plot_treatment_day_rates(ax, summary_df, per_sample_df, tests_df, sample_col
             # Sort by p-value
             comparisons.sort(key=lambda x: x[4])
             
-            # Display as compact text in bottom right
+            # Display as compact text in bottom right (smaller font and padding)
             table_text = "Comparisons:\n"
-            for day1_label, day2_label, symbol, p_str, _ in comparisons[:6]:  # Limit to 6 comparisons
-                table_text += f"{day1_label} vs {day2_label}: {symbol} ({p_str})\n"
+            for day1_label, day2_label, symbol, p_str, _ in comparisons[:4]:  # Limit to 4 comparisons
+                table_text += f"{day1_label} vs {day2_label}: {p_str}\n"
             
             ax.text(0.98, 0.02, table_text, transform=ax.transAxes,
-                   ha='right', va='bottom', fontsize=18,
-                   bbox=dict(boxstyle='round,pad=1.0', facecolor='white', alpha=0.8, edgecolor='gray', linewidth=2),
+                   ha='right', va='bottom', fontsize=14,
+                   bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='gray', linewidth=1.5),
                    family='monospace')
     
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, axis='y')
@@ -1094,6 +1036,198 @@ def parse_gff(gff_file):
                 gene_id = fields[8].split(';')[0].replace('ID=', '') if 'ID=' in fields[8] else f"gene_{len(gene_regions)}"
                 gene_regions.append((chrom, start, end, gene_id))
     return gene_regions
+
+
+def load_gene_info_cache(cache_file):
+    """Load gene information from JSON cache file.
+    
+    Returns:
+        dict mapping gene_id (WD_RS format) to dict with 'name' and 'description'
+    """
+    if not cache_file or not os.path.exists(cache_file):
+        return {}
+    
+    gene_info = {}
+    try:
+        with open(cache_file, 'r') as f:
+            cache_data = json.load(f)
+        
+        # Extract gene info - cache uses UID as key, need to find WD_RS IDs in otheraliases
+        for uid, gene_data in cache_data.items():
+            name = gene_data.get('name', '')
+            description = gene_data.get('description', '')
+            otheraliases = gene_data.get('otheraliases', '')
+            
+            # Extract WD_RS IDs from otheraliases (format: "WD_RS05860, WD1295, WD_1295")
+            if otheraliases:
+                aliases = [a.strip() for a in otheraliases.split(',')]
+                for alias in aliases:
+                    if alias.startswith('WD_RS'):
+                        # Store info keyed by WD_RS ID
+                        gene_info[alias] = {
+                            'name': name,
+                            'description': description
+                        }
+                        # Also store with "gene-" prefix for compatibility
+                        gene_info[f'gene-{alias}'] = {
+                            'name': name,
+                            'description': description
+                        }
+    except Exception as e:
+        print(f"Warning: Could not load gene info cache: {e}")
+        return {}
+    
+    return gene_info
+
+
+def extract_wd_rs_id(gene_id_str):
+    """Extract WD_RS ID from gene identifier string.
+    Handles formats like "gene-WD_RS00015" -> "WD_RS00015"
+    """
+    if pd.isna(gene_id_str) or not gene_id_str:
+        return None
+    gene_id_str = str(gene_id_str)
+    if gene_id_str.startswith('gene-'):
+        return gene_id_str[5:]  # Remove "gene-" prefix
+    return gene_id_str
+
+
+def analyze_genes_in_rate_windows(windows_df, gff_file, gene_info_cache, rate_col, n_windows=10, highest=True):
+    """
+    Analyze genes in windows with highest or lowest mutation rates.
+    
+    Args:
+        windows_df: DataFrame with window rates
+        gff_file: Path to GFF file with gene annotations
+        gene_info_cache: Dict mapping gene IDs to name/description
+        rate_col: Column name for rate values
+        n_windows: Number of top/bottom windows to analyze
+        highest: If True, analyze highest rate windows; if False, analyze lowest
+    
+    Returns:
+        DataFrame with window info and gene details
+    """
+    if gff_file is None or not os.path.exists(gff_file):
+        return pd.DataFrame()
+    
+    # Load genes from GFF file
+    try:
+        gene_regions = parse_gff(gff_file)
+        print(f"Loaded {len(gene_regions)} genes from GFF file")
+    except Exception as e:
+        print(f"Error loading GFF file: {e}")
+        return pd.DataFrame()
+    
+    # Get top/bottom windows by rate
+    valid_windows = windows_df[windows_df[rate_col].notna() & (windows_df[rate_col] > 0)].copy()
+    if len(valid_windows) == 0:
+        return pd.DataFrame()
+    
+    if highest:
+        top_windows = valid_windows.nlargest(n_windows, rate_col)
+        window_type = 'highest'
+    else:
+        top_windows = valid_windows.nsmallest(n_windows, rate_col)
+        window_type = 'lowest'
+    
+    print(f"\nAnalyzing genes in {n_windows} {window_type} rate windows...")
+    
+    # Organize genes by chromosome
+    genes_by_chrom = defaultdict(list)
+    for chrom, start, end, gene_id in gene_regions:
+        genes_by_chrom[str(chrom)].append((start, end, gene_id))
+    
+    # Analyze each window
+    results = []
+    for idx, window_row in top_windows.iterrows():
+        chrom = str(window_row['chrom'])
+        window_start = int(window_row['start'])
+        window_end = int(window_row['end'])
+        window_rate = window_row[rate_col]
+        
+        # Find overlapping genes
+        overlapping_genes = []
+        if chrom in genes_by_chrom:
+            for gene_start, gene_end, gene_id in genes_by_chrom[chrom]:
+                # Check if gene overlaps with window
+                overlap_start = max(window_start, gene_start)
+                overlap_end = min(window_end, gene_end)
+                if overlap_start <= overlap_end:
+                    # Calculate coverage percentage
+                    gene_length = gene_end - gene_start + 1
+                    overlap_length = overlap_end - overlap_start + 1
+                    coverage_pct = (overlap_length / gene_length * 100) if gene_length > 0 else 0
+                    
+                    # Extract WD_RS ID
+                    wd_rs_id = extract_wd_rs_id(gene_id)
+                    
+                    # Get gene name and description from cache
+                    gene_name = ''
+                    gene_description = ''
+                    if wd_rs_id:
+                        # Try direct match first
+                        if wd_rs_id in gene_info_cache:
+                            gene_name = gene_info_cache[wd_rs_id].get('name', '')
+                            gene_description = gene_info_cache[wd_rs_id].get('description', '')
+                        # Try with gene- prefix
+                        elif f'gene-{wd_rs_id}' in gene_info_cache:
+                            gene_name = gene_info_cache[f'gene-{wd_rs_id}'].get('name', '')
+                            gene_description = gene_info_cache[f'gene-{wd_rs_id}'].get('description', '')
+                    
+                    overlapping_genes.append({
+                        'gene_id': gene_id,
+                        'wd_rs_id': wd_rs_id if wd_rs_id else gene_id,
+                        'gene_name': gene_name,
+                        'gene_description': gene_description,
+                        'gene_start': gene_start,
+                        'gene_end': gene_end,
+                        'overlap_start': overlap_start,
+                        'overlap_end': overlap_end,
+                        'coverage_percentage': coverage_pct
+                    })
+        
+        # Create result row
+        if overlapping_genes:
+            for gene_info in overlapping_genes:
+                results.append({
+                    'window_index': idx,
+                    'chrom': chrom,
+                    'window_start': window_start,
+                    'window_end': window_end,
+                    'window_rate': window_rate,
+                    'gene_id': gene_info['gene_id'],
+                    'wd_rs_id': gene_info['wd_rs_id'],
+                    'gene_name': gene_info['gene_name'],
+                    'gene_description': gene_info['gene_description'],
+                    'gene_start': gene_info['gene_start'],
+                    'gene_end': gene_info['gene_end'],
+                    'overlap_start': gene_info['overlap_start'],
+                    'overlap_end': gene_info['overlap_end'],
+                    'coverage_percentage': gene_info['coverage_percentage']
+                })
+        else:
+            # Window with no genes
+            results.append({
+                'window_index': idx,
+                'chrom': chrom,
+                'window_start': window_start,
+                'window_end': window_end,
+                'window_rate': window_rate,
+                'gene_id': 'none',
+                'wd_rs_id': 'none',
+                'gene_name': '',
+                'gene_description': '',
+                'gene_start': np.nan,
+                'gene_end': np.nan,
+                'overlap_start': np.nan,
+                'overlap_end': np.nan,
+                'coverage_percentage': 0.0
+            })
+    
+    result_df = pd.DataFrame(results)
+    print(f"Found {len([r for r in results if r['gene_id'] != 'none'])} gene hits in {window_type} rate windows")
+    
+    return result_df
 
 
 def find_origin_of_replication(gff_file, oriC_position=None, oriC_chrom=None):
@@ -1421,35 +1555,42 @@ def _finalize_cluster(cluster, chrom_windows, chrom, rate_col, total_windows, to
     original_cluster_indices = [original_indices[i] for i in indices]
     
     # Calculate cluster statistics
-    n_cluster = len(indices)
+    n_cluster_sig = len(indices)  # Number of significant windows in cluster
     cluster_start = cluster_windows['start'].min()
     cluster_end = cluster_windows['end'].max()
     mean_rate = cluster_windows[rate_col].mean()
+    
+    # Count total windows in cluster region (including non-significant windows in gaps)
+    # Find all windows that fall within the cluster span
+    cluster_region_mask = ((chrom_windows['start'] >= cluster_start) & 
+                           (chrom_windows['end'] <= cluster_end))
+    n_cluster_total = cluster_region_mask.sum()  # Total windows in cluster region
     
     # Test cluster significance using binomial test
     # Null hypothesis: cluster is random (proportion of significant windows matches genome-wide)
     # Alternative: cluster has more significant windows than expected by chance
     p_sig_genome = total_sig / total_windows if total_windows > 0 else 0
     
-    # Binomial test: probability of observing n_cluster significant windows
-    # out of n_cluster total windows, given genome-wide proportion
-    if p_sig_genome > 0 and p_sig_genome < 1 and n_cluster > 0:
+    # Binomial test: probability of observing n_cluster_sig significant windows
+    # out of n_cluster_total total windows in the cluster region, given genome-wide proportion
+    if p_sig_genome > 0 and p_sig_genome < 1 and n_cluster_total > 0 and n_cluster_sig > 0:
         # Use binomtest for newer scipy, fallback to binom_test for older versions
         try:
             from scipy.stats import binomtest
             # binomtest(k, n, p, alternative='greater')
-            result = binomtest(n_cluster, n_cluster, p_sig_genome, alternative='greater')
+            # k = number of successes (significant windows), n = total trials (total windows in region)
+            result = binomtest(n_cluster_sig, n_cluster_total, p_sig_genome, alternative='greater')
             p_value = result.pvalue
         except (ImportError, AttributeError):
             # Fallback for older scipy versions
             try:
-                p_value = stats.binom_test(n_cluster, n_cluster, p_sig_genome, alternative='greater')
+                p_value = stats.binom_test(n_cluster_sig, n_cluster_total, p_sig_genome, alternative='greater')
             except (AttributeError, TypeError):
                 # Manual calculation if binom_test not available
                 from scipy.stats import binom
-                p_value = 1 - binom.cdf(n_cluster - 1, n_cluster, p_sig_genome)
+                p_value = 1 - binom.cdf(n_cluster_sig - 1, n_cluster_total, p_sig_genome)
     else:
-        # If all or no windows are significant, can't test
+        # If all or no windows are significant, or no windows in cluster region, can't test
         p_value = 1.0
     
     return {
@@ -1457,7 +1598,7 @@ def _finalize_cluster(cluster, chrom_windows, chrom, rate_col, total_windows, to
         'chrom': chrom,
         'start': int(cluster_start),
         'end': int(cluster_end),
-        'n_windows': n_cluster,
+        'n_windows': n_cluster_sig,  # Number of significant windows in cluster
         'window_indices': original_cluster_indices,  # Use original DataFrame indices
         'p_value': p_value,
         'mean_rate': mean_rate,
@@ -1476,7 +1617,9 @@ def plot_regional_rates_manhattan(
     max_cluster_gap: int = 2,
     cluster_p_threshold: float = 0.05,
     oriC_position: int = None,
-    oriC_chrom: str = None
+    oriC_chrom: str = None,
+    gene_info_cache_file: str = None,
+    output_dir: str = None
 ):
     """
     Create Manhattan plot showing mutation rates across the genome.
@@ -1518,12 +1661,24 @@ def plot_regional_rates_manhattan(
         axis=1
     )
     
-    # Filter out windows where control rate > treated rate (these are likely artifacts)
+    # Filter out windows where control rate > treated rate or where rates are virtually identical (no treatment effect)
+    # Save a copy BEFORE filtering for clustering (to avoid breaking up clusters)
+    windows_rates_df_before_outlier_filter = None
     if use_treatment_covariate and 'rate_control' in windows_rates_df.columns and 'rate_treated' in windows_rates_df.columns:
         n_before = len(windows_rates_df)
-        # Keep only windows where treated rate >= control rate (or either is NaN)
+        # Calculate fold-change: treated/control (handle division by zero)
+        # Filter out windows where:
+        # 1. Control > treated (artifacts)
+        # 2. Treated/control < 1.01 (less than 1% increase - virtually identical, no treatment effect)
+        # Keep windows where treated >= control AND fold-change >= 1.01 (or either rate is NaN)
+        control_positive = windows_rates_df['rate_control'] > 0
+        fold_change = np.where(
+            control_positive,
+            windows_rates_df['rate_treated'] / windows_rates_df['rate_control'],
+            np.inf  # If control is 0, fold-change is infinite (keep if treated > 0)
+        )
         valid_mask = (
-            (windows_rates_df['rate_treated'] >= windows_rates_df['rate_control']) |
+            ((windows_rates_df['rate_treated'] >= windows_rates_df['rate_control']) & (fold_change >= 1.01)) |
             windows_rates_df['rate_treated'].isna() |
             windows_rates_df['rate_control'].isna()
         )
@@ -1531,24 +1686,54 @@ def plot_regional_rates_manhattan(
         n_after = len(windows_rates_df)
         n_filtered = n_before - n_after
         if n_filtered > 0:
-            print(f"Filtered out {n_filtered} windows where control rate > treated rate ({n_after} remaining)")
+            print(f"Filtered out {n_filtered} windows where control rate > treated rate or rates are virtually identical (fold-change < 1.01) ({n_after} remaining)")
     
-    # Determine significance using statistical tests
+    # Save copy AFTER fold-change filter but BEFORE outlier filter for clustering
+    # This way clustering sees windows that pass the fold-change filter (valid treatment effect)
+    # but can still span across outlier windows to avoid breaking up clusters
+    windows_rates_df_before_outlier_filter = windows_rates_df.copy()
+    
+    # Filter extreme outliers that would stretch the y-axis (especially for gene windows)
+    if use_treatment_covariate and 'rate_treated' in windows_rates_df.columns:
+        rate_col_for_outlier = 'rate_treated'
+    else:
+        rate_col_for_outlier = 'rate_control' if 'rate_control' in windows_rates_df.columns else rate_col
+    
+    # Calculate outlier threshold using IQR method
+    rates = windows_rates_df[rate_col_for_outlier].dropna()
+    if len(rates) > 0:
+        Q1 = rates.quantile(0.25)
+        Q3 = rates.quantile(0.75)
+        IQR = Q3 - Q1
+        # Use a more conservative threshold (3x IQR instead of 1.5x) to only remove extreme outliers
+        outlier_threshold_high = Q3 + 3 * IQR
+        
+        n_before_outlier = len(windows_rates_df)
+        outlier_mask = windows_rates_df[rate_col_for_outlier] <= outlier_threshold_high
+        windows_rates_df = windows_rates_df[outlier_mask].copy()
+        n_after_outlier = len(windows_rates_df)
+        n_outliers_removed = n_before_outlier - n_after_outlier
+        
+        if n_outliers_removed > 0:
+            print(f"Filtered out {n_outliers_removed} extreme outlier windows (rate > {outlier_threshold_high:.6e}) to improve plot readability ({n_after_outlier} remaining)")
+    
+    # Determine significance using statistical tests on data that passed fold-change filter
+    # (but before outlier filter, so clustering can span across outliers)
     # Test if each window's rate is significantly different from the overall mean rate
     # This identifies regions with unusually high or low mutation rates (hotspots/coldspots)
+    # We do this on data that passed the fold-change filter (valid treatment effect)
+    # but before outlier filter, so clustering can span across outliers without breaking up
     if use_treatment_covariate:
         # Use treated rate for comparison (since that's what we're interested in)
         rate_col = 'rate_treated'
         
-        # Calculate overall mean treated rate across all windows
-        overall_mean = windows_rates_df[rate_col].dropna().mean()
+        # Calculate overall mean treated rate across windows that passed fold-change filter
+        overall_mean = windows_rates_df_before_outlier_filter[rate_col].dropna().mean()
         
-        print(f"Comparing each window's treated rate to overall mean treated rate: {overall_mean:.6e}")
+        # Do significance testing on data that passed fold-change filter
+        windows_rates_df_before_outlier_filter['p_value'] = np.nan
         
-        # For each window, test if treated rate differs from overall mean
-        windows_rates_df['p_value'] = np.nan
-        
-        for idx, row in windows_rates_df.iterrows():
+        for idx, row in windows_rates_df_before_outlier_filter.iterrows():
             p_val = np.nan
             
             # Test if window rate differs from overall mean using CI-based test
@@ -1578,11 +1763,48 @@ def plot_regional_rates_manhattan(
             
             # Store p-value (significance will be determined after FDR correction)
             if np.isfinite(p_val) and not pd.isna(p_val):
-                windows_rates_df.at[idx, 'p_value'] = p_val
+                windows_rates_df_before_outlier_filter.at[idx, 'p_value'] = p_val
         
-        # Calculate fold-change relative to overall mean (for coloring)
+        # Apply FDR correction to data that passed fold-change filter
+        valid_pvalues = windows_rates_df_before_outlier_filter['p_value'].dropna()
+        if len(valid_pvalues) > 1:
+            pvalues_array = valid_pvalues.values
+            rejected, pvalues_corrected, _, _ = multipletests(
+                pvalues_array, 
+                alpha=significance_threshold, 
+                method='fdr_bh'
+            )
+            windows_rates_df_before_outlier_filter['p_value_fdr_corrected'] = np.nan
+            windows_rates_df_before_outlier_filter.loc[valid_pvalues.index, 'p_value_fdr_corrected'] = pvalues_corrected
+            windows_rates_df_before_outlier_filter['is_significant'] = False
+            windows_rates_df_before_outlier_filter.loc[valid_pvalues.index[rejected], 'is_significant'] = True
+            n_significant = rejected.sum()
+            n_tested = len(valid_pvalues)
+            print(f"Significance testing (FDR-corrected): {n_significant} of {n_tested} windows significant at FDR<{significance_threshold}")
+        else:
+            windows_rates_df_before_outlier_filter['is_significant'] = False
+            windows_rates_df_before_outlier_filter['p_value_fdr_corrected'] = windows_rates_df_before_outlier_filter['p_value']
+        
+        # Calculate overall mean on filtered data for plotting
+        overall_mean_filtered = windows_rates_df[rate_col].dropna().mean()
+        
+        print(f"Comparing each window's treated rate to overall mean treated rate: {overall_mean:.6e} (after fold-change filter)")
+        print(f"Filtered dataset mean (after outlier filter): {overall_mean_filtered:.6e}")
+        
+        # Copy significance from before-outlier-filter to filtered dataframe (for plotting)
+        windows_rates_df['p_value'] = windows_rates_df.index.map(
+            lambda idx: windows_rates_df_before_outlier_filter.loc[idx, 'p_value'] if idx in windows_rates_df_before_outlier_filter.index else np.nan
+        )
+        windows_rates_df['p_value_fdr_corrected'] = windows_rates_df.index.map(
+            lambda idx: windows_rates_df_before_outlier_filter.loc[idx, 'p_value_fdr_corrected'] if idx in windows_rates_df_before_outlier_filter.index else np.nan
+        )
+        windows_rates_df['is_significant'] = windows_rates_df.index.map(
+            lambda idx: windows_rates_df_before_outlier_filter.loc[idx, 'is_significant'] if idx in windows_rates_df_before_outlier_filter.index else False
+        )
+        
+        # Calculate fold-change relative to overall mean (for coloring) - use filtered mean for plot
         windows_rates_df['fold_change'] = (
-            windows_rates_df[rate_col] / overall_mean
+            windows_rates_df[rate_col] / overall_mean_filtered
         ).replace([np.inf, -np.inf], np.nan)
     else:
         # Single rate per window - compare to overall mean
@@ -1602,59 +1824,37 @@ def plot_regional_rates_manhattan(
         
         rate_col = 'rate_control'
     
-    # Apply FDR correction (Benjamini-Hochberg) to p-values
-    # Get all valid p-values
-    valid_pvalues = windows_rates_df['p_value'].dropna()
-    if len(valid_pvalues) > 1:
-        # Apply FDR correction
-        pvalues_array = valid_pvalues.values
-        rejected, pvalues_corrected, alpha_sidak, alpha_bonf = multipletests(
-            pvalues_array, 
-            alpha=significance_threshold, 
-            method='fdr_bh'  # Benjamini-Hochberg FDR correction
-        )
-        
-        # Store corrected p-values
-        windows_rates_df['p_value_fdr_corrected'] = np.nan
-        windows_rates_df.loc[valid_pvalues.index, 'p_value_fdr_corrected'] = pvalues_corrected
-        
-        # Update significance based on FDR-corrected p-values
-        windows_rates_df['is_significant'] = False
-        windows_rates_df.loc[valid_pvalues.index[rejected], 'is_significant'] = True
-        
-        n_significant = rejected.sum()
-        n_tested = len(valid_pvalues)
-        print(f"Significance testing (FDR-corrected): {n_significant} of {n_tested} windows significant at FDR<{significance_threshold}")
-        print(f"  Applied Benjamini-Hochberg FDR correction for multiple comparisons")
-    else:
-        # If only one or no p-values, no correction needed
-        n_significant = windows_rates_df['is_significant'].sum() if 'is_significant' in windows_rates_df.columns else 0
-        n_tested = windows_rates_df['p_value'].notna().sum()
-        windows_rates_df['p_value_fdr_corrected'] = windows_rates_df['p_value']
-        print(f"Significance testing: {n_significant} of {n_tested} windows significant at p<{significance_threshold}")
-        if n_tested <= 1:
-            print(f"  No multiple comparisons correction needed (only {n_tested} test(s))")
+    # Significance testing and FDR correction already done on original data above
+    # Just report stats for filtered data
+    n_significant = windows_rates_df['is_significant'].sum() if 'is_significant' in windows_rates_df.columns else 0
+    n_tested = windows_rates_df['p_value'].notna().sum()
+    print(f"Significant windows in filtered dataset: {n_significant} of {n_tested} windows")
     
     # Create plot
     fig, ax = plt.subplots(figsize=(16, 6))
+    
+    # Set log scale for y-axis BEFORE plotting (ensures proper transformation)
+    ax.set_yscale('log')
     
     # Ensure is_significant column exists
     if 'is_significant' not in windows_rates_df.columns:
         windows_rates_df['is_significant'] = False
     
-    # Calculate overall mean for coloring
+    # Calculate overall mean for coloring (use filtered mean for plot)
     if use_treatment_covariate:
-        overall_mean = windows_rates_df[rate_col].dropna().mean()
+        overall_mean_plot = overall_mean_filtered if use_treatment_covariate else windows_rates_df[rate_col].dropna().mean()
     else:
-        overall_mean = windows_rates_df[rate_col].dropna().mean()
+        overall_mean_plot = windows_rates_df[rate_col].dropna().mean()
     
     # Identify clusters of significant windows
+    # Use data that passed fold-change filter (but before outlier filter) for clustering
+    # This ensures we only cluster windows with valid treatment effects, but can span across outliers
     clusters = identify_significant_clusters(
-        windows_rates_df, 
+        windows_rates_df_before_outlier_filter,  # Use data after fold-change filter, before outlier filter
         chrom_order, 
         chrom_offsets,
         rate_col, 
-        overall_mean,
+        overall_mean,  # Use mean from data that passed fold-change filter
         min_cluster_size=min_cluster_size,
         max_gap=max_cluster_gap,
         cluster_p_threshold=cluster_p_threshold
@@ -1674,8 +1874,8 @@ def plot_regional_rates_manhattan(
     # Plot significant windows (original style)
     sig = windows_rates_df[windows_rates_df['is_significant']]
     if len(sig) > 0:
-        increased = sig[sig[rate_col] > overall_mean]
-        decreased = sig[sig[rate_col] < overall_mean]
+        increased = sig[sig[rate_col] > overall_mean_plot]
+        decreased = sig[sig[rate_col] < overall_mean_plot]
         
         # Plot all significant windows with original style
         # Cluster windows will be overlaid with different markers
@@ -1733,8 +1933,8 @@ def plot_regional_rates_manhattan(
         if i > 0:
             ax.axvline(x=offset, color='black', linestyle='--', alpha=0.3, linewidth=0.5)
     
-    # Mark origin of replication if GFF file provided or explicit position given
-    if gff_file or oriC_position is not None:
+    # Mark origin of replication only if explicitly requested via --oriC-position flag
+    if oriC_position is not None:
         oriC = find_origin_of_replication(gff_file, oriC_position=oriC_position, oriC_chrom=oriC_chrom)
         if oriC:
             chrom = oriC['chrom']
@@ -1748,7 +1948,7 @@ def plot_regional_rates_manhattan(
                 # Add label
                 ax.text(x_pos, y_max * 0.98, 'oriC', ha='center', va='top',
                        fontsize=12, fontweight='bold', color='purple',
-                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                       bbox=dict(boxstyle='round,pad=0.6', facecolor='white', 
                                alpha=0.9, edgecolor='purple', linewidth=1.5),
                        zorder=6)
                 if oriC['dnaA_start'] is not None:
@@ -1756,34 +1956,28 @@ def plot_regional_rates_manhattan(
                 else:
                     print(f"Marked origin of replication at {chrom}:{oriC_pos} (user-specified)")
     
-    # Add horizontal line at overall mean
-    ax.axhline(y=overall_mean, color='green', linestyle='--', linewidth=1.5, 
+    # Add horizontal line at overall mean (use filtered mean for plot)
+    ax.axhline(y=overall_mean_plot, color='green', linestyle='--', linewidth=1.5, 
                alpha=0.7)
     
-    # Labels
-    ax.set_ylabel('Mutation Rate (per base, log scale)', fontsize=12, fontweight='bold')
-    if use_treatment_covariate:
-        ax.set_title('Treated Mutation Rates Across Genome\n(compared to overall mean; FDR-corrected)', 
-                    fontsize=14, fontweight='bold')
-    else:
-        ax.set_title('Mutation Rates Across Genome\n(compared to overall mean; FDR-corrected)', 
-                    fontsize=14, fontweight='bold')
+    # Labels - matching regression plot font sizes (minimum 10pt, target 12-14pt)
+    ax.set_ylabel('Mutation Rate (per base, log scale)', fontsize=14, fontweight='bold')
+    # Title removed per user request
     
     # Set log scale for y-axis with proper formatting
     ax.set_yscale('log')
     
     # Format y-axis to show scientific notation with proper log scale ticks
-    fmt = ScalarFormatter(useMathText=True)
-    fmt.set_scientific(True)
-    fmt.set_powerlimits((-3, 3))
+    # Use LogFormatterSciNotation for log scales (not ScalarFormatter which is for linear)
+    fmt = LogFormatterSciNotation()
     ax.yaxis.set_major_formatter(fmt)
     
-    # Use log locator for major ticks
-    ax.yaxis.set_major_locator(LogLocator(base=10.0, numticks=10))
+    # Use log locator for major ticks - will be adjusted after limits are set
+    ax.yaxis.set_major_locator(LogLocator(base=10.0, numticks=15))
     
     ax.grid(alpha=0.3, axis='y', which='both', linestyle='--')
-    ax.tick_params(axis='y', which='major', labelsize=10)
-    ax.tick_params(axis='y', which='minor', labelsize=8)
+    ax.tick_params(axis='y', which='major', labelsize=12)
+    ax.tick_params(axis='y', which='minor', labelsize=10)
     
     # X-axis ticks every 100,000 bp
     # Get total genome size
@@ -1812,8 +2006,8 @@ def plot_regional_rates_manhattan(
             current_pos += tick_interval
     
     ax.set_xticks(x_ticks)
-    ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=8)
-    ax.set_xlabel('Genomic Position (kb)', fontsize=12)
+    ax.set_xticklabels(x_labels, rotation=45, ha='right', fontsize=12)
+    ax.set_xlabel('Genomic Position (kb)', fontsize=14, fontweight='bold')
     
     # Add chromosome labels as secondary x-axis or text annotations
     # Add text labels for chromosomes at the top of the plot
@@ -1827,10 +2021,67 @@ def plot_regional_rates_manhattan(
         # Position text in log space
         text_y = 10**(np.log10(y_max) + 0.05 * log_range)
         ax.text(chrom_center, text_y, chrom, ha='center', va='bottom',
-               fontsize=10, fontweight='bold', transform=ax.transData)
+               fontsize=12, fontweight='bold', transform=ax.transData)
     
     # Expand y-axis slightly to accommodate chromosome labels
     ax.set_ylim(top=new_y_max)
+    
+    # Now that y-axis limits are finalized, manually generate ticks to ensure we have enough
+    y_min_final, y_max_final = ax.get_ylim()
+    log_min = np.log10(y_min_final)
+    log_max = np.log10(y_max_final)
+    log_range_final = log_max - log_min
+    
+    # Generate tick positions manually
+    # For small ranges, use more granular ticks (1, 2, 5 per decade)
+    tick_positions = []
+    decade_min = int(np.floor(log_min))
+    decade_max = int(np.ceil(log_max))
+    
+    if log_range_final < 1:
+        # Small range: generate ticks at 1, 2, 5 for each decade
+        for decade in range(decade_min, decade_max + 1):
+            for multiplier in [1.0, 2.0, 5.0]:
+                tick_val = multiplier * (10 ** decade)
+                if y_min_final * 0.95 <= tick_val <= y_max_final * 1.05:  # Slight padding
+                    tick_positions.append(tick_val)
+    elif log_range_final < 2:
+        # Medium range: use 1, 2, 5 per decade
+        for decade in range(decade_min, decade_max + 1):
+            for multiplier in [1.0, 2.0, 5.0]:
+                tick_val = multiplier * (10 ** decade)
+                if y_min_final * 0.95 <= tick_val <= y_max_final * 1.05:
+                    tick_positions.append(tick_val)
+    else:
+        # Large range: use standard decade ticks
+        for decade in range(decade_min, decade_max + 1):
+            tick_val = 10 ** decade
+            if y_min_final * 0.95 <= tick_val <= y_max_final * 1.05:
+                tick_positions.append(tick_val)
+    
+    # Remove duplicates and sort
+    tick_positions = sorted(list(set(tick_positions)))
+    
+    # Set the ticks explicitly - use set_yticks which overrides the locator
+    if len(tick_positions) >= 2:  # Need at least 2 ticks
+        ax.set_yticks(tick_positions)
+        ax.yaxis.set_major_formatter(fmt)
+    else:
+        # Fallback: if we don't have enough ticks, force generate more
+        # Expand the range slightly and regenerate
+        for decade in range(decade_min - 1, decade_max + 2):
+            for multiplier in [1.0, 2.0, 5.0]:
+                tick_val = multiplier * (10 ** decade)
+                if y_min_final * 0.8 <= tick_val <= y_max_final * 1.2:
+                    tick_positions.append(tick_val)
+        tick_positions = sorted(list(set(tick_positions)))
+        if len(tick_positions) >= 2:
+            ax.set_yticks(tick_positions)
+            ax.yaxis.set_major_formatter(fmt)
+        else:
+            # Last resort: use locator with subs
+            ax.yaxis.set_major_locator(LogLocator(base=10.0, subs=[1.0, 2.0, 5.0], numticks=20))
+            ax.yaxis.set_major_formatter(fmt)
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -1889,6 +2140,39 @@ def plot_regional_rates_manhattan(
             print(f"Warning: GFF file specified but not found: {gff_file}")
     else:
         print("No significant clusters found")
+    
+    # Generate gene hits files for highest and lowest rate windows
+    if gff_file and os.path.exists(gff_file) and gene_info_cache_file:
+        # Use explicitly provided output_dir, or derive from output_path
+        if output_dir is None:
+            output_dir = os.path.dirname(output_path) if os.path.dirname(output_path) else '.'
+        # Ensure output_dir is absolute
+        output_dir = os.path.abspath(output_dir)
+        
+        # Load gene info cache
+        gene_info_cache = load_gene_info_cache(gene_info_cache_file)
+        print(f"\nLoaded gene info for {len(gene_info_cache)} genes from cache")
+        
+        # rate_col is already defined above in the significance testing section
+        # Analyze highest rate windows
+        print(f"\nAnalyzing genes in highest rate windows...")
+        highest_gene_hits = analyze_genes_in_rate_windows(
+            windows_rates_df, gff_file, gene_info_cache, rate_col, n_windows=10, highest=True
+        )
+        if not highest_gene_hits.empty:
+            highest_path = os.path.join(output_dir, 'gene_hits_high_rate_windows.tsv')
+            highest_gene_hits.to_csv(highest_path, sep='\t', index=False)
+            print(f"Gene hits in highest rate windows saved to {highest_path}")
+        
+        # Analyze lowest rate windows
+        print(f"\nAnalyzing genes in lowest rate windows...")
+        lowest_gene_hits = analyze_genes_in_rate_windows(
+            windows_rates_df, gff_file, gene_info_cache, rate_col, n_windows=10, highest=False
+        )
+        if not lowest_gene_hits.empty:
+            lowest_path = os.path.join(output_dir, 'gene_hits_low_rate_windows.tsv')
+            lowest_gene_hits.to_csv(lowest_path, sep='\t', index=False)
+            print(f"Gene hits in lowest rate windows saved to {lowest_path}")
 
 
 def create_multiplot(output_dir, output_path=None):
@@ -1896,24 +2180,25 @@ def create_multiplot(output_dir, output_path=None):
     # Load data
     data = load_data(output_dir)
     
-    # Create figure with subplots - larger size to accommodate larger fonts and significance boxes
-    fig = plt.figure(figsize=(36, 12))  # Wider to accommodate grouped bars in center panel
-    # Adjust grid spec to give more space for larger fonts and prevent overlap
-    # Center panel now has grouped bars (control + treated) so needs more space
-    gs = fig.add_gridspec(1, 3, hspace=0.75, wspace=0.4, 
-                         left=0.08, right=0.94, top=0.90, bottom=0.15,
-                         width_ratios=[1.0, 1.0, 1.0])  # Equal width panels
+    # Create figure with subplots - stacked layout: panel 1 wide on top, panels 2&3 side by side below
+    fig = plt.figure(figsize=(24, 20))  # Taller to accommodate sample labels
+    # Grid spec: 2 rows, 2 columns
+    # Row 0: Panel 1 spans both columns (full width)
+    # Row 1: Panel 2 in left column, Panel 3 in right column
+    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.3, 
+                         left=0.10, right=0.96, top=0.96, bottom=0.10,
+                         height_ratios=[1.3, 1.0], width_ratios=[1.0, 1.0])
     
-    # Panel 1: Per-sample GLM rates
-    ax1 = fig.add_subplot(gs[0, 0])
+    # Panel 1: Per-sample GLM rates (spans full width on top)
+    ax1 = fig.add_subplot(gs[0, :])
     sample_color_dict = plot_glm_per_sample(ax1, data['glm_per_sample'])
     
-    # Panel 2: Category significances
-    ax2 = fig.add_subplot(gs[0, 1])
+    # Panel 2: Category significances (bottom left)
+    ax2 = fig.add_subplot(gs[1, 0])
     plot_category_significances(ax2, data['category_rates'], data['category_tests'])
     
-    # Panel 3: Treatment day rates (pass sample colors from first plot)
-    ax3 = fig.add_subplot(gs[0, 2])
+    # Panel 3: Treatment day rates (bottom right)
+    ax3 = fig.add_subplot(gs[1, 1])
     plot_treatment_day_rates(ax3, data['treatment_day_rates'], 
                             data['treatment_day_per_sample'], 
                             data['treatment_day_tests'],
@@ -1983,14 +2268,15 @@ def main():
     )
     parser.add_argument(
         '--create-manhattan-plot',
-        action='store_true',
-        help='Create Manhattan plot from 5mer normalized window data (if available)'
+        type=str,
+        default=None,
+        help='Directory containing window_rates.tsv file. Manhattan plot and gene hits files will be created in this directory.'
     )
     parser.add_argument(
         '--manhattan-plot-path',
         type=str,
         default=None,
-        help='Output path for Manhattan plot (default: output_dir/5mer_normalized_windows/manhattan_plot.png)'
+        help='Output path for Manhattan plot (default: <manhattan-dir>/manhattan_plot.png)'
     )
     parser.add_argument(
         '--gff-file',
@@ -2028,8 +2314,24 @@ def main():
         default=None,
         help='Chromosome name for oriC (optional, will use first chromosome if not specified)'
     )
+    parser.add_argument(
+        '--gene-info-cache',
+        type=str,
+        default=None,
+        help='Path to gene_info_cache.json file for adding gene names and descriptions to gene hits files. Default: looks for data/references/gene_info_cache.json relative to script location'
+    )
     
     args = parser.parse_args()
+    
+    # Try to find default gene_info_cache.json if not provided
+    if args.gene_info_cache is None:
+        # Try relative to script location
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        default_cache = os.path.join(script_dir, '..', '..', '..', 'data', 'references', 'gene_info_cache.json')
+        default_cache = os.path.normpath(default_cache)
+        if os.path.exists(default_cache):
+            args.gene_info_cache = default_cache
+            print(f"Using default gene info cache: {args.gene_info_cache}")
     
     if not os.path.isdir(args.output_dir):
         print(f"Error: {args.output_dir} is not a directory")
@@ -2044,30 +2346,42 @@ def main():
     
     # Create Manhattan plot if requested
     if args.create_manhattan_plot:
-        data = load_data(args.output_dir)
-        if data['kmer5_windows'] is not None and not data['kmer5_windows'].empty:
-            if args.manhattan_plot_path is None:
-                manhattan_dir = os.path.join(args.output_dir, '5mer_normalized_windows')
-                os.makedirs(manhattan_dir, exist_ok=True)
-                args.manhattan_plot_path = os.path.join(manhattan_dir, 'manhattan_plot.png')
-            
-            # Determine if we have treated rates
-            use_treatment = 'rate_treated' in data['kmer5_windows'].columns
-            plot_regional_rates_manhattan(
-                data['kmer5_windows'],
-                args.manhattan_plot_path,
-                use_treatment_covariate=use_treatment,
-                gff_file=args.gff_file,
-                min_cluster_size=args.min_cluster_size,
-                max_cluster_gap=args.max_cluster_gap,
-                cluster_p_threshold=args.cluster_p_threshold,
-                oriC_position=args.oriC_position,
-                oriC_chrom=args.oriC_chrom
-            )
-            print(f"Manhattan plot created: {args.manhattan_plot_path}")
-        else:
-            print("Warning: 5mer normalized window data not found. Skipping Manhattan plot.")
-            print(f"  Expected file: {os.path.join(args.output_dir, '5mer_normalized_windows', 'window_rates.tsv')}")
+        manhattan_dir = args.create_manhattan_plot
+        if not os.path.isdir(manhattan_dir):
+            print(f"Error: Manhattan plot directory does not exist: {manhattan_dir}")
+            return 1
+        
+        # Load window rates from the specified directory
+        window_rates_path = os.path.join(manhattan_dir, 'window_rates.tsv')
+        if not os.path.exists(window_rates_path):
+            print(f"Error: window_rates.tsv not found in {manhattan_dir}")
+            return 1
+        
+        print(f"Loading window rates from {window_rates_path}")
+        windows_df = pd.read_csv(window_rates_path, sep='\t')
+        print(f"Loaded {len(windows_df)} windows")
+        
+        # Set output path
+        if args.manhattan_plot_path is None:
+            args.manhattan_plot_path = os.path.join(manhattan_dir, 'manhattan_plot.png')
+        
+        # Determine if we have treated rates
+        use_treatment = 'rate_treated' in windows_df.columns
+        
+        plot_regional_rates_manhattan(
+            windows_df,
+            args.manhattan_plot_path,
+            use_treatment_covariate=use_treatment,
+            gff_file=args.gff_file,
+            min_cluster_size=args.min_cluster_size,
+            max_cluster_gap=args.max_cluster_gap,
+            cluster_p_threshold=args.cluster_p_threshold,
+            oriC_position=args.oriC_position,
+            oriC_chrom=args.oriC_chrom,
+            gene_info_cache_file=args.gene_info_cache,
+            output_dir=manhattan_dir
+        )
+        print(f"Manhattan plot created: {args.manhattan_plot_path}")
     
     return 0
 
