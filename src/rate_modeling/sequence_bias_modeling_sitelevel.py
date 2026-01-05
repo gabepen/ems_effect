@@ -181,26 +181,33 @@ def add_positional_features(df: pd.DataFrame) -> list:
 
 def add_3mer_features(df: pd.DataFrame) -> list:
     bases = ['A', 'T', 'G', 'C']
-    all3 = [a + b + c for a in bases for b in bases for c in bases]
+    # 3mer: positions 1, 2, 3 of 5mer (positions -1, 0, +1 relative to mutation)
+    # Position 2 (center) is always C, so only 4×1×4 = 16 possible 3mers
+    all3 = [a + 'C' + b for a in bases for b in bases]
     cols = []
     for t in all3:
         col = f'3mer_{t}'
-        df[col] = df['kmer5'].apply(lambda k, t=t: 1 if k and k[1:4] == t else 0)
+        df[col] = df['kmer5'].apply(lambda k, t=t: 1 if k and len(k) == 5 and k[1:4] == t else 0)
         cols.append(col)
     return cols
 
 
 def add_pos3mer_features(df: pd.DataFrame) -> list:
     bases = ['A', 'T', 'G', 'C']
-    all3 = [a + b + c for a in bases for b in bases for c in bases]
+    # Left 3mer: positions 0, 1, 2 of 5mer (positions -2, -1, 0 relative to mutation)
+    # Position 2 (center) is always C, so only 4×4×1 = 16 possible left 3mers
+    left_3mers = [a + b + 'C' for a in bases for b in bases]
+    # Right 3mer: positions 2, 3, 4 of 5mer (positions 0, +1, +2 relative to mutation)
+    # Position 2 (center) is always C, so only 1×4×4 = 16 possible right 3mers
+    right_3mers = ['C' + a + b for a in bases for b in bases]
     cols = []
-    for t in all3:
+    for t in left_3mers:
         col = f'l3_{t}'
-        df[col] = df['kmer5'].apply(lambda k, t=t: 1 if k and k[0:3] == t else 0)
+        df[col] = df['kmer5'].apply(lambda k, t=t: 1 if k and len(k) == 5 and k[0:3] == t else 0)
         cols.append(col)
-    for t in all3:
+    for t in right_3mers:
         col = f'r3_{t}'
-        df[col] = df['kmer5'].apply(lambda k, t=t: 1 if k and k[2:5] == t else 0)
+        df[col] = df['kmer5'].apply(lambda k, t=t: 1 if k and len(k) == 5 and k[2:5] == t else 0)
         cols.append(col)
     return cols
 
@@ -341,6 +348,54 @@ def fit_glm(y, X, offset, family: str = 'poisson', nb_alpha: float | None = None
         return model
 
 
+def validate_model_metrics(model, model_name: str, n_obs: int, feature_cols: list = None):
+    """
+    Validate that AIC and BIC are calculated correctly.
+    
+    AIC = 2*k - 2*llf
+    BIC = k*log(n) - 2*llf
+    where k = number of parameters, n = number of observations, llf = log-likelihood
+    """
+    k = len(model.params)
+    llf = model.llf
+    aic_reported = model.aic
+    bic_reported = model.bic
+    
+    # Calculate expected AIC and BIC
+    aic_expected = 2 * k - 2 * llf
+    bic_expected = k * np.log(n_obs) - 2 * llf
+    
+    # Check if they match (within numerical precision)
+    aic_match = np.isclose(aic_reported, aic_expected, rtol=1e-10)
+    bic_match = np.isclose(bic_reported, bic_expected, rtol=1e-10)
+    
+    if not aic_match or not bic_match:
+        print(f"  WARNING: {model_name} metric validation failed!")
+        if not aic_match:
+            print(f"    AIC: reported={aic_reported:.6f}, expected={aic_expected:.6f}, diff={abs(aic_reported - aic_expected):.2e}")
+        if not bic_match:
+            print(f"    BIC: reported={bic_reported:.6f}, expected={bic_expected:.6f}, diff={abs(bic_reported - bic_expected):.2e}")
+    else:
+        # Build status message
+        status_msg = f"  ✓ {model_name}: {k} parameters, AIC={aic_reported:.2f}, BIC={bic_reported:.2f}"
+        if feature_cols is not None:
+            expected_params = 1 + 1 + len(feature_cols)  # intercept + treatment + features
+            if k == expected_params:
+                status_msg += f" (1 intercept + 1 treatment + {len(feature_cols)} features)"
+            else:
+                status_msg += f" (expected {expected_params} = 1 intercept + 1 treatment + {len(feature_cols)} features, got {k})"
+        print(status_msg)
+    
+    return {
+        'n_params': k,
+        'aic': aic_reported,
+        'bic': bic_reported,
+        'llf': llf,
+        'aic_valid': aic_match,
+        'bic_valid': bic_match
+    }
+
+
 def compare_models_sitelevel(df: pd.DataFrame, output_dir: str, glm_family: str = 'poisson', nb_alpha: float | None = None, sevenmer_splits: int = 8, force_refit: bool = False):
     # Common pieces
     df = df[df['depth'] > 0].copy()
@@ -390,18 +445,22 @@ def compare_models_sitelevel(df: pd.DataFrame, output_dir: str, glm_family: str 
             # Compute metrics from loaded model (may be slow but ensures accuracy)
             pos_cols = add_positional_features(df)
             X_pos = df[base_cov + pos_cols]
+            # Validate metrics for loaded model
+            validate_model_metrics(models['positional'], 'positional (loaded)', len(df), pos_cols)
             results['positional'] = {
                 'aic': models['positional'].aic,
                 'bic': models['positional'].bic,
                 'llf': models['positional'].llf,
-                'n_params': len(pos_cols)
+                'n_params': len(models['positional'].params)
             }
     else:
         print(f"  Fitting positional model...")
         pos_cols = add_positional_features(df)
         X_pos = df[base_cov + pos_cols]
         model_pos = fit_glm(df['ems_count'].values, X_pos, df['log_depth'].values, family=glm_family, nb_alpha=nb_alpha)
-        results['positional'] = {'aic': model_pos.aic, 'bic': model_pos.bic, 'llf': model_pos.llf, 'n_params': len(pos_cols)}
+        # Validate metrics
+        validate_model_metrics(model_pos, 'positional', len(df), pos_cols)
+        results['positional'] = {'aic': model_pos.aic, 'bic': model_pos.bic, 'llf': model_pos.llf, 'n_params': len(model_pos.params)}
         models['positional'] = model_pos
 
     # 3mer model
@@ -413,18 +472,22 @@ def compare_models_sitelevel(df: pd.DataFrame, output_dir: str, glm_family: str 
         if existing_summary and 'results' in existing_summary and '3mer' in existing_summary['results']:
             results['3mer'] = existing_summary['results']['3mer']
         else:
+            # Validate metrics for loaded model
+            validate_model_metrics(models['3mer'], '3mer (loaded)', len(df), tri_cols)
             results['3mer'] = {
                 'aic': models['3mer'].aic,
                 'bic': models['3mer'].bic,
                 'llf': models['3mer'].llf,
-                'n_params': len(tri_cols)
+                'n_params': len(models['3mer'].params)
             }
     else:
         print(f"  Fitting 3mer model...")
         tri_cols = add_3mer_features(df)
         X_tri = df[base_cov + tri_cols]
         model_tri = fit_glm(df['ems_count'].values, X_tri, df['log_depth'].values, family=glm_family, nb_alpha=nb_alpha)
-        results['3mer'] = {'aic': model_tri.aic, 'bic': model_tri.bic, 'llf': model_tri.llf, 'n_params': len(tri_cols)}
+        # Validate metrics
+        validate_model_metrics(model_tri, '3mer', len(df), tri_cols)
+        results['3mer'] = {'aic': model_tri.aic, 'bic': model_tri.bic, 'llf': model_tri.llf, 'n_params': len(model_tri.params)}
         models['3mer'] = model_tri
 
     # 5mer model
@@ -436,18 +499,22 @@ def compare_models_sitelevel(df: pd.DataFrame, output_dir: str, glm_family: str 
         if existing_summary and 'results' in existing_summary and '5mer' in existing_summary['results']:
             results['5mer'] = existing_summary['results']['5mer']
         else:
+            # Validate metrics for loaded model
+            validate_model_metrics(models['5mer'], '5mer (loaded)', len(df), k5_cols)
             results['5mer'] = {
                 'aic': models['5mer'].aic,
                 'bic': models['5mer'].bic,
                 'llf': models['5mer'].llf,
-                'n_params': len(k5_cols)
+                'n_params': len(models['5mer'].params)
             }
     else:
         print(f"  Fitting 5mer model...")
         k5_cols = add_5mer_features(df)
         X_k5 = df[base_cov + k5_cols]
         model_k5 = fit_glm(df['ems_count'].values, X_k5, df['log_depth'].values, family=glm_family, nb_alpha=nb_alpha)
-        results['5mer'] = {'aic': model_k5.aic, 'bic': model_k5.bic, 'llf': model_k5.llf, 'n_params': len(k5_cols)}
+        # Validate metrics
+        validate_model_metrics(model_k5, '5mer', len(df), k5_cols)
+        results['5mer'] = {'aic': model_k5.aic, 'bic': model_k5.bic, 'llf': model_k5.llf, 'n_params': len(model_k5.params)}
         models['5mer'] = model_k5
 
     # positional 3mer
@@ -459,18 +526,22 @@ def compare_models_sitelevel(df: pd.DataFrame, output_dir: str, glm_family: str 
         if existing_summary and 'results' in existing_summary and 'pos3mer' in existing_summary['results']:
             results['pos3mer'] = existing_summary['results']['pos3mer']
         else:
+            # Validate metrics for loaded model
+            validate_model_metrics(models['pos3mer'], 'pos3mer (loaded)', len(df), p3_cols)
             results['pos3mer'] = {
                 'aic': models['pos3mer'].aic,
                 'bic': models['pos3mer'].bic,
                 'llf': models['pos3mer'].llf,
-                'n_params': len(p3_cols)
+                'n_params': len(models['pos3mer'].params)
             }
     else:
         print(f"  Fitting pos3mer model...")
         p3_cols = add_pos3mer_features(df)
         X_p3 = df[base_cov + p3_cols]
         model_p3 = fit_glm(df['ems_count'].values, X_p3, df['log_depth'].values, family=glm_family, nb_alpha=nb_alpha)
-        results['pos3mer'] = {'aic': model_p3.aic, 'bic': model_p3.bic, 'llf': model_p3.llf, 'n_params': len(p3_cols)}
+        # Validate metrics
+        validate_model_metrics(model_p3, 'pos3mer', len(df), p3_cols)
+        results['pos3mer'] = {'aic': model_p3.aic, 'bic': model_p3.bic, 'llf': model_p3.llf, 'n_params': len(model_p3.params)}
         models['pos3mer'] = model_p3
 
     # 7mer model via split-fitting to control memory
@@ -863,8 +934,15 @@ def main():
             eval_dir = os.path.join(args.output_dir, 'prediction_evaluation')
             os.makedirs(eval_dir, exist_ok=True)
             
+            # Check for CV results if cross-validation was run
+            cv_results_path = None
+            if args.run_cross_validation:
+                cv_results_path = os.path.join(args.output_dir, 'cross_validation', 'cv_results_summary.json')
+                if not os.path.exists(cv_results_path):
+                    cv_results_path = None
+            
             test_metrics = compare_models_predictions(
-                eval_models, df, eval_dir, eval_metadata
+                eval_models, df, eval_dir, eval_metadata, cv_results_path=cv_results_path
             )
             
             if test_metrics is not None:
@@ -900,6 +978,33 @@ def main():
                         print(f"  MAE: {metrics['mae_mean']:.4f} ± {metrics['mae_std']:.4f}")
                         print(f"  Pearson r: {metrics['pearson_r_mean']:.4f} ± {metrics['pearson_r_std']:.4f}")
                 print("✓ Cross-validation complete")
+                
+                # Regenerate combined 8-panel plot now that CV results exist
+                cv_results_path = os.path.join(cv_dir, 'cv_results_summary.json')
+                if os.path.exists(cv_results_path):
+                    try:
+                        from prediction_accuracy_metrics import plot_combined_model_evaluation
+                        import pandas as pd
+                        
+                        # Load prediction metrics
+                        eval_dir = os.path.join(args.output_dir, 'prediction_evaluation')
+                        metrics_tsv = os.path.join(eval_dir, 'prediction_accuracy_metrics.tsv')
+                        if os.path.exists(metrics_tsv):
+                            print("\nRegenerating 8-panel combined plot with CV results...")
+                            metrics_df = pd.read_csv(metrics_tsv, sep='\t')
+                            
+                            # Save to final_figs directory if it exists, otherwise to eval_dir
+                            final_figs_dir = os.path.join(args.output_dir, 'final_figs')
+                            if os.path.exists(final_figs_dir):
+                                plot_output_dir = final_figs_dir
+                            else:
+                                os.makedirs(final_figs_dir, exist_ok=True)
+                                plot_output_dir = final_figs_dir
+                            
+                            plot_combined_model_evaluation(metrics_df, cv_results_path, plot_output_dir)
+                            print(f"✓ Combined plot saved to {plot_output_dir}/combined_model_evaluation.png")
+                    except Exception as e2:
+                        print(f"⚠ Warning: Failed to regenerate combined plot: {e2}")
             except Exception as e:
                 print(f"⚠ Warning: Cross-validation failed: {e}")
                 import traceback

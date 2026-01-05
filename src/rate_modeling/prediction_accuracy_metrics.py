@@ -21,7 +21,8 @@ import os
 def compute_prediction_metrics(
     y_observed: np.ndarray,
     y_predicted: np.ndarray,
-    mu_predicted: np.ndarray = None  # Mean predictions for GLM
+    mu_predicted: np.ndarray = None,  # Mean predictions for GLM
+    nb_alpha: float = None  # Negative Binomial dispersion parameter (if None, uses Poisson deviance)
 ) -> Dict:
     """
     Compute comprehensive prediction accuracy metrics.
@@ -30,6 +31,7 @@ def compute_prediction_metrics(
         y_observed: Actual observed counts
         y_predicted: Predicted counts (can be mean or integer predictions)
         mu_predicted: Mean predictions (if different from y_predicted)
+        nb_alpha: Negative Binomial dispersion parameter. If provided, calculates NB deviance instead of Poisson.
     
     Returns:
         Dictionary with all metrics
@@ -62,13 +64,28 @@ def compute_prediction_metrics(
     # For now, use same formula (would need n_params)
     adj_r_squared = r_squared  # Could be improved with parameter count
     
-    # Poisson-specific metrics
-    # Deviance (negative log-likelihood)
+    # Deviance calculation: NB if alpha provided, otherwise Poisson
     mu_safe = np.maximum(mu_predicted, 1e-10)
     y_safe = np.maximum(y_observed, 0)
-    poisson_deviance = 2 * np.sum(
-        y_safe * np.log((y_safe + 1e-10) / mu_safe) - (y_safe - mu_safe)
-    )
+    
+    if nb_alpha is not None and nb_alpha > 0:
+        # Negative Binomial deviance
+        # Formula: 2 * Σ [y * log(y/μ) - (y + 1/α) * log((y + 1/α)/(μ + 1/α))]
+        inv_alpha = 1.0 / nb_alpha
+        y_plus_inv_alpha = y_safe + inv_alpha
+        mu_plus_inv_alpha = mu_safe + inv_alpha
+        
+        # Handle zeros carefully
+        y_log_term = np.where(y_safe > 0, y_safe * np.log((y_safe + 1e-10) / mu_safe), 0)
+        combined_log_term = y_plus_inv_alpha * np.log((y_plus_inv_alpha + 1e-10) / (mu_plus_inv_alpha + 1e-10))
+        
+        nb_deviance = 2 * np.sum(y_log_term - combined_log_term)
+        poisson_deviance = nb_deviance  # Use NB deviance as the main metric
+    else:
+        # Poisson deviance (fallback for Poisson models or when alpha not provided)
+        poisson_deviance = 2 * np.sum(
+            y_safe * np.log((y_safe + 1e-10) / mu_safe) - (y_safe - mu_safe)
+        )
     
     # Mean squared log error (MSLE) - good for count data
     y_obs_log = np.log1p(y_observed)  # log(1+x) to handle zeros
@@ -113,8 +130,9 @@ def compute_prediction_metrics(
         'r_squared': r_squared,
         'adj_r_squared': adj_r_squared,
         
-        # Poisson-specific
-        'poisson_deviance': poisson_deviance,
+        # Deviance (NB if nb_alpha provided, otherwise Poisson)
+        'deviance': poisson_deviance,
+        'poisson_deviance': poisson_deviance,  # Keep for backwards compatibility
         'msle': msle,
         'rmsle': rmsle,
         
@@ -228,8 +246,22 @@ def evaluate_model_on_test_set(
     # Get predictions (mean expected counts)
     mu_pred = model.predict(design_test, offset=offset_test)
     
+    # Extract nb_alpha from model if it's a Negative Binomial model
+    nb_alpha = None
+    # Check if it's a GLM NB model (has family.alpha)
+    if hasattr(model, 'family') and hasattr(model.family, 'alpha'):
+        nb_alpha = model.family.alpha
+    # Check if it's an NBDiscrete model (statsmodels.discrete.discrete_model.NegativeBinomial)
+    elif 'NegativeBinomial' in str(type(model)) or 'NBDiscrete' in str(type(model)):
+        try:
+            # For NBDiscrete models, alpha is the last parameter
+            if hasattr(model, 'params') and len(model.params) > 0:
+                nb_alpha = float(model.params.iloc[-1])
+        except:
+            pass
+    
     # Compute all metrics
-    metrics = compute_prediction_metrics(y_test, mu_pred, mu_pred)
+    metrics = compute_prediction_metrics(y_test, mu_pred, mu_pred, nb_alpha=nb_alpha)
     metrics['model_name'] = model_name
     
     return metrics
@@ -239,7 +271,8 @@ def compare_models_predictions(
     models: Dict,
     df_test: pd.DataFrame,
     output_dir: str = None,
-    metadata: Dict = None
+    metadata: Dict = None,
+    cv_results_path: str = None
 ) -> pd.DataFrame:
     """
     Compare prediction accuracy across multiple models.
@@ -317,8 +350,42 @@ def compare_models_predictions(
                     print(f"  Warning: Length mismatch for {model_name} ({len(mu_pred_7mer)} vs {len(y_test_7mer)}), skipping")
                     continue
                 
+                # Extract nb_alpha from 7mer split model metadata if available
+                nb_alpha = None
+                if isinstance(model, list) and len(model) > 0:
+                    # Check first split model for nb_alpha in metadata
+                    first_split = model[0]
+                    if isinstance(first_split, dict) and 'nb_alpha' in first_split:
+                        nb_alpha = first_split['nb_alpha']
+                    # Or try to extract from the actual model object
+                    elif isinstance(first_split, dict) and 'model' in first_split:
+                        split_model = first_split['model']
+                        # Check if it's a GLM NB model
+                        if hasattr(split_model, 'family') and hasattr(split_model.family, 'alpha'):
+                            nb_alpha = split_model.family.alpha
+                        # Check if it's an NBDiscrete model
+                        elif 'NegativeBinomial' in str(type(split_model)) or 'NBDiscrete' in str(type(split_model)):
+                            try:
+                                if hasattr(split_model, 'params') and len(split_model.params) > 0:
+                                    nb_alpha = float(split_model.params.iloc[-1])
+                            except:
+                                pass
+                    # If first_split is directly a model object (not a dict)
+                    elif not isinstance(first_split, dict):
+                        split_model = first_split
+                        # Check if it's a GLM NB model
+                        if hasattr(split_model, 'family') and hasattr(split_model.family, 'alpha'):
+                            nb_alpha = split_model.family.alpha
+                        # Check if it's an NBDiscrete model
+                        elif 'NegativeBinomial' in str(type(split_model)) or 'NBDiscrete' in str(type(split_model)):
+                            try:
+                                if hasattr(split_model, 'params') and len(split_model.params) > 0:
+                                    nb_alpha = float(split_model.params.iloc[-1])
+                            except:
+                                pass
+                
                 # Compute metrics
-                metrics = compute_prediction_metrics(y_test_7mer, mu_pred_7mer, mu_pred_7mer)
+                metrics = compute_prediction_metrics(y_test_7mer, mu_pred_7mer, mu_pred_7mer, nb_alpha=nb_alpha)
                 metrics['model_name'] = model_name
                 all_metrics.append(metrics)
                 print(f"  Successfully evaluated {model_name}: {len(y_test_7mer)} observations, R²={metrics['r_squared']:.4f}, Pearson r={metrics['pearson_r']:.4f}")
@@ -345,14 +412,70 @@ def compare_models_predictions(
     
     # Save if output directory provided
     if output_dir:
+        print(f"DEBUG: output_dir is {output_dir}")
         os.makedirs(output_dir, exist_ok=True)
         metrics_df.to_csv(
             os.path.join(output_dir, 'prediction_accuracy_metrics.tsv'),
             sep='\t', index=False
         )
         
-        # Create comparison plot
+        # Create comparison plot (3-panel)
+        print(f"DEBUG: Creating 3-panel plot...")
         plot_prediction_comparison(metrics_df, output_dir)
+        
+        # Always create combined 8-panel plot (with or without CV results)
+        print(f"DEBUG: About to create 8-panel plot...")
+        # Check for CV results in standard location if not provided
+        if cv_results_path is None:
+            # Try to find CV results in parent directory
+            parent_dir = os.path.dirname(os.path.dirname(output_dir)) if os.path.dirname(output_dir) else output_dir
+            potential_cv_path = os.path.join(parent_dir, 'cross_validation', 'cv_results_summary.json')
+            if os.path.exists(potential_cv_path):
+                cv_results_path = potential_cv_path
+                print(f"  Found CV results at: {potential_cv_path}")
+            else:
+                # Try in same directory structure (output_dir's parent)
+                potential_cv_path2 = os.path.join(os.path.dirname(output_dir), 'cross_validation', 'cv_results_summary.json')
+                if os.path.exists(potential_cv_path2):
+                    cv_results_path = potential_cv_path2
+                    print(f"  Found CV results at: {potential_cv_path2}")
+                else:
+                    # Try in output_dir itself
+                    potential_cv_path3 = os.path.join(output_dir, '..', 'cross_validation', 'cv_results_summary.json')
+                    potential_cv_path3 = os.path.normpath(potential_cv_path3)
+                    if os.path.exists(potential_cv_path3):
+                        cv_results_path = potential_cv_path3
+                        print(f"  Found CV results at: {potential_cv_path3}")
+        
+        print(f"\nCreating 8-panel combined model evaluation plot...")
+        if cv_results_path and os.path.exists(cv_results_path):
+            print(f"  Using CV results from: {cv_results_path}")
+        else:
+            print(f"  Note: CV results not found. Bottom row will show 'CV results not available'")
+            print(f"    Searched in: {os.path.join(os.path.dirname(output_dir), 'cross_validation', 'cv_results_summary.json')}")
+            cv_results_path = None
+        
+        # Save to final_figs directory if it exists, otherwise to output_dir
+        final_figs_dir = os.path.join(os.path.dirname(output_dir), 'final_figs')
+        if os.path.exists(final_figs_dir):
+            plot_output_dir = final_figs_dir
+        else:
+            # Create final_figs directory
+            plot_output_dir = final_figs_dir
+            os.makedirs(plot_output_dir, exist_ok=True)
+        
+        print(f"  Calling plot_combined_model_evaluation with:")
+        print(f"    metrics_df: {len(metrics_df)} rows")
+        print(f"    cv_results_path: {cv_results_path}")
+        print(f"    plot_output_dir: {plot_output_dir}")
+        
+        try:
+            plot_combined_model_evaluation(metrics_df, cv_results_path, plot_output_dir)
+            print(f"  ✓ Successfully generated 8-panel plot")
+        except Exception as e:
+            print(f"  ✗ ERROR: Failed to generate 8-panel plot: {e}")
+            import traceback
+            traceback.print_exc()
     
     return metrics_df
 
@@ -489,6 +612,9 @@ def plot_prediction_comparison(metrics_df: pd.DataFrame, output_dir: str):
     y_max_r2 = min(1.05, max(r2_vals) + 0.05) if max(r2_vals) <= 1 else max(r2_vals) + 0.05
     ax.set_ylim([y_min_r2, y_max_r2])
     
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    
     # Save with high quality
     output_path = os.path.join(output_dir, 'prediction_accuracy_comparison.png')
     plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
@@ -504,28 +630,36 @@ def plot_combined_model_evaluation(
     output_dir: str
 ):
     """
-    Create publication-ready single-row multiplot with 3 prediction accuracy metrics:
-    MSE, Pearson Correlation, and R².
+    Create publication-ready multiplot with:
+    Top row: Top 4 prediction accuracy metrics (MSE, RMSE, Pearson, R²)
+    Bottom row: Top 4 cross-validation metrics (MSE, MAE, Pearson, Poisson Deviance)
     
     Args:
         prediction_metrics_df: DataFrame with prediction accuracy metrics
-        cv_results_path: Path to CV results JSON file (unused, kept for compatibility)
+        cv_results_path: Path to CV results JSON file
         output_dir: Output directory for plots
     """
+    import json
     from matplotlib.gridspec import GridSpec
     import matplotlib.ticker as ticker
     
+    # Load CV results if available
+    cv_results = None
+    if cv_results_path and os.path.exists(cv_results_path):
+        with open(cv_results_path, 'r') as f:
+            cv_results = json.load(f)
+    
     # Set publication-quality style
     plt.rcParams.update({
-        'font.size': 11,
+        'font.size': 10,
         'font.family': 'sans-serif',
         'font.sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans'],
-        'axes.labelsize': 12,
-        'axes.titlesize': 13,
+        'axes.labelsize': 11,
+        'axes.titlesize': 12,
         'axes.linewidth': 1.2,
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
-        'legend.fontsize': 10,
+        'xtick.labelsize': 9,
+        'ytick.labelsize': 9,
+        'legend.fontsize': 9,
         'figure.titlesize': 14,
         'axes.spines.top': False,
         'axes.spines.right': False,
@@ -535,21 +669,23 @@ def plot_combined_model_evaluation(
         'grid.linestyle': '--',
     })
     
-    fig = plt.figure(figsize=(15, 5))
-    fig.suptitle('Model Evaluation: Prediction Accuracy', 
-                 fontsize=16, fontweight='bold', y=0.98)
+    fig = plt.figure(figsize=(20, 10))
+    # Removed overall title
     
-    # Create grid: single row with 3 plots
-    gs = GridSpec(1, 3, figure=fig, hspace=0.3, wspace=0.35, 
-                  left=0.06, right=0.98, top=0.85, bottom=0.25)
+    # Create grid: 2 rows x 4 columns
+    gs = GridSpec(2, 4, figure=fig, hspace=0.35, wspace=0.4, 
+                  left=0.05, right=0.98, top=0.95, bottom=0.12)
     
     model_names = prediction_metrics_df['model_name'].values
     
     # Professional color palette
     colors = {
         'mse': '#2E86AB',      # Blue
+        'rmse': '#1B998B',     # Teal
+        'mae': '#6A994E',      # Green
         'pearson': '#F18F01',  # Orange
         'r2': '#C73E1D',       # Red
+        'deviance': '#7209B7'  # Purple
     }
     
     # Helper function to set y-axis limits
@@ -584,10 +720,10 @@ def plot_combined_model_evaluation(
     
     # Helper function to format axes consistently
     def format_axes(ax, ylabel, title, use_scientific=False):
-        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
-        ax.set_title(title, fontsize=13, fontweight='bold', pad=10)
-        ax.tick_params(axis='x', rotation=45, labelsize=10, length=4, width=1.2)
-        ax.tick_params(axis='y', labelsize=10, length=4, width=1.2)
+        ax.set_ylabel(ylabel, fontsize=11, fontweight='bold')
+        ax.set_title(title, fontsize=12, fontweight='bold', pad=8)
+        ax.tick_params(axis='x', rotation=45, labelsize=9, length=4, width=1.2)
+        ax.tick_params(axis='y', labelsize=9, length=4, width=1.2)
         ax.spines['bottom'].set_linewidth(1.2)
         ax.spines['left'].set_linewidth(1.2)
         ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.8, axis='y')
@@ -598,25 +734,34 @@ def plot_combined_model_evaluation(
         else:
             ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: f'{x:.4f}' if abs(x) < 1 else f'{x:.3f}'))
     
-    # Plot 1: MSE (lower is better)
+    # TOP ROW: Top 4 Prediction Accuracy Metrics
+    # Row 1, Column 1: MSE (lower is better)
     ax = fig.add_subplot(gs[0, 0])
     mse_vals = prediction_metrics_df['mse'].values
     bars = ax.bar(model_names, mse_vals, color=colors['mse'], alpha=0.85, edgecolor='black', linewidth=0.8)
     format_axes(ax, 'Mean Squared Error', 'MSE', use_scientific=True)
     set_yaxis_to_show_differences(ax, mse_vals, start_at_zero=False, zoom_when_similar=True)
     
-    # Plot 2: Pearson correlation (higher is better)
+    # Row 1, Column 2: RMSE (lower is better)
     ax = fig.add_subplot(gs[0, 1])
+    if 'rmse' in prediction_metrics_df.columns:
+        rmse_vals = prediction_metrics_df['rmse'].values
+        bars = ax.bar(model_names, rmse_vals, color=colors['rmse'], alpha=0.85, edgecolor='black', linewidth=0.8)
+        format_axes(ax, 'Root Mean Squared Error', 'RMSE', use_scientific=False)
+        set_yaxis_to_show_differences(ax, rmse_vals, start_at_zero=False, zoom_when_similar=True)
+    
+    # Row 1, Column 3: Pearson correlation (higher is better)
+    ax = fig.add_subplot(gs[0, 2])
     pearson_vals = prediction_metrics_df['pearson_r'].values
     bars = ax.bar(model_names, pearson_vals, color=colors['pearson'], alpha=0.85, edgecolor='black', linewidth=0.8)
-    format_axes(ax, 'Pearson Correlation', 'Correlation', use_scientific=False)
+    format_axes(ax, 'Pearson Correlation', 'Pearson r', use_scientific=False)
     set_yaxis_to_show_differences(ax, pearson_vals, start_at_zero=False, zoom_when_similar=True)
     y_min_corr = min(pearson_vals) - 0.05 if min(pearson_vals) < 0 else max(0, min(pearson_vals) - 0.05)
     y_max_corr = min(1.05, max(pearson_vals) + 0.05) if max(pearson_vals) <= 1 else max(pearson_vals) + 0.05
     ax.set_ylim([y_min_corr, y_max_corr])
     
-    # Plot 3: R² (higher is better)
-    ax = fig.add_subplot(gs[0, 2])
+    # Row 1, Column 4: R² (higher is better)
+    ax = fig.add_subplot(gs[0, 3])
     r2_vals = prediction_metrics_df['r_squared'].values
     bars = ax.bar(model_names, r2_vals, color=colors['r2'], alpha=0.85, edgecolor='black', linewidth=0.8)
     format_axes(ax, 'R²', 'R²', use_scientific=False)
@@ -624,6 +769,56 @@ def plot_combined_model_evaluation(
     y_min_r2 = min(r2_vals) - 0.05 if min(r2_vals) < 0 else max(0, min(r2_vals) - 0.05)
     y_max_r2 = min(1.05, max(r2_vals) + 0.05) if max(r2_vals) <= 1 else max(r2_vals) + 0.05
     ax.set_ylim([y_min_r2, y_max_r2])
+    
+    # BOTTOM ROW: Top 4 Cross-Validation Metrics
+    if cv_results:
+        # Row 2, Column 1: CV MSE (lower is better)
+        ax = fig.add_subplot(gs[1, 0])
+        cv_mse_vals = [cv_results.get(model, {}).get('mse_mean', np.nan) for model in model_names]
+        if not all(np.isnan(cv_mse_vals)):
+            bars = ax.bar(model_names, cv_mse_vals, color=colors['mse'], alpha=0.85, edgecolor='black', linewidth=0.8)
+            format_axes(ax, 'CV MSE (mean)', 'CV MSE', use_scientific=True)
+            set_yaxis_to_show_differences(ax, [v for v in cv_mse_vals if not np.isnan(v)], start_at_zero=False, zoom_when_similar=True)
+        
+        # Row 2, Column 2: CV MAE (lower is better)
+        ax = fig.add_subplot(gs[1, 1])
+        cv_mae_vals = [cv_results.get(model, {}).get('mae_mean', np.nan) for model in model_names]
+        if not all(np.isnan(cv_mae_vals)):
+            bars = ax.bar(model_names, cv_mae_vals, color=colors['mae'], alpha=0.85, edgecolor='black', linewidth=0.8)
+            format_axes(ax, 'CV MAE (mean)', 'CV MAE', use_scientific=False)
+            set_yaxis_to_show_differences(ax, [v for v in cv_mae_vals if not np.isnan(v)], start_at_zero=False, zoom_when_similar=True)
+        
+        # Row 2, Column 3: CV Pearson correlation (higher is better)
+        ax = fig.add_subplot(gs[1, 2])
+        cv_pearson_vals = [cv_results.get(model, {}).get('pearson_r_mean', np.nan) for model in model_names]
+        if not all(np.isnan(cv_pearson_vals)):
+            bars = ax.bar(model_names, cv_pearson_vals, color=colors['pearson'], alpha=0.85, edgecolor='black', linewidth=0.8)
+            format_axes(ax, 'CV Pearson r (mean)', 'CV Pearson r', use_scientific=False)
+            valid_vals = [v for v in cv_pearson_vals if not np.isnan(v)]
+            if valid_vals:
+                set_yaxis_to_show_differences(ax, valid_vals, start_at_zero=False, zoom_when_similar=True)
+                y_min = min(valid_vals) - 0.05 if min(valid_vals) < 0 else max(0, min(valid_vals) - 0.05)
+                y_max = min(1.05, max(valid_vals) + 0.05) if max(valid_vals) <= 1 else max(valid_vals) + 0.05
+                ax.set_ylim([y_min, y_max])
+        
+        # Row 2, Column 4: CV Deviance (NB if models were NB, otherwise Poisson)
+        ax = fig.add_subplot(gs[1, 3])
+        cv_dev_vals = [cv_results.get(model, {}).get('poisson_dev_mean', np.nan) for model in model_names]
+        if not all(np.isnan(cv_dev_vals)):
+            bars = ax.bar(model_names, cv_dev_vals, color=colors['deviance'], alpha=0.85, edgecolor='black', linewidth=0.8)
+            format_axes(ax, 'CV Deviance (mean)', 'CV Deviance', use_scientific=True)
+            set_yaxis_to_show_differences(ax, [v for v in cv_dev_vals if not np.isnan(v)], start_at_zero=False, zoom_when_similar=True)
+    else:
+        # If no CV results, show message
+        for i in range(4):
+            ax = fig.add_subplot(gs[1, i])
+            ax.text(0.5, 0.5, 'CV results not available', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.set_xticks([])
+            ax.set_yticks([])
+    
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
     
     # Save with high quality
     output_path = os.path.join(output_dir, 'combined_model_evaluation.png')
@@ -649,7 +844,8 @@ def print_metrics_summary(metrics_df: pd.DataFrame):
         print(f"  RMSE: {row['rmse']:.4f}")
         print(f"  Pearson r: {row['pearson_r']:.4f} (p={row['pearson_p']:.2e})")
         print(f"  R²: {row['r_squared']:.4f}")
-        print(f"  Poisson Deviance: {row['poisson_deviance']:.2f}")
+        deviance_key = 'deviance' if 'deviance' in row else 'poisson_deviance'
+        print(f"  Deviance: {row[deviance_key]:.2f}")
         print(f"  RMSLE: {row['rmsle']:.4f}")
 
 
@@ -680,15 +876,43 @@ def regenerate_plots_from_tsv(tsv_path: str, output_dir: str = None, cv_results_
     
     print(f"\nPlots saved to {output_dir}/prediction_accuracy_comparison.png")
     
-    # Create combined plot if CV results provided
-    if cv_results_path:
-        if os.path.exists(cv_results_path):
-            print(f"\nCreating combined model evaluation plot with CV results...")
-            plot_combined_model_evaluation(metrics_df, cv_results_path, output_dir)
-            print(f"Combined plot saved to {output_dir}/combined_model_evaluation.png")
+    # Always create combined 8-panel plot (with or without CV results)
+    # Check for CV results in standard location if not provided
+    if cv_results_path is None:
+        # Try to find CV results in parent directory
+        parent_dir = os.path.dirname(output_dir)
+        potential_cv_path = os.path.join(parent_dir, 'cross_validation', 'cv_results_summary.json')
+        if os.path.exists(potential_cv_path):
+            cv_results_path = potential_cv_path
+            print(f"  Found CV results at: {potential_cv_path}")
         else:
-            print(f"\nWarning: CV results file not found: {cv_results_path}")
-            print("  Skipping combined plot generation")
+            # Try in grandparent directory
+            grandparent_dir = os.path.dirname(parent_dir)
+            potential_cv_path2 = os.path.join(grandparent_dir, 'cross_validation', 'cv_results_summary.json')
+            if os.path.exists(potential_cv_path2):
+                cv_results_path = potential_cv_path2
+                print(f"  Found CV results at: {potential_cv_path2}")
+    
+    print(f"\nCreating 8-panel combined model evaluation plot...")
+    if cv_results_path and os.path.exists(cv_results_path):
+        print(f"  Using CV results from: {cv_results_path}")
+    else:
+        print(f"  Note: CV results not found. Bottom row will show 'CV results not available'")
+        cv_results_path = None
+    
+    # Save to final_figs directory if it exists, otherwise create it
+    final_figs_dir = os.path.join(os.path.dirname(output_dir), 'final_figs')
+    if not os.path.exists(final_figs_dir):
+        os.makedirs(final_figs_dir, exist_ok=True)
+    plot_output_dir = final_figs_dir
+    
+    try:
+        plot_combined_model_evaluation(metrics_df, cv_results_path, plot_output_dir)
+        print(f"  ✓ Successfully generated 8-panel plot at {plot_output_dir}/combined_model_evaluation.png")
+    except Exception as e:
+        print(f"  ✗ ERROR: Failed to generate 8-panel plot: {e}")
+        import traceback
+        traceback.print_exc()
     
     print("\nSummary of metrics:")
     print_metrics_summary(metrics_df)
@@ -696,9 +920,6 @@ def regenerate_plots_from_tsv(tsv_path: str, output_dir: str = None, cv_results_
 
 if __name__ == '__main__':
     import argparse
-    from sequence_bias_modeling_sitelevel import load_site_level_data
-    from load_saved_models import load_models_and_prepare_data
-    from sklearn.model_selection import train_test_split
     
     parser = argparse.ArgumentParser(description='Evaluate prediction accuracy or regenerate plots')
     parser.add_argument('--output-dir',
@@ -730,6 +951,11 @@ if __name__ == '__main__':
     if not args.output_dir or not args.counts_dir or not args.genome_fasta:
         parser.error("--output-dir, --counts-dir, and --genome-fasta are required (unless using --regenerate-plots)")
     
+    # Import here to avoid dependency when just regenerating plots
+    from sequence_bias_modeling_sitelevel import load_site_level_data
+    from load_saved_models import load_models_and_prepare_data
+    from sklearn.model_selection import train_test_split
+    
     print("Loading saved models...")
     result = load_models_and_prepare_data(args.output_dir)
     models = result['models']
@@ -758,10 +984,17 @@ if __name__ == '__main__':
         )
         print(f"Test set: {len(df_test):,} sites")
     
+    # Check for CV results
+    cv_results_path = None
+    if args.output_dir:
+        potential_cv_path = os.path.join(args.output_dir, 'cross_validation', 'cv_results_summary.json')
+        if os.path.exists(potential_cv_path):
+            cv_results_path = potential_cv_path
+    
     # Evaluate each model on test set
     print("\nEvaluating models on test set...")
     test_metrics = compare_models_predictions(
-        models, df_test, args.output_dir, metadata
+        models, df_test, args.output_dir, metadata, cv_results_path=cv_results_path
     )
     
     if test_metrics is not None:
