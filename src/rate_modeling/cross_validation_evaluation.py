@@ -113,15 +113,8 @@ def cross_validate_model(
                 'poisson_deviance': deviance,  # Keep key name for compatibility, but value is NB if alpha provided
                 'n_test': len(y_test)
             })
-            
-            # Clean up memory
-            del model, X_train, X_test, y_train, y_test, offset_train, offset_test
-            del design_test, mu_test
-            gc.collect()
         except Exception as e:
             print(f"Warning: Fold {fold_idx + 1} failed: {e}")
-            import traceback
-            traceback.print_exc()
             continue
     
     if not fold_metrics:
@@ -226,15 +219,10 @@ def cross_validate_7mer_splits(
                 
                 # Predict on test fold for this group (only if model fit succeeded)
                 if result is None:
-                    # Clean up before continuing
-                    del sub_train, dummies_train, X_train, y_train, offset_train
-                    gc.collect()
                     continue
                     
                 sub_test = df_test[df_test['kmer7'].isin(group)].copy()
                 if sub_test.empty:
-                    del sub_train, dummies_train, X_train, y_train, offset_train, result
-                    gc.collect()
                     continue
                 
                 dummies_test = pd.DataFrame(0, index=sub_test.index, columns=want_cols, dtype='uint8')
@@ -254,14 +242,7 @@ def cross_validate_7mer_splits(
                     test_predictions.extend(mu_test)
                     test_actuals.extend(sub_test['ems_count'].values)
                 except Exception:
-                    pass
-                finally:
-                    # Clean up after each group
-                    del sub_train, sub_test, dummies_train, dummies_test
-                    del X_train, X_test, X_test_df, design_test
-                    del y_train, offset_train, offset_test, mu_test
-                    del result
-                    gc.collect()
+                    continue
             
             if len(test_predictions) == 0:
                 continue
@@ -324,15 +305,8 @@ def cross_validate_7mer_splits(
                 'poisson_deviance': deviance,  # Keep key name for compatibility, but value is NB if alpha provided
                 'n_test': len(test_actuals)
             })
-            
-            # Clean up memory
-            del df_train, df_test, fitted_models
-            del test_predictions, test_actuals
-            gc.collect()
         except Exception as e:
             print(f"Warning: 7mer CV fold {fold_idx + 1} failed: {e}")
-            import traceback
-            traceback.print_exc()
             continue
     
     if not fold_metrics:
@@ -383,8 +357,6 @@ def cross_validate_all_models(
         df_pos, pos_cols, 'ems_count', 'log_depth',
         glm_family, nb_alpha, n_folds
     )
-    del df_pos
-    gc.collect()
     
     # 3mer model
     print("Cross-validating 3mer model...")
@@ -394,8 +366,6 @@ def cross_validate_all_models(
         df_tri, tri_cols, 'ems_count', 'log_depth',
         glm_family, nb_alpha, n_folds
     )
-    del df_tri
-    gc.collect()
     
     # Positional-3mer model
     print("Cross-validating pos3mer model...")
@@ -405,8 +375,6 @@ def cross_validate_all_models(
         df_p3, p3_cols, 'ems_count', 'log_depth',
         glm_family, nb_alpha, n_folds
     )
-    del df_p3
-    gc.collect()
     
     # 5mer model
     print("Cross-validating 5mer model...")
@@ -416,8 +384,6 @@ def cross_validate_all_models(
         df_k5, k5_cols, 'ems_count', 'log_depth',
         glm_family, nb_alpha, n_folds
     )
-    del df_k5
-    gc.collect()
     
     # 7mer model (using split-fitting approach)
     if not skip_7mer:
