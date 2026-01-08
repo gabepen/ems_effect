@@ -563,6 +563,9 @@ def compare_models_sitelevel(df: pd.DataFrame, output_dir: str, glm_family: str 
             # Store split models as a list for saving
             if 'split_models' in res7:
                 models['7mer_split'] = res7['split_models']
+        else:
+            print(f"    Warning: 7mer_split model fitting failed (fit_7mer_model_splits returned None)")
+            results['7mer_split'] = {'aic': np.nan, 'bic': np.nan, 'llf': np.nan, 'n_params': 0}
 
     # Ensure we have positional features for plotting (even if model was loaded)
     if 'positional' in models:
