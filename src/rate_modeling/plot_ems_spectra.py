@@ -5,6 +5,7 @@ Matches plot_spectra.py logic exactly.
 
 Usage:
   python plot_ems_spectra.py /path/to/counts_dir -o output.png --min-alt 3 --min-depth 10
+  python plot_ems_spectra.py /path/to/counts_dir -o output.png --strand-collapsed
 """
 
 import argparse
@@ -22,6 +23,38 @@ import matplotlib.colors as mcolors
 import seaborn as sns
 import numpy as np
 from scipy.stats import mannwhitneyu
+
+# Strand-collapsed (SBS6-style): complementary pairs averaged; labels use pyrimidine ref (C/T).
+STRAND_COLLAPSE_ORDER = ("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+STRAND_COLLAPSE_MEMBERS = {
+    "C>A": ("C>A", "G>T"),
+    "C>G": ("C>G", "G>C"),
+    "C>T": ("C>T", "G>A"),
+    "T>A": ("T>A", "A>T"),
+    "T>C": ("T>C", "A>G"),
+    "T>G": ("T>G", "A>C"),
+}
+# Watson–Crick ref pair -> mutant pair (pyrimidine on left of each dinucleotide).
+STRAND_COLLAPSE_PAIR_LABELS = {
+    "C>A": "CG>AT",
+    "C>G": "CG>GC",
+    "C>T": "CG>TA",
+    "T>A": "TA>AT",
+    "T>C": "TA>CG",
+    "T>G": "TA>GC",
+}
+
+
+def collapse_rates_strand_average(rates: Dict[str, float]) -> Dict[str, float]:
+    """Average each complementary substitution pair into one strand-collapsed rate."""
+    return {
+        collapsed: (rates.get(a, 0.0) + rates.get(b, 0.0)) / 2.0
+        for collapsed, (a, b) in STRAND_COLLAPSE_MEMBERS.items()
+    }
+
+
+def collapse_sample_to_rates(sample_to_rates: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    return {sample: collapse_rates_strand_average(rates) for sample, rates in sample_to_rates.items()}
 
 
 def list_tsv_files(input_dir: str, pattern: str) -> List[str]:
@@ -511,7 +544,8 @@ def filter_positions_by_nt_controls(tsv_dir: str, pattern: str, max_nt_proportio
 
 def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str, 
                  filtering_stats: dict = None, depth_correction: str = 'filter', ax=None, title=None,
-                 color_dict: Dict[str, str] = None, suppress_legend: bool = False):
+                 color_dict: Dict[str, str] = None, suppress_legend: bool = False,
+                 strand_collapsed: bool = False):
     """
     Plot mutation spectra.
     Matches plot_spectra.py style exactly.
@@ -536,6 +570,18 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
     if not sample_to_rates:
         print("Warning: No data to plot.")
         return
+
+    if strand_collapsed:
+        sample_to_rates = collapse_sample_to_rates(dict(sample_to_rates))
+        # Order strand-collapsed classes by aggregate mutation rate (ascending).
+        collapsed_totals = {
+            sub: sum(rates.get(sub, 0.0) for rates in sample_to_rates.values())
+            for sub in STRAND_COLLAPSE_ORDER
+        }
+        substitution_order = sorted(STRAND_COLLAPSE_ORDER, key=lambda sub: collapsed_totals.get(sub, 0.0))
+    else:
+        substitution_order = ["A>C", "T>G", "A>G", "T>C", "A>T", "T>A", 
+                             "C>A", "G>T", "C>G", "G>C", "C>T", "G>A"]
     
     # Convert to dataframe format
     import pandas as pd
@@ -567,7 +613,8 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
         for sample in df['sample'].unique():
             sample_total = df[df['sample'] == sample]['proportion'].sum()
             sample_nonzero = (df[df['sample'] == sample]['proportion'] > 0).sum()
-            print(f"    {sample}: total={sample_total:.2e}, non-zero={sample_nonzero}/12")
+            n_subs = 6 if strand_collapsed else 12
+            print(f"    {sample}: total={sample_total:.2e}, non-zero={sample_nonzero}/{n_subs}")
     
     # Sort samples by C>T mutation rates within NT and non-NT groups
     all_samples = df["sample"].unique()
@@ -684,17 +731,22 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
     # Convert to list in display_order - seaborn applies colors in order
     palette_list = [color_dict_display[label] for label in display_order]
     
-    # Create custom substitution order with complementary pairs adjacent (matching plot_spectra.py)
-    substitution_order = ["A>C", "T>G", "A>G", "T>C", "A>T", "T>A", 
-                         "C>A", "G>T", "C>G", "G>C", "C>T", "G>A"]
-    
+    if strand_collapsed:
+        df["substitution_display"] = df["substitution"].map(STRAND_COLLAPSE_PAIR_LABELS)
+        substitution_display_order = [STRAND_COLLAPSE_PAIR_LABELS[s] for s in substitution_order]
+    else:
+        df["substitution_display"] = df["substitution"]
+        substitution_display_order = list(substitution_order)
+
+    # Perform Mann-Whitney U tests (internal pyrimidine / 12-class keys)
+    p_values = perform_mann_whitney_tests(df, NT_samples_sorted, other_samples_sorted, substitution_order)
+
     # Sort by custom substitution order, then by sample display order
     df["sample_display"] = pd.Categorical(df["sample_display"], categories=display_order, ordered=True)
-    df["substitution"] = pd.Categorical(df["substitution"], categories=substitution_order, ordered=True)
-    df = df.sort_values(["substitution", "sample_display"])
-    
-    # Perform Mann-Whitney U tests
-    p_values = perform_mann_whitney_tests(df, NT_samples_sorted, other_samples_sorted, substitution_order)
+    df["substitution_display"] = pd.Categorical(
+        df["substitution_display"], categories=substitution_display_order, ordered=True
+    )
+    df = df.sort_values(["substitution_display", "sample_display"])
     
     # Check if all values are zero or below log scale threshold
     max_proportion = df['proportion'].max()
@@ -727,7 +779,7 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
         # This ensures we still get proper axis labels even if some values are zero
         bp = sns.barplot(
             data=df_plot,
-            x="substitution",
+            x="substitution_display",
             y="proportion",
             hue="sample_display",
             palette=palette_list,
@@ -740,7 +792,7 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
         # This ensures the plot has proper labels and structure
         bp = sns.barplot(
             data=df_plot,
-            x="substitution",
+            x="substitution_display",
             y="proportion",
             hue="sample_display",
             palette=palette_list,
@@ -900,7 +952,8 @@ def plot_spectra(sample_to_rates: Dict[str, Dict[str, float]], output_path: str,
 def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], output_path: str, 
                               filtering_stats: dict = None, ax=None, title=None,
                               color_dict: Dict[str, str] = None, suppress_legend: bool = False,
-                              extract_colors_from_legend: bool = False):
+                              extract_colors_from_legend: bool = False,
+                              strand_collapsed: bool = False):
     """
     Plot mutation spectra for finite-sites rate model.
     
@@ -922,6 +975,18 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
     if not sample_to_rates:
         print("Warning: No data to plot.")
         return
+
+    if strand_collapsed:
+        sample_to_rates = collapse_sample_to_rates(dict(sample_to_rates))
+        # Order strand-collapsed classes by aggregate mutation rate (ascending).
+        collapsed_totals = {
+            sub: sum(rates.get(sub, 0.0) for rates in sample_to_rates.values())
+            for sub in STRAND_COLLAPSE_ORDER
+        }
+        substitution_order = sorted(STRAND_COLLAPSE_ORDER, key=lambda sub: collapsed_totals.get(sub, 0.0))
+    else:
+        substitution_order = ["A>C", "T>G", "A>G", "T>C", "A>T", "T>A", 
+                             "C>A", "G>T", "C>G", "G>C", "C>T", "G>A"]
     
     # Convert to dataframe format
     import pandas as pd
@@ -953,7 +1018,8 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
         for sample in df['sample'].unique():
             sample_total = df[df['sample'] == sample]['proportion'].sum()
             sample_nonzero = (df[df['sample'] == sample]['proportion'] > 0).sum()
-            print(f"    {sample}: total={sample_total:.2e}, non-zero={sample_nonzero}/12")
+            n_subs = 6 if strand_collapsed else 12
+            print(f"    {sample}: total={sample_total:.2e}, non-zero={sample_nonzero}/{n_subs}")
     
     # Sort samples by C>T mutation rates within NT and non-NT groups
     all_samples = df["sample"].unique()
@@ -1070,17 +1136,22 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
     # Convert to list in display_order - seaborn applies colors in order
     palette_list = [color_dict_display[label] for label in display_order]
     
-    # Create custom substitution order with complementary pairs adjacent (matching plot_spectra.py)
-    substitution_order = ["A>C", "T>G", "A>G", "T>C", "A>T", "T>A", 
-                         "C>A", "G>T", "C>G", "G>C", "C>T", "G>A"]
-    
+    if strand_collapsed:
+        df["substitution_display"] = df["substitution"].map(STRAND_COLLAPSE_PAIR_LABELS)
+        substitution_display_order = [STRAND_COLLAPSE_PAIR_LABELS[s] for s in substitution_order]
+    else:
+        df["substitution_display"] = df["substitution"]
+        substitution_display_order = list(substitution_order)
+
+    # Perform Mann-Whitney U tests (internal pyrimidine / 12-class keys)
+    p_values = perform_mann_whitney_tests(df, NT_samples_sorted, other_samples_sorted, substitution_order)
+
     # Sort by custom substitution order, then by sample display order
     df["sample_display"] = pd.Categorical(df["sample_display"], categories=display_order, ordered=True)
-    df["substitution"] = pd.Categorical(df["substitution"], categories=substitution_order, ordered=True)
-    df = df.sort_values(["substitution", "sample_display"])
-    
-    # Perform Mann-Whitney U tests
-    p_values = perform_mann_whitney_tests(df, NT_samples_sorted, other_samples_sorted, substitution_order)
+    df["substitution_display"] = pd.Categorical(
+        df["substitution_display"], categories=substitution_display_order, ordered=True
+    )
+    df = df.sort_values(["substitution_display", "sample_display"])
     
     # Check if all values are zero
     max_rate = df['proportion'].max()
@@ -1112,7 +1183,7 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
         # This ensures we still get proper axis labels even if some values are zero
         bp = sns.barplot(
             data=df_plot,
-            x="substitution",
+            x="substitution_display",
             y="proportion",
             hue="sample_display",
             palette=palette_list,
@@ -1125,7 +1196,7 @@ def plot_spectra_finite_sites(sample_to_rates: Dict[str, Dict[str, float]], outp
         # This ensures the plot has proper labels and structure
         bp = sns.barplot(
             data=df_plot,
-            x="substitution",
+            x="substitution_display",
             y="proportion",
             hue="sample_display",
             palette=palette_list,
@@ -1293,7 +1364,8 @@ def plot_spectra_comparison(sample_to_rates1: Dict[str, Dict[str, float]],
                            filtering_stats2: dict = None,
                            depth_correction: str = 'filter',
                            title1: str = "Dataset 1",
-                           title2: str = "Dataset 2"):
+                           title2: str = "Dataset 2",
+                           strand_collapsed: bool = False):
     """
     Plot two mutation spectra one on top of the other for comparison.
     Uses colors from first plot for second plot, with single shared legend.
@@ -1313,12 +1385,12 @@ def plot_spectra_comparison(sample_to_rates1: Dict[str, Dict[str, float]],
     # Plot first dataset (upper panel) with no legend - this determines the colors
     print("\n=== Plotting first dataset (non-consensus, top panel) ===")
     color_dict = plot_spectra(sample_to_rates1, output_path, filtering_stats1, depth_correction, 
-                             ax=ax1, title=title1, suppress_legend=True)
+                             ax=ax1, title=title1, suppress_legend=True, strand_collapsed=strand_collapsed)
     
     # Plot second dataset (lower panel) using the exact same colors, no legend
     print("\n=== Plotting second dataset (consensus, bottom panel) ===")
     plot_spectra(sample_to_rates2, output_path, filtering_stats2, depth_correction, 
-                ax=ax2, title=title2, color_dict=color_dict, suppress_legend=True)
+                ax=ax2, title=title2, color_dict=color_dict, suppress_legend=True, strand_collapsed=strand_collapsed)
     
     # Create single shared legend from the color_dict
     # Get sample order from first dataset
@@ -1326,11 +1398,14 @@ def plot_spectra_comparison(sample_to_rates1: Dict[str, Dict[str, float]],
     NT_samples = [s for s in all_samples if "NT" in s]
     other_samples = [s for s in all_samples if "NT" not in s]
     
-    # Get C>T rates for sorting
+    # Get C>T rates for sorting (match strand-collapsed C>T when applicable)
     ct_rates = {}
     for sample in all_samples:
         if sample in sample_to_rates1:
-            ct_rates[sample] = sample_to_rates1[sample].get('C>T', 0.0)
+            r = sample_to_rates1[sample]
+            if strand_collapsed:
+                r = collapse_rates_strand_average(r)
+            ct_rates[sample] = r.get('C>T', 0.0)
         else:
             ct_rates[sample] = 0.0
     
@@ -1402,6 +1477,9 @@ def main():
     ap.add_argument('--title2', default=None, help='Title for second plot/dataset (comparison mode only)')
     ap.add_argument('--rate-model', choices=['depth-weighted', 'finite-sites'], default='depth-weighted',
                     help='Rate calculation model: depth-weighted (default) or finite-sites (from estimate_rates.py high_rate)')
+    ap.add_argument('--strand-collapsed', action='store_true',
+                    help='Plot 6 strand-collapsed classes (SBS6-style): average complementary pairs; '
+                         'x-axis Watson–Crick pair labels (e.g. CG>TA, CG>AT)')
     args = ap.parse_args()
     
     # Check if user requested comparison mode
@@ -1410,6 +1488,7 @@ def main():
     # Check for existing TSV file first
     tsv_output = args.out.replace('.png', '.tsv').replace('.pdf', '.tsv')
     tsv_fully_loaded = False  # Flag to skip count file processing
+    loaded_rates = None
     
     if os.path.exists(tsv_output):
         print(f"\n=== Found existing TSV: {tsv_output} ===")
@@ -1642,12 +1721,14 @@ def main():
             print("\n=== Plotting non-consensus dataset (top panel) - finite-sites ===")
             color_dict = plot_spectra_finite_sites(sample_to_rates2, args.out, filtering_stats2, 
                                                   ax=ax1, title=title2, suppress_legend=True, 
-                                                  extract_colors_from_legend=True)
+                                                  extract_colors_from_legend=True,
+                                                  strand_collapsed=args.strand_collapsed)
             
             # Plot consensus dataset (lower panel) using the exact same colors, no legend
             print("\n=== Plotting consensus dataset (bottom panel) - finite-sites ===")
             plot_spectra_finite_sites(sample_to_rates1, args.out, filtering_stats1, 
-                                     ax=ax2, title=title1, color_dict=color_dict, suppress_legend=True)
+                                     ax=ax2, title=title1, color_dict=color_dict, suppress_legend=True,
+                                     strand_collapsed=args.strand_collapsed)
             
             # Create single shared legend from the color_dict
             # Get sample order from non-consensus dataset (which determined the colors)
@@ -1659,7 +1740,10 @@ def main():
             ct_rates = {}
             for sample in all_samples:
                 if sample in sample_to_rates2:
-                    ct_rates[sample] = sample_to_rates2[sample].get('C>T', 0.0)
+                    r = sample_to_rates2[sample]
+                    if args.strand_collapsed:
+                        r = collapse_rates_strand_average(r)
+                    ct_rates[sample] = r.get('C>T', 0.0)
                 else:
                     ct_rates[sample] = 0.0
             
@@ -1712,13 +1796,15 @@ def main():
         else:
             plot_spectra_comparison(sample_to_rates1, sample_to_rates2, args.out, 
                                    filtering_stats1, filtering_stats2, args.depth_correction,
-                                   title1, title2)
+                                   title1, title2, strand_collapsed=args.strand_collapsed)
     else:
         title = args.title1 if args.title1 else None
         if args.rate_model == 'finite-sites':
-            plot_spectra_finite_sites(sample_to_rates1, args.out, filtering_stats1, title=title)
+            plot_spectra_finite_sites(sample_to_rates1, args.out, filtering_stats1, title=title,
+                                     strand_collapsed=args.strand_collapsed)
         else:
-            plot_spectra(sample_to_rates1, args.out, filtering_stats1, args.depth_correction, title=title)
+            plot_spectra(sample_to_rates1, args.out, filtering_stats1, args.depth_correction, title=title,
+                        strand_collapsed=args.strand_collapsed)
     
     return 0
 
