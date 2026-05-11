@@ -515,6 +515,8 @@ def plot_5mer_enrichment_rates(aggregate_rates, output_dir, plot_prefix='observe
     
     output_file = os.path.join(output_dir, f'{plot_prefix}_5mer_enrichment_rates.png')
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    output_svg = os.path.join(output_dir, f'{plot_prefix}_5mer_enrichment_rates.svg')
+    plt.savefig(output_svg, format='svg', bbox_inches='tight')
     plt.close()
     
     print(f"Saved {plot_prefix} 5mer enrichment rate plot: {output_file}")
@@ -1315,9 +1317,12 @@ def plot_5mer_enrichment_rates_single_panel(aggregate_rates, output_dir, plot_pr
     
     output_file = os.path.join(output_dir, f'{plot_prefix}_5mer_enrichment_rates_single_panel.png')
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    output_svg = os.path.join(output_dir, f'{plot_prefix}_5mer_enrichment_rates_single_panel.svg')
+    plt.savefig(output_svg, format='svg', bbox_inches='tight')
     plt.close()
     
     print(f"Saved {plot_prefix} 5mer enrichment rate multi-panel plot: {output_file}")
+    print(f"Saved {plot_prefix} 5mer enrichment rate multi-panel plot: {output_svg}")
 
 
 def load_rates_from_tsv(tsv_file):
