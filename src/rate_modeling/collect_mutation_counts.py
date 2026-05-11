@@ -55,6 +55,58 @@ def parse_bases(bases, ref):
     return out
 
 
+def parse_bases_with_mpileup_qual(bases, quals, ref, min_bq):
+    """
+    Parse mpileup bases column keeping only bases whose parallel mpileup quality
+    (column 6, PHRED+33) is >= min_bq. Skips indel lines by returning None
+    (caller should fall back to parse_bases).
+    """
+    if min_bq <= 0 or not quals:
+        return None
+    if '+' in bases or '-' in bases:
+        return None
+
+    ref_up = ref.upper()
+    out = []
+    i = 0
+    j = 0
+    L = len(bases)
+    Q = len(quals)
+
+    while i < L:
+        c = bases[i]
+        if c == '^':
+            i += 2
+            continue
+        if c == '$':
+            i += 1
+            continue
+        if c == '*':
+            i += 1
+            if j >= Q:
+                return None
+            j += 1
+            continue
+        if c == '.' or c == ',':
+            b = ref_up
+        elif c.isalpha():
+            b = c.upper()
+        else:
+            i += 1
+            continue
+        if j >= Q:
+            return None
+        q = ord(quals[j]) - 33
+        j += 1
+        i += 1
+        if q >= min_bq:
+            out.append(b)
+
+    if j != Q:
+        return None
+    return out
+
+
 def analyze_read_position_bias(reads, alt):
     """
     Analyze positional bias using KS test to compare distributions of
@@ -199,7 +251,8 @@ def load_exclusion_mask(mask_file):
     return excluded_sites
 
 
-def process_mpileup_file(infile, excluded_sites, low_pct=10, high_pct=90, apply_position_bias=False):
+def process_mpileup_file(infile, excluded_sites, low_pct=10, high_pct=90, apply_position_bias=False,
+                         min_mpileup_bq=0):
     """
     Process mpileup file and return filtered sites with mutation counts.
     
@@ -219,8 +272,13 @@ def process_mpileup_file(infile, excluded_sites, low_pct=10, high_pct=90, apply_
                 continue
             chrom, pos, ref = fields[0], fields[1], fields[2].upper()
             bases = fields[4]
+            quals = fields[5] if len(fields) > 5 else None
 
-            parsed = parse_bases(bases, ref)
+            if min_mpileup_bq > 0 and quals:
+                parsed_f = parse_bases_with_mpileup_qual(bases, quals, ref, min_mpileup_bq)
+                parsed = parsed_f if parsed_f is not None else parse_bases(bases, ref)
+            else:
+                parsed = parse_bases(bases, ref)
             depth = len(parsed)
             if depth == 0:
                 continue
@@ -279,11 +337,12 @@ def process_mpileup_file(infile, excluded_sites, low_pct=10, high_pct=90, apply_
 
 def process_single_file(args_tuple):
     """Process a single mpileup file. Used by multiprocessing."""
-    infile, outfile, excluded_sites, low_pct, high_pct, apply_position_bias = args_tuple
+    infile, outfile, excluded_sites, low_pct, high_pct, apply_position_bias, min_mpileup_bq = args_tuple
     
     try:
         filtered_sites, low_thresh, high_thresh = process_mpileup_file(
-            infile, excluded_sites, low_pct, high_pct, apply_position_bias
+            infile, excluded_sites, low_pct, high_pct, apply_position_bias,
+            min_mpileup_bq=min_mpileup_bq,
         )
         
         # Write output
@@ -331,6 +390,10 @@ def main():
                         help="Number of processes to use (default: number of CPUs)")
     parser.add_argument("--position-bias", action="store_true",
                         help="Apply position bias filtering using KS test (default: False)")
+    parser.add_argument("--min-mpileup-bq", type=int, default=0,
+                        help="If >0 and mpileup has a 6th column (base qualities), keep only bases "
+                        "with PHRED >= this value. Lines with indels fall back to unfiltered parsing. "
+                        "Default 0 = ignore base qualities.")
     args = parser.parse_args()
 
     # Create output directory
@@ -352,7 +415,10 @@ def main():
     for infile in mpileup_files:
         basename = os.path.basename(infile)
         outfile = os.path.join(args.output_dir, basename.replace(".txt", ".counts"))
-        process_args.append((infile, outfile, excluded_sites, args.low, args.high, args.position_bias))
+        process_args.append((
+            infile, outfile, excluded_sites, args.low, args.high, args.position_bias,
+            args.min_mpileup_bq,
+        ))
     
     # Process files in parallel
     if args.n_processes:

@@ -35,6 +35,72 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 
 
+LITERATURE_PROPHAGE_INTERVAL_SETS = {
+    "wmel_literature": [
+        ("NC_002978.6", 247493, 270172),
+        ("NC_002978.6", 552257, 634847),
+    ],
+}
+
+
+def merge_overlapping_intervals(intervals: list[tuple[str, int, int]]) -> list[tuple[str, int, int]]:
+    if not intervals:
+        return []
+    by_chrom = defaultdict(list)
+    for chrom, start, end in intervals:
+        by_chrom[str(chrom)].append((int(start), int(end)))
+    merged = []
+    for chrom, spans in by_chrom.items():
+        spans.sort(key=lambda x: (x[0], x[1]))
+        cur_s, cur_e = spans[0]
+        for s, e in spans[1:]:
+            if s <= cur_e:
+                cur_e = max(cur_e, e)
+            else:
+                merged.append((chrom, cur_s, cur_e))
+                cur_s, cur_e = s, e
+        merged.append((chrom, cur_s, cur_e))
+    merged.sort(key=lambda x: (x[0], x[1], x[2]))
+    return merged
+
+
+def get_literature_prophage_intervals(set_name: str) -> list[tuple[str, int, int]]:
+    key = (set_name or "").strip().lower()
+    if key not in LITERATURE_PROPHAGE_INTERVAL_SETS:
+        valid = ", ".join(sorted(LITERATURE_PROPHAGE_INTERVAL_SETS.keys()))
+        raise ValueError(f"Unknown --prophage-interval-set '{set_name}'. Valid: {valid}")
+    return list(LITERATURE_PROPHAGE_INTERVAL_SETS[key])
+
+
+def parse_genomic_intervals(interval_text: str, default_chrom: str | None = None) -> list[tuple[str, int, int]]:
+    intervals = []
+    if not interval_text:
+        return intervals
+    for raw_part in interval_text.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        chrom = default_chrom
+        span = part
+        if ":" in part:
+            chrom, span = part.split(":", 1)
+            chrom = chrom.strip()
+        if chrom is None:
+            raise ValueError(
+                f"Interval '{part}' is missing chromosome and no default chromosome was provided."
+            )
+        if "-" not in span:
+            raise ValueError(f"Interval '{part}' is invalid. Expected start-end.")
+        start_s, end_s = span.split("-", 1)
+        start = int(start_s.replace(",", "").strip())
+        end = int(end_s.replace(",", "").strip())
+        if start <= 0 or end <= 0:
+            raise ValueError(f"Interval '{part}' has non-positive coordinates.")
+        if end < start:
+            start, end = end, start
+        intervals.append((str(chrom), start, end))
+    return intervals
+
 
 def proportion_ci(successes, total, alpha=0.05):
     """Return estimate, lower, upper using Wald normal approximation."""
@@ -4701,6 +4767,256 @@ def compare_regional_rates_gc_normalized(
     return regional_df
 
 
+def compare_prophage_vs_non_prophage_rates(
+    site_df: pd.DataFrame,
+    prophage_intervals: list[tuple[str, int, int]],
+    output_dir: str,
+    method: str = "poisson",
+    alpha: float = 0.0,
+    region_label: str = "prophage",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if site_df is None or site_df.empty:
+        raise ValueError("Site-level dataframe is empty.")
+    if not prophage_intervals:
+        raise ValueError("No prophage intervals provided.")
+
+    work = site_df.copy()
+    work["chrom"] = work["chrom"].astype(str)
+    work["pos_int"] = pd.to_numeric(work["pos"], errors="coerce")
+    work = work[work["pos_int"].notna()].copy()
+    work["pos_int"] = work["pos_int"].astype(int)
+    if work.empty:
+        raise ValueError("No valid positions found in site-level dataframe.")
+
+    intervals_by_chrom = defaultdict(list)
+    for chrom, start, end in prophage_intervals:
+        intervals_by_chrom[str(chrom)].append((int(start), int(end)))
+
+    in_region_mask = np.zeros(len(work), dtype=bool)
+    for chrom, chrom_intervals in intervals_by_chrom.items():
+        chrom_mask = (work["chrom"] == chrom).to_numpy()
+        if not chrom_mask.any():
+            continue
+        pos_values = work.loc[chrom_mask, "pos_int"].to_numpy()
+        chrom_in = np.zeros(pos_values.shape[0], dtype=bool)
+        for start, end in chrom_intervals:
+            chrom_in |= (pos_values >= start) & (pos_values <= end)
+        in_region_mask[chrom_mask] = chrom_in
+    work["in_target_region"] = in_region_mask
+
+    cohorts = [("all", work)]
+    if "treatment" in work.columns:
+        cohorts.append(("control", work[work["treatment"] == 0]))
+        cohorts.append(("treated", work[work["treatment"] == 1]))
+
+    summary_rows, comparison_rows = [], []
+    for cohort_name, cohort_df in cohorts:
+        if cohort_df.empty:
+            continue
+        cohort_results = {}
+        for in_region_value, region_name in [(True, region_label), (False, "non_prophage")]:
+            part = cohort_df[cohort_df["in_target_region"] == in_region_value]
+            total_depth = float(part["depth"].sum())
+            total_mut = float(part["ems_count"].sum())
+            n_sites = int(len(part))
+            rate = (total_mut / total_depth) if total_depth > 0 else np.nan
+            glm_rate, ci_low, ci_high = np.nan, np.nan, np.nan
+            if total_depth > 0 and n_sites > 0:
+                glm_input = part[["depth", "ems_count"]].rename(columns={"ems_count": "y"}).copy()
+                glm_rate, ci_low, ci_high = fit_site_level_glm_intercept_only(
+                    glm_input, method=method, alpha=alpha
+                )
+
+            row = {
+                "cohort": cohort_name,
+                "region": region_name,
+                "n_sites": n_sites,
+                "total_depth": total_depth,
+                "total_mutations": total_mut,
+                "raw_rate": rate,
+                "glm_rate": glm_rate,
+                "glm_ci_low": ci_low,
+                "glm_ci_high": ci_high,
+            }
+            summary_rows.append(row)
+            cohort_results[region_name] = row
+
+        if region_label in cohort_results and "non_prophage" in cohort_results:
+            r1 = cohort_results[region_label]
+            r0 = cohort_results["non_prophage"]
+            rate_1, rate_0 = r1["raw_rate"], r0["raw_rate"]
+            mut_1, mut_0 = r1["total_mutations"], r0["total_mutations"]
+            rr = rate_1 / rate_0 if np.isfinite(rate_1) and np.isfinite(rate_0) and rate_0 > 0 else np.nan
+            rr_ci_low, rr_ci_high, p_value = np.nan, np.nan, np.nan
+            if mut_1 > 0 and mut_0 > 0 and np.isfinite(rr) and rr > 0:
+                se_log_rr = np.sqrt((1.0 / mut_1) + (1.0 / mut_0))
+                z = np.log(rr) / se_log_rr
+                p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+                rr_ci_low = np.exp(np.log(rr) - 1.96 * se_log_rr)
+                rr_ci_high = np.exp(np.log(rr) + 1.96 * se_log_rr)
+            comparison_rows.append({
+                "cohort": cohort_name,
+                f"{region_label}_rate": rate_1,
+                "non_prophage_rate": rate_0,
+                "rate_ratio": rr,
+                "rate_ratio_ci_low": rr_ci_low,
+                "rate_ratio_ci_high": rr_ci_high,
+                "p_value": p_value,
+                f"{region_label}_mutations": mut_1,
+                "non_prophage_mutations": mut_0,
+                f"{region_label}_depth": r1["total_depth"],
+                "non_prophage_depth": r0["total_depth"],
+                f"{region_label}_sites": r1["n_sites"],
+                "non_prophage_sites": r0["n_sites"],
+            })
+
+    summary_df = pd.DataFrame(summary_rows)
+    comparison_df = pd.DataFrame(comparison_rows)
+
+    # Per-sample paired robustness tests
+    per_sample_rows = []
+    if "sample" in work.columns:
+        for sample_name, s in work.groupby("sample", sort=True):
+            p = s[s["in_target_region"]]
+            n = s[~s["in_target_region"]]
+            p_depth = float(p["depth"].sum())
+            n_depth = float(n["depth"].sum())
+            p_mut = float(p["ems_count"].sum())
+            n_mut = float(n["ems_count"].sum())
+            p_rate = (p_mut / p_depth) if p_depth > 0 else np.nan
+            n_rate = (n_mut / n_depth) if n_depth > 0 else np.nan
+            rr = (p_rate / n_rate) if np.isfinite(p_rate) and np.isfinite(n_rate) and n_rate > 0 else np.nan
+            log_rr = np.log(rr) if np.isfinite(rr) and rr > 0 else np.nan
+            treatment_val = s["treatment"].iloc[0] if "treatment" in s.columns else np.nan
+            per_sample_rows.append({
+                "sample": sample_name,
+                "treatment": treatment_val,
+                "is_control": bool(treatment_val == 0) if np.isfinite(treatment_val) else np.nan,
+                f"{region_label}_rate": p_rate,
+                "non_prophage_rate": n_rate,
+                "rate_ratio": rr,
+                "log_rate_ratio": log_rr,
+            })
+    per_sample_df = pd.DataFrame(per_sample_rows)
+    paired_rows = []
+    if not per_sample_df.empty:
+        for cohort_name, subset in [
+            ("all_samples", per_sample_df),
+            ("control_samples", per_sample_df[per_sample_df["is_control"] == True]),
+            ("treated_samples", per_sample_df[per_sample_df["is_control"] == False]),
+        ]:
+            vals = pd.to_numeric(subset["log_rate_ratio"], errors="coerce").dropna()
+            n = int(vals.shape[0])
+            mean_log = float(vals.mean()) if n else np.nan
+            median_log = float(vals.median()) if n else np.nan
+            mean_rr = float(np.exp(mean_log)) if np.isfinite(mean_log) else np.nan
+            median_rr = float(np.exp(median_log)) if np.isfinite(median_log) else np.nan
+            wilcoxon_p, ttest_p, sign_p = np.nan, np.nan, np.nan
+            if n >= 2:
+                try:
+                    wilcoxon_p = float(stats.wilcoxon(vals, alternative="two-sided").pvalue)
+                except Exception:
+                    pass
+                try:
+                    ttest_p = float(stats.ttest_1samp(vals, popmean=0.0, nan_policy="omit").pvalue)
+                except Exception:
+                    pass
+                try:
+                    n_pos = int((vals > 0).sum())
+                    n_nonzero = int((vals != 0).sum())
+                    if n_nonzero > 0:
+                        sign_p = float(stats.binomtest(n_pos, n_nonzero, p=0.5, alternative="two-sided").pvalue)
+                except Exception:
+                    pass
+            paired_rows.append({
+                "cohort": cohort_name,
+                "n_samples": n,
+                "mean_log_rate_ratio": mean_log,
+                "median_log_rate_ratio": median_log,
+                "mean_rate_ratio": mean_rr,
+                "median_rate_ratio": median_rr,
+                "wilcoxon_p_value": wilcoxon_p,
+                "ttest_p_value": ttest_p,
+                "sign_test_p_value": sign_p,
+            })
+
+    os.makedirs(output_dir, exist_ok=True)
+    summary_df.to_csv(os.path.join(output_dir, "prophage_region_rate_summary.tsv"), sep="\t", index=False)
+    comparison_df.to_csv(os.path.join(output_dir, "prophage_vs_non_prophage_comparison.tsv"), sep="\t", index=False)
+    pd.DataFrame(prophage_intervals, columns=["chrom", "start", "end"]).to_csv(
+        os.path.join(output_dir, "prophage_intervals_used.tsv"), sep="\t", index=False
+    )
+    if not per_sample_df.empty:
+        per_sample_df.to_csv(os.path.join(output_dir, "prophage_per_sample_rate_ratios.tsv"), sep="\t", index=False)
+    if paired_rows:
+        pd.DataFrame(paired_rows).to_csv(
+            os.path.join(output_dir, "prophage_per_sample_paired_tests.tsv"), sep="\t", index=False
+        )
+    return summary_df, comparison_df
+
+
+def compare_prophage_windows_vs_rest(
+    windows_rates_df: pd.DataFrame,
+    prophage_intervals: list[tuple[str, int, int]],
+    output_dir: str,
+    region_label: str = "prophage",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if windows_rates_df is None or windows_rates_df.empty:
+        raise ValueError("Window rates dataframe is empty.")
+    work = windows_rates_df.copy()
+    work["chrom"] = work["chrom"].astype(str)
+    work["start"] = pd.to_numeric(work["start"], errors="coerce").astype("Int64")
+    work["end"] = pd.to_numeric(work["end"], errors="coerce").astype("Int64")
+    work = work[work["start"].notna() & work["end"].notna()].copy()
+    work["start"] = work["start"].astype(int)
+    work["end"] = work["end"].astype(int)
+
+    in_region = np.zeros(len(work), dtype=bool)
+    for chrom, i_start, i_end in prophage_intervals:
+        chrom_mask = (work["chrom"] == str(chrom)).to_numpy()
+        if not chrom_mask.any():
+            continue
+        starts = work.loc[chrom_mask, "start"].to_numpy()
+        ends = work.loc[chrom_mask, "end"].to_numpy()
+        in_region[chrom_mask] |= (starts <= i_end) & (ends >= i_start)
+    work["region"] = np.where(in_region, region_label, "non_prophage")
+
+    summary_rows, comparison_rows = [], []
+    for rate_col in [c for c in ["rate_control", "rate_treated"] if c in work.columns]:
+        vals_p = pd.to_numeric(work.loc[work["region"] == region_label, rate_col], errors="coerce").dropna()
+        vals_n = pd.to_numeric(work.loc[work["region"] == "non_prophage", rate_col], errors="coerce").dropna()
+        summary_rows.append({
+            "rate_column": rate_col,
+            "prophage_mean_rate": float(vals_p.mean()) if len(vals_p) else np.nan,
+            "non_prophage_mean_rate": float(vals_n.mean()) if len(vals_n) else np.nan,
+            "prophage_n_windows": int((work["region"] == region_label).sum()),
+            "non_prophage_n_windows": int((work["region"] == "non_prophage").sum()),
+        })
+        p_val = np.nan
+        if len(vals_p) >= 2 and len(vals_n) >= 2:
+            try:
+                p_val = float(stats.mannwhitneyu(vals_p, vals_n, alternative="two-sided").pvalue)
+            except Exception:
+                pass
+        mean_ratio = (vals_p.mean() / vals_n.mean()) if len(vals_p) and len(vals_n) and vals_n.mean() > 0 else np.nan
+        comparison_rows.append({
+            "rate_column": rate_col,
+            "prophage_mean_rate": float(vals_p.mean()) if len(vals_p) else np.nan,
+            "non_prophage_mean_rate": float(vals_n.mean()) if len(vals_n) else np.nan,
+            "mean_rate_ratio": float(mean_ratio) if np.isfinite(mean_ratio) else np.nan,
+            "mannwhitney_p_value": p_val,
+            "prophage_n_windows": int((work["region"] == region_label).sum()),
+            "non_prophage_n_windows": int((work["region"] == "non_prophage").sum()),
+        })
+
+    os.makedirs(output_dir, exist_ok=True)
+    work.to_csv(os.path.join(output_dir, "window_rates_with_prophage_overlap.tsv"), sep="\t", index=False)
+    pd.DataFrame(summary_rows).to_csv(os.path.join(output_dir, "prophage_window_rate_summary.tsv"), sep="\t", index=False)
+    comparison_df = pd.DataFrame(comparison_rows)
+    comparison_df.to_csv(os.path.join(output_dir, "prophage_vs_non_prophage_window_comparison.tsv"), sep="\t", index=False)
+    return pd.DataFrame(summary_rows), comparison_df
+
+
 def analyze_gene_hits_in_windows(
     windows_rates_df: pd.DataFrame,
     gff_file: str,
@@ -5160,6 +5476,16 @@ def main():
     parser.add_argument("--site-glm-method", type=str, default="poisson",
                         choices=["poisson", "negative_binomial"],
                         help="GLM family for site-level model (default: poisson)")
+    parser.add_argument("--compare-prophage-rates", action="store_true",
+                        help="Compare mutation rates in prophage interval(s) vs non-prophage genome")
+    parser.add_argument("--prophage-coords", type=str, default=None,
+                        help="Prophage interval(s): 'chrom:start-end[,chrom:start-end]' or 'start-end' with --prophage-chrom")
+    parser.add_argument("--prophage-chrom", type=str, default=None,
+                        help="Chromosome/contig name when --prophage-coords omits chrom")
+    parser.add_argument("--prophage-interval-set", type=str, default=None,
+                        help="Built-in prophage interval set name (e.g. wmel_literature)")
+    parser.add_argument("--prophage-merge-overlaps", action="store_true",
+                        help="Merge overlapping prophage intervals before analysis")
     # NB alpha is estimated from all data (controls + treated) when using treatment covariate approach
     
     args = parser.parse_args()
@@ -5180,6 +5506,9 @@ def main():
             print(f"Loaded exclusion mask: {len(excluded_sites)} sites to exclude")
         else:
             print(f"Warning: Exclusion mask file not found: {args.exclusion_mask}")
+
+    output_dir = args.output_prefix
+    os.makedirs(output_dir, exist_ok=True)
 
     # Step 1: Basic rate estimation (existing)
     results = []
@@ -5283,10 +5612,66 @@ def main():
             create_site_level_glm_plots(df, os.path.join(site_dir, "site_glm"))
             save_individual_site_level_glm_plots(df, os.path.join(site_dir, "site_glm"))
 
+    # Optional: raw (non-5mer) prophage comparison
+    if args.compare_prophage_rates and not getattr(args, "kmer5_normalized_windows", False):
+        if not args.prophage_coords and not args.prophage_interval_set:
+            print("Warning: --compare-prophage-rates requires --prophage-coords or --prophage-interval-set")
+            print("Skipping prophage comparison analysis")
+        else:
+            print("\n" + "=" * 80)
+            print("RUNNING PROPHAGE VS NON-PROPHAGE COMPARISON")
+            print("=" * 80)
+            try:
+                if args.prophage_coords:
+                    default_chrom = args.prophage_chrom
+                    if default_chrom is None and ":" not in args.prophage_coords:
+                        if args.genome_fasta:
+                            seqs_tmp = load_genome_sequences(args.genome_fasta)
+                            if len(seqs_tmp) == 1:
+                                default_chrom = list(seqs_tmp.keys())[0]
+                                print(f"Using single FASTA contig as default chromosome: {default_chrom}")
+                            else:
+                                raise ValueError(
+                                    "Multiple contigs in genome FASTA; provide chrom in --prophage-coords or use --prophage-chrom"
+                                )
+                        else:
+                            raise ValueError(
+                                "--prophage-coords omitted chromosome. Provide chrom in coords, or set --prophage-chrom, "
+                                "or provide --genome-fasta with one contig."
+                            )
+                    prophage_intervals = parse_genomic_intervals(args.prophage_coords, default_chrom=default_chrom)
+                else:
+                    prophage_intervals = get_literature_prophage_intervals(args.prophage_interval_set)
+                    print(f"Using built-in prophage interval set: {args.prophage_interval_set}")
+
+                if args.prophage_merge_overlaps:
+                    before_n = len(prophage_intervals)
+                    prophage_intervals = merge_overlapping_intervals(prophage_intervals)
+                    print(f"Merged overlapping intervals: {before_n} -> {len(prophage_intervals)}")
+
+                site_df_prop = load_site_level_data_no_context(args.counts_dir, args.exclusion_mask)
+                if site_df_prop is None or site_df_prop.empty:
+                    print("Warning: No site-level data loaded; skipping prophage comparison")
+                else:
+                    prophage_dir = os.path.join(output_dir, "prophage_comparison")
+                    alpha_for_region = alpha if not use_treatment_covariate else 0.0
+                    _, comparison_df = compare_prophage_vs_non_prophage_rates(
+                        site_df_prop,
+                        prophage_intervals=prophage_intervals,
+                        output_dir=prophage_dir,
+                        method=args.site_glm_method,
+                        alpha=alpha_for_region,
+                        region_label="prophage",
+                    )
+                    if not comparison_df.empty:
+                        print(comparison_df.to_string(index=False))
+            except Exception as e:
+                print(f"Warning: Prophage comparison analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
+
     # Save results table
     # Step 4: Create output directory
-    output_dir = args.output_prefix
-    os.makedirs(output_dir, exist_ok=True)
     print(f"Created output directory: {output_dir}")
     
     # Step 5: Save results to file
@@ -5684,6 +6069,45 @@ def main():
                                     method="negative_binomial",
                                     use_treatment_covariate=use_treatment_covariate
                                 )
+
+                            # Optional: compare prophage-overlapping windows vs non-prophage windows
+                            if args.compare_prophage_rates:
+                                try:
+                                    if args.prophage_coords:
+                                        default_chrom = args.prophage_chrom
+                                        if default_chrom is None and ":" not in args.prophage_coords:
+                                            if args.genome_fasta:
+                                                seqs_tmp = load_genome_sequences(args.genome_fasta)
+                                                if len(seqs_tmp) == 1:
+                                                    default_chrom = list(seqs_tmp.keys())[0]
+                                                else:
+                                                    raise ValueError(
+                                                        "Multiple contigs in genome FASTA; provide chrom in --prophage-coords "
+                                                        "or use --prophage-chrom"
+                                                    )
+                                            else:
+                                                raise ValueError(
+                                                    "--prophage-coords omitted chromosome. Provide chrom in coords, "
+                                                    "or set --prophage-chrom, or provide --genome-fasta with one contig."
+                                                )
+                                        prophage_intervals = parse_genomic_intervals(args.prophage_coords, default_chrom=default_chrom)
+                                    elif args.prophage_interval_set:
+                                        prophage_intervals = get_literature_prophage_intervals(args.prophage_interval_set)
+                                    else:
+                                        raise ValueError("Set --prophage-coords or --prophage-interval-set for prophage window comparison")
+
+                                    if args.prophage_merge_overlaps:
+                                        prophage_intervals = merge_overlapping_intervals(prophage_intervals)
+
+                                    prophage_window_dir = os.path.join(window_dir, "prophage_window_comparison")
+                                    compare_prophage_windows_vs_rest(
+                                        windows_rates_df=windows_rates_df,
+                                        prophage_intervals=prophage_intervals,
+                                        output_dir=prophage_window_dir,
+                                        region_label="prophage",
+                                    )
+                                except Exception as e:
+                                    print(f"⚠ Warning: Prophage window comparison failed: {e}")
                             
                             print("✓ 5mer-normalized window analysis complete")
                         else:
